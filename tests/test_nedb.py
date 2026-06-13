@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
@@ -107,6 +109,43 @@ def test_merkle_proof():
     leaf, proof, root = db.file_proof("m", 1, v)
     assert NEDB.verify_proof(leaf, proof, root)
     assert not NEDB.verify_proof("00" * 32, proof, root)
+
+
+def test_persistence_reload():
+    """A path-backed database survives a restart: the hash chain still verifies,
+    HEAD/seq are preserved, AS OF time-travel and relations replay, and new
+    writes continue without nonce collisions (state == replay(log))."""
+    d = tempfile.mkdtemp()
+    try:
+        db = NEDB(d)
+        db.create_index("users", "status", "eq")
+        db.create_index("users", "age", "ordered")
+        db.put("users", "alice", {"name": "Alice", "age": 31, "status": "active"})
+        db.put("users", "bob", {"name": "Bob", "age": 40, "status": "inactive"})
+        s = db.seq
+        db.put("users", "alice", {"name": "Alice", "age": 32, "status": "active"})
+        db.link("users:alice", "follows", "users:bob")
+        head, seq = db.head, db.seq
+        q1 = db.query('FROM users WHERE status = "active" ORDER BY age DESC')
+        db.close()
+
+        db2 = NEDB(d)  # reopen
+        assert db2.verify(), "chain must verify after reload"
+        assert (db2.head, db2.seq) == (head, seq), "head/seq preserved"
+        assert db2.query('FROM users WHERE status = "active" ORDER BY age DESC') == q1
+        assert db2.get("users", "alice", as_of=s)["age"] == 31, "AS OF survives restart"
+        assert db2.get("users", "alice")["age"] == 32
+        assert db2.neighbors("users:alice", "follows") == ["users:bob"]
+        assert db2.verify_determinism()
+        db2.put("users", "carol", {"name": "Carol", "age": 22, "status": "active"})
+        assert db2.verify()
+        db2.close()
+
+        db3 = NEDB(d)  # durability of the post-reload write
+        assert db3.get("users", "carol")["name"] == "Carol"
+        db3.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def run_all():

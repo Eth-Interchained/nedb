@@ -8,6 +8,8 @@ pure function of the log, we get crash recovery and determinism (rebuild) for fr
 """
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, List, Optional
 
 from .cascade import BlobStore
@@ -44,13 +46,95 @@ def apply_op(store: MVCCStore, relations: Relations, indexes: Indexes, op: Op) -
 
 
 class NEDB:
-    def __init__(self) -> None:
+    def __init__(self, path: Optional[str] = None) -> None:
+        """Create a database.
+
+        With no `path`, NEDB is in-memory (the original behavior). With a `path`
+        (a directory), NEDB is DURABLE: every op is appended to a hash-chained
+        append-only log file (AOF) and fsync'd, and the database reloads by
+        replaying that log on open — Redis-style persistence, except the log is
+        the same tamper-evident chain the engine already treats as the source of
+        truth, so verify() and AS OF hold across restarts. The append-only log is
+        never rewritten: the chain (and its anchorable head) stays provable.
+        """
         self.log = OpLog()
         self.store = MVCCStore()
         self.relations = Relations()
         self.indexes = Indexes()
         self.blobs: Dict[str, BlobStore] = {"warm": BlobStore("warm"), "cold": BlobStore("cold")}
         self._nonce: Dict[str, int] = {}
+
+        self.path = path
+        self._aof = None
+        if path is not None:
+            self._open(path)
+
+    # --- persistence (AOF) --------------------------------------------------
+    def _open(self, path: str) -> None:
+        os.makedirs(path, exist_ok=True)
+        self._aof_path = os.path.join(path, "log.aof")
+        self._meta_path = os.path.join(path, "meta.json")
+        if os.path.exists(self._aof_path) or os.path.exists(self._meta_path):
+            self._load()
+        # Append mode: never truncates the existing log.
+        self._aof = open(self._aof_path, "a", encoding="utf-8")
+
+    def _load(self) -> None:
+        # 1) index configuration (the only state not captured by the op log)
+        if os.path.exists(self._meta_path):
+            with open(self._meta_path, encoding="utf-8") as fh:
+                for coll, field, kind in json.load(fh).get("indexes", []):
+                    self.indexes.ensure(coll, field, kind)
+        # 2) the hash-chained op log itself
+        ops: List[Op] = []
+        if os.path.exists(self._aof_path):
+            with open(self._aof_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        ops.append(Op.from_dict(json.loads(line)))
+        self.log.load(ops)
+        # 3) fold the log into materialized state (state = pure function of log)
+        for op in self.log.ops:
+            apply_op(self.store, self.relations, self.indexes, op)
+        # 4) restore the auto-nonce counter so new local writes don't collide
+        self._nonce = dict(self.log._last_nonce)
+
+    def _persist_meta(self) -> None:
+        if self.path is None:
+            return
+        with open(self._meta_path, "w", encoding="utf-8") as fh:
+            json.dump({"indexes": [list(t) for t in self.indexes.config]}, fh)
+
+    def _log_append(self, client: str, nonce: int, op: str, payload: dict,
+                    idem: Optional[str] = None):
+        """Append to the in-memory log AND, if durable, to the AOF (fsync'd)."""
+        rec, created = self.log.append(client, nonce, op, payload, idem)
+        if created and self._aof is not None:
+            self._aof.write(json.dumps(rec.to_dict()) + "\n")
+            self._aof.flush()
+            os.fsync(self._aof.fileno())
+        return rec, created
+
+    def flush(self) -> None:
+        """Force buffered writes to disk."""
+        if self._aof is not None:
+            self._aof.flush()
+            os.fsync(self._aof.fileno())
+
+    def close(self) -> None:
+        """Flush and close the append-only log."""
+        if self._aof is not None:
+            self._aof.flush()
+            os.fsync(self._aof.fileno())
+            self._aof.close()
+            self._aof = None
+
+    def __enter__(self) -> "NEDB":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # --- nonce helper -------------------------------------------------------
     def _next(self, client: str) -> int:
@@ -65,8 +149,8 @@ class NEDB:
         doc = dict(doc)
         doc.setdefault("_id", id)
         nonce = self._next(client) if nonce is None else nonce
-        op, created = self.log.append(client, nonce, "put",
-                                      {"key": key, "coll": coll, "id": id, "doc": doc}, idem)
+        op, created = self._log_append(client, nonce, "put",
+                                       {"key": key, "coll": coll, "id": id, "doc": doc}, idem)
         if created:
             apply_op(self.store, self.relations, self.indexes, op)
         return self.store.get(key)
@@ -75,8 +159,8 @@ class NEDB:
                nonce: Optional[int] = None, idem: Optional[str] = None) -> None:
         key = f"{coll}:{id}"
         nonce = self._next(client) if nonce is None else nonce
-        op, created = self.log.append(client, nonce, "delete",
-                                      {"key": key, "coll": coll, "id": id}, idem)
+        op, created = self._log_append(client, nonce, "delete",
+                                       {"key": key, "coll": coll, "id": id}, idem)
         if created:
             apply_op(self.store, self.relations, self.indexes, op)
 
@@ -87,14 +171,14 @@ class NEDB:
     def link(self, frm: str, rel: str, to: str, client: str = "local",
              nonce: Optional[int] = None) -> None:
         nonce = self._next(client) if nonce is None else nonce
-        op, created = self.log.append(client, nonce, "link", {"frm": frm, "rel": rel, "to": to})
+        op, created = self._log_append(client, nonce, "link", {"frm": frm, "rel": rel, "to": to})
         if created:
             apply_op(self.store, self.relations, self.indexes, op)
 
     def unlink(self, frm: str, rel: str, to: str, client: str = "local",
                nonce: Optional[int] = None) -> None:
         nonce = self._next(client) if nonce is None else nonce
-        op, created = self.log.append(client, nonce, "unlink", {"frm": frm, "rel": rel, "to": to})
+        op, created = self._log_append(client, nonce, "unlink", {"frm": frm, "rel": rel, "to": to})
         if created:
             apply_op(self.store, self.relations, self.indexes, op)
 
@@ -112,6 +196,8 @@ class NEDB:
             doc = self.store.get(key)
             if doc is not None:
                 self.indexes.add(coll, key, doc)
+        # index config isn't an op-log entry, so snapshot it for durable reload
+        self._persist_meta()
 
     # --- queries ------------------------------------------------------------
     def q(self, coll: str) -> Query:
@@ -202,8 +288,8 @@ class NEDB:
         version = bs.put_file(name, data)
         root = bs.root(name, version)
         nonce = self._next(client) if nonce is None else nonce
-        self.log.append(client, nonce, "put_file",
-                        {"name": name, "tier": tier, "version": version, "root": root}, idem)
+        self._log_append(client, nonce, "put_file",
+                         {"name": name, "tier": tier, "version": version, "root": root}, idem)
         return version
 
     def get_file(self, name: str, version: int = -1, tier: str = "warm") -> bytes:

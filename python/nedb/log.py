@@ -54,6 +54,21 @@ class Op:
     prev_hash: str
     hash: str
 
+    def to_dict(self) -> dict:
+        """Serialize for the append-only log file (AOF)."""
+        return {
+            "seq": self.seq, "client": self.client, "nonce": self.nonce,
+            "op": self.op, "payload": self.payload, "ts": self.ts,
+            "idem": self.idem, "prev_hash": self.prev_hash, "hash": self.hash,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Op":
+        return cls(
+            d["seq"], d["client"], d["nonce"], d["op"], d["payload"],
+            d["ts"], d.get("idem"), d["prev_hash"], d["hash"],
+        )
+
 
 class OpLog:
     def __init__(self) -> None:
@@ -99,6 +114,21 @@ class OpLog:
             self._idem[idem] = seq
         self._head = h
         return rec, True
+
+    def load(self, ops: List[Op]) -> None:
+        """Rehydrate the log from persisted ops WITHOUT recomputing hashes, so the
+        original chain (and thus verify() and the head commitment) is preserved
+        exactly across a restart. Nonce, idempotency, and head state are restored
+        from the ops themselves — replay protection survives a reload."""
+        self.ops = list(ops)
+        self._last_nonce = {}
+        self._idem = {}
+        for o in self.ops:
+            if o.nonce > self._last_nonce.get(o.client, 0):
+                self._last_nonce[o.client] = o.nonce
+            if o.idem is not None and o.idem not in self._idem:
+                self._idem[o.idem] = o.seq
+        self._head = self.ops[-1].hash if self.ops else GENESIS
 
     def verify(self) -> bool:
         """Re-walk the chain and confirm no op has been tampered with."""
