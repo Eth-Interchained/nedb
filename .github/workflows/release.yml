@@ -76,7 +76,7 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload --skip-existing dist/*
+        run: twine upload --skip-existing --verbose dist/*.whl
 
   # ----------------------------------------------------------------- npm -----
   node-binaries:
