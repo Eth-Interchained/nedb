@@ -29,7 +29,7 @@ Redis is fast because it's in-memory and simple — but relations are hand-rolle
 ## Quickstart (Python reference engine — runs today, zero build)
 
 ```bash
-git clone https://github.com/interchained/nedb && cd nedb
+git clone https://github.com/Eth-Interchained/nedb && cd nedb
 pip install -e .                 # pure-Python reference; no toolchain needed
 python3 examples/demo.py         # see every feature
 python3 tests/test_nedb.py       # 10/10 invariants

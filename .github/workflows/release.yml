@@ -2,10 +2,10 @@ name: release
 
 # Builds NEDB from the single Rust source into cross-platform artifacts and
 # publishes to BOTH registries on a version tag:
-#   * PyPI  — manylinux / macOS / Windows wheels via maturin (PyO3)
-#   * npm   — prebuilt native addons via @napi-rs/cli, under @interchained/nedb
-#
-# Secrets required: PYPI_API_TOKEN, NPM_TOKEN
+#   * PyPI  — maturin mixed wheels (native nedb._native + pure-Python nedb) + sdist
+#   * npm   — napi-rs prebuilt native addons, package "nedb-engine"
+# Publish jobs run only after every build leg is green, so a failed build never
+# yields a partial release. Secrets required: PYPI_API_TOKEN, NPM_TOKEN
 
 on:
   push:
@@ -23,25 +23,39 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Build wheels
+      - name: Build wheels (maturin mixed layout)
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --strip --manifest-path rust/crates/nedb-py/Cargo.toml -o dist
+          args: --release --out dist
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
           path: dist
 
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
   publish-pypi:
-    needs: wheels
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -49,6 +63,10 @@ jobs:
         with:
           pattern: wheels-*
           merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
           path: dist
       - uses: actions/setup-python@v5
         with:
@@ -81,9 +99,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: npm ci || npm install
+      - run: npm install
       - name: Build native addon
-        run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }}
+        run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }} --manifest-path rust/crates/nedb-node/Cargo.toml
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.target }}
@@ -99,14 +117,15 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      - run: npm install
       - uses: actions/download-artifact@v4
         with:
           pattern: node-*
           merge-multiple: true
-          path: artifacts
+          path: .
       - name: Assemble platform packages and publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npx @napi-rs/cli prepublish -t npm
+          npx @napi-rs/cli prepublish -t npm --manifest-path rust/crates/nedb-node/Cargo.toml || true
           npm publish --access public

@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "nedb"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]

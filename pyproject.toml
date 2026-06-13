@@ -1,22 +1,20 @@
-# Pure-Python reference package (runs everywhere, no build step).
-# The accelerated wheel is built from ../rust/crates/nedb-py via maturin in CI.
-#
-# NOTE: the import name is `nedb`. The PyPI *distribution* name is `nedb-engine`
-# because `nedb` is already taken on PyPI (verify before release; alt: scope/rename).
+# nedb-engine — maturin mixed layout: ships a native Rust core (nedb._native)
+# alongside the pure-Python package (python/nedb). Native wheels are built per
+# platform by CI; the pure-Python code is the always-works fallback.
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
 
 [project]
 name = "nedb-engine"
-version = "0.1.0"
-description = "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable)."
+version = "0.1.1"
+description = "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable). Native Rust core with a pure-Python fallback."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Interchained" }]
+authors = [{ name = "Eth-Interchained" }]
 keywords = ["database", "embedded", "mvcc", "time-travel", "versioning",
-            "compression", "dedup", "graph", "search", "redis", "git"]
+            "compression", "dedup", "graph", "search", "redis", "git", "rust"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -27,8 +25,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/interchained/nedb"
-Repository = "https://github.com/interchained/nedb"
+Homepage = "https://github.com/Eth-Interchained/nedb"
+Repository = "https://github.com/Eth-Interchained/nedb"
 
-[tool.setuptools]
-packages = ["nedb"]
+[tool.maturin]
+python-source = "python"
+module-name = "nedb._native"
+manifest-path = "rust/crates/nedb-py/Cargo.toml"
+# pure-Python sdist fallback still builds; native wheels carry the compiled core.

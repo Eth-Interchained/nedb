@@ -64,7 +64,7 @@ impl NedbCore {
 }
 
 #[pymodule]
-fn nedb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NedbCore>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

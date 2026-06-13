@@ -1,13 +1,13 @@
 {
-  "name": "@interchained/nedb",
-  "version": "0.1.0",
+  "name": "nedb-engine",
+  "version": "0.1.1",
   "description": "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable). Native core via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/interchained/nedb.git"
+    "url": "git+https://github.com/Eth-Interchained/nedb.git"
   },
   "keywords": [
     "database", "embedded", "mvcc", "time-travel", "versioning",

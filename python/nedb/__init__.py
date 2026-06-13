@@ -10,8 +10,9 @@ NEDB — a versioned, self-compressing, time-traveling embedded database.
   * git-style files with Cascade compression: content-defined chunking + dedup +
     temperature tiers, with a Merkle root per version anchorable on-chain.
 
-This pure-Python package is the reference implementation. The production speed core
-is Rust (see ../rust), exposed to PyPI via PyO3 and to npm via napi-rs.
+The pure-Python package is the reference implementation and the always-works
+fallback. When installed from a platform wheel, the compiled Rust core is available
+as ``nedb._native`` (``nedb.__has_native__`` reports whether it loaded).
 """
 from __future__ import annotations
 
@@ -19,5 +20,13 @@ from .engine import NEDB
 from .log import Op, OpLog, ReplayError
 from .query import Query, parse_nql
 
-__all__ = ["NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql"]
-__version__ = "0.1.0"
+try:  # compiled Rust core, present in platform wheels (PyO3 via maturin)
+    from . import _native  # type: ignore
+    __has_native__ = True
+except ImportError:  # pure-Python install (sdist / unsupported platform)
+    _native = None  # type: ignore
+    __has_native__ = False
+
+__all__ = ["NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
+           "_native", "__has_native__"]
+__version__ = "0.1.1"
