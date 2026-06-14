@@ -19,6 +19,9 @@ from __future__ import annotations
 from .engine import NEDB
 from .log import Op, OpLog, ReplayError
 from .query import Query, parse_nql
+from .sql import sql_exec, sql_to_nql, SQLError, SQLUnsupportedError
+from .redis_compat import RedisCompat, RedisError, RedisUnsupportedError
+from .autoindex import AutoIndexDB
 
 try:  # compiled Rust core, present in platform wheels (PyO3 via maturin)
     from . import _native  # type: ignore
@@ -27,6 +30,11 @@ except ImportError:  # pure-Python install (sdist / unsupported platform)
     _native = None  # type: ignore
     __has_native__ = False
 
-__all__ = ["NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
-           "_native", "__has_native__"]
-__version__ = "0.3.1"
+__all__ = [
+    "NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
+    "sql_exec", "sql_to_nql", "SQLError", "SQLUnsupportedError",
+    "RedisCompat", "RedisError", "RedisUnsupportedError",
+    "AutoIndexDB",
+    "_native", "__has_native__",
+]
+__version__ = "0.4.0"
