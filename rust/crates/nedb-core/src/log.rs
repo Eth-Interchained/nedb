@@ -153,6 +153,29 @@ impl OpLog {
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
+
+    /// Rehydrate from a slice of persisted ops WITHOUT recomputing hashes.
+    /// The original chain (and thus verify() and the head commitment) is preserved.
+    pub fn load(&mut self, ops: Vec<Op>) {
+        self.ops = ops;
+        self.last_nonce.clear();
+        self.idem.clear();
+        for (i, o) in self.ops.iter().enumerate() {
+            let prev = self.last_nonce.get(&o.client).copied().unwrap_or(0);
+            if o.nonce > prev {
+                self.last_nonce.insert(o.client.clone(), o.nonce);
+            }
+            if let Some(k) = &o.idem {
+                self.idem.entry(k.clone()).or_insert(i);
+            }
+        }
+        self.head = self.ops.last().map(|o| o.hash.clone()).unwrap_or_else(|| GENESIS.to_string());
+    }
+
+    /// Export the current nonce map (for persistence restore).
+    pub fn nonce_map(&self) -> HashMap<String, u64> {
+        self.last_nonce.clone()
+    }
 }
 
 #[cfg(test)]
