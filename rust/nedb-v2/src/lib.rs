@@ -19,6 +19,8 @@ pub mod index;
 pub mod graph;
 pub mod migrate;
 pub mod db;
+pub mod nql;
+pub mod server;
 
 pub use store::{Dek, Node, ObjectStore};
 pub use index::{IdIndex, OrderedValue, SortedIndexes};
