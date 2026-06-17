@@ -278,6 +278,12 @@ async fn put_document(
         }
         Some(db) => db,
     };
+    // Block writes until background startup scan completes (cold start only).
+    // Reads and queries always proceed immediately.
+    if !db.startup_ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return err(StatusCode::SERVICE_UNAVAILABLE,
+            "database startup in progress — reads available, writes retry in a moment");
+    }
     let caused_by = body.caused_by.unwrap_or_default();
     match db.put(&body.coll, &body.id, body.doc, caused_by, body.valid_from, body.valid_to) {
         Ok(node) => {
@@ -344,6 +350,10 @@ async fn batch_operations(
         Some(db) => db,
     };
 
+    if !db.startup_ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return err(StatusCode::SERVICE_UNAVAILABLE,
+            "database startup in progress — reads available, writes retry in a moment");
+    }
     let mut results = vec![];
     for op in body.ops {
         let op_type = op.op.to_lowercase();
