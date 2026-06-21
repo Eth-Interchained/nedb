@@ -173,7 +173,27 @@ jobs:
         run: npm install
       - name: Build native addon
         run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node
-      - name: Upload .node binary to GitHub release
+      - name: Build nedbd-v2 binary (DAG engine daemon)
+        shell: bash
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target ${{ matrix.target }}
+          cd ..
+          # Stage the binary with the platform-suffixed name the JS shim expects.
+          # Naming matches the .node convention: nedbd-v2-<platform>-<arch>[.exe]
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            SRC="rust/target/${{ matrix.target }}/release/nedbd"
+            DEST="nedbd-v2-linux-x64"
+          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+            SRC="rust/target/${{ matrix.target }}/release/nedbd.exe"
+            DEST="nedbd-v2-win-x64.exe"
+          else
+            echo "Unknown target ${{ matrix.target }}"; exit 1
+          fi
+          cp "$SRC" "$DEST"
+          chmod +x "$DEST" || true
+          echo "Staged nedbd-v2 binary: $(ls -lh $DEST)"
+      - name: Upload .node + nedbd-v2 binaries to GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -181,13 +201,20 @@ jobs:
           for f in *.node; do
             [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
           done
+          # Upload platform-suffixed nedbd-v2 binary (linux-x64 or win-x64.exe)
+          for f in nedbd-v2-linux-x64 nedbd-v2-win-x64.exe; do
+            [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.target }}
           path: |
             *.node
+            nedbd-v2-linux-x64
+            nedbd-v2-win-x64.exe
             index.js
             index.d.ts
+          if-no-files-found: ignore
 
   publish-npm:
     needs: [node-binaries]
@@ -201,7 +228,7 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - name: Download Linux + Windows napi artifacts
+      - name: Download Linux + Windows napi + nedbd-v2 artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: node-*
@@ -220,16 +247,32 @@ jobs:
             X86=$(echo "$ASSETS" | grep -c "darwin-x64" || true)
             echo "  Attempt $i/35 — arm64=$ARM x86_64=$X86"
             if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
-              echo "Mac binaries found — downloading"
+              echo "Mac binaries found — downloading .node + nedbd-v2"
               gh release download "$VERSION" --pattern "*.node" --dir . --clobber
+              # Pull every platform-suffixed nedbd-v2 binary from the release
+              # (linux-x64 and win-x64.exe are already local from the artifact step
+              # above; --clobber makes the download idempotent. darwin-arm64 and
+              # darwin-x64 come from Codemagic.)
+              gh release download "$VERSION" --pattern "nedbd-v2-*" --dir . --clobber || true
               break
             fi
             if [ "$i" -eq 35 ]; then
               echo "Timeout — publishing without Mac binaries (Codemagic may still upload later)"
+              # Still grab whatever nedbd-v2-* assets exist on the release so we
+              # ship at minimum the linux/windows binaries we know are uploaded.
+              gh release download "$VERSION" --pattern "nedbd-v2-*" --dir . --clobber || true
             fi
             sleep 60
           done
-          echo "Final .node files: $(ls *.node 2>/dev/null || echo 'none')"
+          echo "Final .node files:     $(ls *.node 2>/dev/null || echo 'none')"
+          echo "Final nedbd-v2 files:  $(ls nedbd-v2-* 2>/dev/null || echo 'none')"
+      - name: Make nedbd-v2 binaries executable
+        shell: bash
+        run: |
+          for f in nedbd-v2-linux-x64 nedbd-v2-darwin-arm64 nedbd-v2-darwin-x64; do
+            [ -f "$f" ] && chmod +x "$f"
+          done
+          ls -lh nedbd-v2-* 2>/dev/null || true
       - name: Publish to npm (all available platform binaries)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

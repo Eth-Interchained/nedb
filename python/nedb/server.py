@@ -590,14 +590,12 @@ def main() -> None:
             print("    cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
             print("    # then copy: nedbd-v2[.exe] to PATH or the nedb package dir", file=_sys.stderr)
             _sys.exit(1)
-        # Build argv forwarding all recognised flags
-        _argv = [_bin, "--data", args.data, "--port", str(args.port)]
+        # Rust binary: nedbd-v2 [data_dir]
+        # Port/token/TMK are passed via environment variables (not CLI flags).
+        os.environ["NEDBD_PORT"] = str(args.port)
         if args.token:
-            _argv += ["--token", args.token]
-        if os.environ.get("NEDBD_TOKEN") and "--token" not in _argv:
-            _argv += ["--token", os.environ["NEDBD_TOKEN"]]
-        if os.environ.get("NEDB_TMK"):
-            os.environ.setdefault("NEDB_TMK", os.environ["NEDB_TMK"])
+            os.environ["NEDBD_TOKEN"] = args.token
+        _argv = [_bin, args.data]   # data_dir is the only positional arg
         # os.execv replaces the process on POSIX; use subprocess on Windows
         if _sys.platform == "win32":
             _sys.exit(_sub.call(_argv))
