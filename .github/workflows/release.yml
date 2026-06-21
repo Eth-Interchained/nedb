@@ -60,21 +60,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Set up MSYS2 MinGW64 toolchain (windows-gnu target only)
+      # ── MinGW / MSYS2 setup (windows-gnu only) ────────────────────────────────
+      # MSYS2 MinGW64 Python has platform tags like mingw_x86_64_msvcrt_gnu.
+      # Maturin must run INSIDE MSYS2 using that Python as the interpreter so
+      # the resulting wheel is tagged for MinGW and pip on MSYS2 installs it.
+      - name: Set up MSYS2 MinGW64 (Python + pip + gcc + rust)
         if: matrix.mingw
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc
-      - name: Add MinGW64 bin to PATH (windows-gnu target only)
-        if: matrix.mingw
-        shell: bash
-        run: echo "C:/msys64/mingw64/bin" >> "$GITHUB_PATH"
+          install: >-
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-pip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-rust
+      # ── Standard Rust toolchain (non-MinGW only) ───────────────────────────
       - uses: dtolnay/rust-toolchain@stable
+        if: "!matrix.mingw"
         with:
           targets: ${{ matrix.target }}
+      # ── nedbd-v2 binary (MSVC build for both — .exe runs in any Windows env) ─
       - name: Build nedbd-v2 (DAG engine binary)
+        if: "!matrix.mingw"
         shell: bash
         run: |
           cd rust
@@ -87,6 +95,15 @@ jobs:
           cp "$BIN" "$DEST"
           chmod +x "$DEST" || true
           echo "nedbd-v2 staged: $(ls -lh $DEST)"
+      - name: Build nedbd-v2 (MinGW binary)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2
+          cd ..
+          cp rust/target/release/nedbd.exe python/nedb/nedbd-v2.exe
+          echo "nedbd-v2 MinGW staged: $(ls -lh python/nedb/nedbd-v2.exe)"
       - name: Stage Python source + binary into maturin layout
         shell: bash
         run: |
@@ -95,14 +112,15 @@ jobs:
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \; || true
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
-          # Verify binary made it — fail loudly if missing (maturin include= requires it)
           if ls rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null; then
             echo "nedbd-v2 binary confirmed in staging area"
           else
-            echo "ERROR: nedbd-v2 binary missing from staging area — wheel would lack the binary"
+            echo "ERROR: nedbd-v2 binary missing from staging area"
             exit 1
           fi
-      - name: Build wheel (maturin)
+      # ── Build wheel — maturin-action for standard targets ─────────────────
+      - name: Build wheel (maturin — standard)
+        if: "!matrix.mingw"
         uses: PyO3/maturin-action@v1
         with:
           command: build
@@ -110,6 +128,20 @@ jobs:
           args: --release --out ../../../dist
           manylinux: auto
           target: ${{ matrix.target }}
+      # ── Build wheel — MSYS2 maturin for MinGW ─────────────────────────────
+      # Run maturin with MSYS2 MinGW Python so the wheel gets mingw_x86_64_*
+      # platform tags that MSYS2/Git Bash pip recognises and installs.
+      - name: Install maturin in MSYS2 (MinGW only)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: pip install maturin
+      - name: Build wheel (maturin — MinGW)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.label }}
