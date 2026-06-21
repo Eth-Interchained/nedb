@@ -168,6 +168,7 @@ if _MODE == "native":
         return NedbCore.open(str(DATA_DIR))
 
     def close_db(db):
+        db.flush()   # persist WAL / MANIFEST to disk before closing
         del db
 
 else:
@@ -331,7 +332,7 @@ print("  The attorney reopens NEDB.\n")
 # ─────────────────────────────────────────────────────────────────────────────
 
 db2 = reopen_db()
-time.sleep(0.2)
+time.sleep(1.0)  # let background scan complete
 
 verified  = db2.verify()
 head_now  = db2.head()
