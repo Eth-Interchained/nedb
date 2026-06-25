@@ -15,7 +15,6 @@
 //!   - Tamper-evident: BLAKE2b chain from MANIFEST → collection heads → nodes
 
 pub mod store;
-pub mod segment;
 pub mod index;
 pub mod graph;
 pub mod migrate;

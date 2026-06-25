@@ -66,19 +66,6 @@ fn blake2b(data: &[u8]) -> String {
     hex::encode(&h.finalize()[..32])   // use first 32 bytes → 64 hex chars
 }
 
-/// NEDB v3 opt-in: the `--dag-v3` flag sets `NEDB_DAG_V3`, which switches the
-/// object substrate to the packed segment store. Default off → byte-for-byte v2.
-fn dag_v3_enabled() -> bool {
-    std::env::var("NEDB_DAG_V3")
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-                     || v.eq_ignore_ascii_case("on")
-                     || v.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
-}
-
 fn encrypt(data: &[u8], dek: &Dek) -> Result<Vec<u8>> {
     use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, OsRng, rand_core::RngCore}};
     let cipher = Aes256Gcm::new_from_slice(&dek.0)?;
@@ -109,9 +96,6 @@ pub struct ObjectStore {
     dek:  Option<Dek>,
     /// In-memory store: hash → raw bytes. None = disk-backed (normal mode).
     mem:  Option<Arc<dashmap::DashMap<String, Vec<u8>>>>,
-    /// NEDB v3 packed substrate. Some = segment mode (NEDB_DAG_V3 / --dag-v3);
-    /// new writes go to segments, reads fall back to loose v2 objects.
-    seg:  Option<crate::segment::SegmentStore>,
 }
 
 impl ObjectStore {
@@ -119,14 +103,7 @@ impl ObjectStore {
         let root = db_root.join("objects");
         fs::create_dir_all(&root)
             .context("create objects/ dir")?;
-        // v3 opt-in: bring up the packed segment substrate (and rebuild its
-        // index by scanning existing segments). Off by default → loose objects.
-        let seg = if dag_v3_enabled() {
-            Some(crate::segment::SegmentStore::open(&root)?)
-        } else {
-            None
-        };
-        Ok(Self { root, dek, mem: None, seg })
+        Ok(Self { root, dek, mem: None })
     }
 
     /// Create a pure in-memory object store — no disk, no files.
@@ -135,7 +112,6 @@ impl ObjectStore {
             root: PathBuf::from(":memory:"),
             dek:  None,
             mem:  Some(Arc::new(dashmap::DashMap::new())),
-            seg:  None,
         }
     }
 
@@ -151,11 +127,8 @@ impl ObjectStore {
         if let Some(ref mem) = self.mem {
             // In-memory: store in DashMap — idempotent
             mem.entry(hash.clone()).or_insert_with(|| content);
-        } else if let Some(ref seg) = self.seg {
-            // v3: append into a packed segment (one fsync per batch via sync()).
-            seg.put(&hash, &content)?;
         } else {
-            // v2: loose object file, written atomically via tmp → rename
+            // Disk: write atomically via tmp → rename
             let dir  = self.root.join(&hash[..2]);
             fs::create_dir_all(&dir)?;
             let path = dir.join(&hash[2..]);
@@ -175,38 +148,21 @@ impl ObjectStore {
             anyhow::bail!("invalid object hash (too short): {:?}", hash);
         }
 
-        // In-memory mode (tests).
-        if let Some(ref mem) = self.mem {
-            let content = mem.get(hash)
+        let content: Vec<u8> = if let Some(ref mem) = self.mem {
+            mem.get(hash)
                 .map(|v| v.clone())
-                .ok_or_else(|| anyhow::anyhow!("object not found in memory: {}", hash))?;
-            return self.decode(content, hash);
-        }
-
-        // v3 segment mode: try segments first (self-verifying), then fall back
-        // to the loose-object path so existing v2 data stays readable.
-        if let Some(ref seg) = self.seg {
-            if let Some(content) = seg.get(hash)? {
-                return self.decode(content, hash);
+                .ok_or_else(|| anyhow::anyhow!("object not found in memory: {}", hash))?
+        } else {
+            let path = self.root.join(&hash[..2]).join(&hash[2..]);
+            let c = fs::read(&path).with_context(|| format!("read object {}", hash))?;
+            // Hash verification — any bit rot or tampering is caught here
+            let actual = blake2b(&c);
+            if actual != hash {
+                bail!("object {} tampered: expected {} got {}", hash, hash, actual);
             }
-            // miss → fall through to loose objects (dual-read migration)
-        }
+            c
+        };
 
-        // v2 loose object.
-        let path = self.root.join(&hash[..2]).join(&hash[2..]);
-        let c = fs::read(&path).with_context(|| format!("read object {}", hash))?;
-        // Hash verification — any bit rot or tampering is caught here
-        let actual = blake2b(&c);
-        if actual != hash {
-            bail!("object {} tampered: expected {} got {}", hash, hash, actual);
-        }
-        self.decode(c, hash)
-    }
-
-    /// Decrypt (if a DEK is set) and deserialize raw content bytes into a Node.
-    /// Hash verification is the caller's responsibility (done before this for the
-    /// loose path; inside SegmentStore::get for the segment path; trusted for mem).
-    fn decode(&self, content: Vec<u8>, hash: &str) -> Result<Node> {
         let raw = match &self.dek {
             Some(dek) => decrypt(&content, dek)?,
             None      => content,
@@ -226,30 +182,7 @@ impl ObjectStore {
             let hashes: Vec<String> = mem.iter().map(|e| e.key().clone()).collect();
             return Box::new(hashes.into_iter());
         }
-
-        // v3: union of packed-segment hashes and any loose v2 objects (deduped),
-        // skipping the segments/ subdir during the loose walk.
-        if let Some(ref seg) = self.seg {
-            let mut seen: std::collections::HashSet<String> =
-                seg.all_hashes().into_iter().collect();
-            if let Ok(rd) = fs::read_dir(&self.root) {
-                for prefix_dir in rd.flatten() {
-                    if !prefix_dir.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
-                    let prefix = prefix_dir.file_name().to_string_lossy().to_string();
-                    if prefix.len() != 2 { continue; } // skip "segments" and non-prefix dirs
-                    if let Ok(rd2) = fs::read_dir(prefix_dir.path()) {
-                        for e in rd2.flatten() {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if name.ends_with(".tmp") { continue; }
-                            seen.insert(format!("{}{}", prefix, name));
-                        }
-                    }
-                }
-            }
-            return Box::new(seen.into_iter());
-        }
-
-        // v2 (default): lazy walk of the objects/ directory tree (unchanged).
+        // Disk: walk objects/ directory tree
         let root = self.root.clone();
         Box::new(fs::read_dir(&root)
             .into_iter()
@@ -268,15 +201,6 @@ impl ObjectStore {
                         Some(format!("{}{}", prefix, name))
                     })
             }))
-    }
-
-    /// Flush durable state for the active segment (v3): one fsync per batch,
-    /// wired into Db::flush_all(). No-op for loose-object and in-memory modes.
-    pub fn sync(&self) -> Result<()> {
-        if let Some(ref seg) = self.seg {
-            seg.sync()?;
-        }
-        Ok(())
     }
 
     /// Verify all objects. Returns (ok_count, tampered_hashes).

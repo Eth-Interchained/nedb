@@ -313,11 +313,6 @@ impl Db {
     /// Flush both the id-index WAL and MANIFEST. Used on graceful shutdown.
     pub fn flush_all(&self) {
         self.id_index.flush_write_buf();
-        // v3: fsync the active segment (no-op for loose/in-memory stores).
-        // One durability point per batch instead of one fsync per object.
-        if let Err(e) = self.objects.sync() {
-            eprintln!("nedb: segment sync failed: {}", e);
-        }
         self.flush_manifest();
     }
 
