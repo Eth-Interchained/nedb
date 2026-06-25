@@ -114,7 +114,9 @@ fn run(label: &'static str, base: &Path, v3: bool, n: usize) -> Stats {
     let (total_files, total_bytes) = dir_stats(&dir);
 
     // ── verify (tamper-evidence over everything) ───────────────────────────────
-    let (verify_ok, verify_bad) = db.verify();
+    // db.verify() returns (ok_count, bad_hashes); we report the count of bad.
+    let (verify_ok, verify_bad_hashes) = db.verify();
+    let verify_bad = verify_bad_hashes.len();
 
     drop(db);
 

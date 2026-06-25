@@ -47,7 +47,7 @@ fn v3_segment_substrate_end_to_end() {
         assert_eq!(value(&db, "coins", "u-0000").as_deref(), Some("val-0"));
         assert_eq!(value(&db, "coins", "u-0199").as_deref(), Some("val-199"));
         let (ok, bad) = db.verify();
-        assert_eq!(bad, 0, "v3 verify must be clean");
+        assert!(bad.is_empty(), "v3 verify must be clean: {:?}", bad);
         assert!(ok >= 200, "v3 verify should cover all objects");
     }
     // segment files exist; reopen rebuilds the index (via scan/.idx) and reads.
@@ -63,7 +63,7 @@ fn v3_segment_substrate_end_to_end() {
         assert_eq!(value(&db, "coins", "u-0001").as_deref(), Some("val-1-NEW"), "current version survives compaction");
         assert_eq!(value(&db, "coins", "u-0150").as_deref(), Some("val-150"), "untouched current version survives");
         let (_ok, bad) = db.verify();
-        assert_eq!(bad, 0, "verify clean after compaction");
+        assert!(bad.is_empty(), "verify clean after compaction: {:?}", bad);
     }
     // survives a reopen after compaction
     {
