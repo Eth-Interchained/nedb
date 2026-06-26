@@ -141,6 +141,14 @@ impl ObjectStore {
 
     /// Write a node. Returns the content hash (the node's permanent ID in the DAG).
     pub fn write(&self, node: &mut Node) -> Result<String> {
+        // The content hash is taken over the node's CONTENT, never over its own
+        // hash field (which is circular). `hash` is `skip_serializing_if =
+        // "String::is_empty"`, so a *fresh* node already excludes it — but a
+        // node being re-written (node.hash already set from a prior write) would
+        // serialize the populated hash and produce a different content hash,
+        // breaking idempotency. Clear it first so first-write and re-write
+        // serialize byte-for-byte identical content.
+        node.hash = String::new();
         let raw = serde_json::to_vec(node)?;
         let content = match &self.dek {
             Some(dek) => encrypt(&raw, dek)?,

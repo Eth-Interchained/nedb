@@ -570,6 +570,27 @@ impl Db {
     }
 }
 
+impl Drop for Db {
+    /// Flush buffered state when the database is closed so a write-then-drop
+    /// sequence is durable without an explicit `flush_all()`.
+    ///
+    /// `IdIndex::set` only stages updates in the in-memory WAL `write_buf`;
+    /// disk persistence happens in `flush_write_buf()`, normally driven by the
+    /// manifest ticker. A short-lived `Db` (a library user's `{ let db =
+    /// Db::open(p)?; db.put(..)?; }` block, or a test) has no ticker, so without
+    /// this its writes would be silently lost on reopen. Flushing on drop
+    /// mirrors the flush-on-close contract of other embedded stores (sled,
+    /// RocksDB).
+    ///
+    /// In production this is a harmless safety net, not the primary durability
+    /// path: the manifest ticker thread holds an `Arc<Db>` for the process
+    /// lifetime, so `Drop` only fires once every owning handle is gone. No-op
+    /// for in-memory databases (`flush_all` short-circuits on `:memory:`).
+    fn drop(&mut self) {
+        self.flush_all();
+    }
+}
+
 /// Background cold-scan worker. Takes Arc<Db> — safe, Db is on the heap.
 fn cold_scan_background_arc(db: Arc<Db>) {
     use rayon::prelude::*;
