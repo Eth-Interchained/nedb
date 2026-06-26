@@ -10,6 +10,7 @@ _Last updated: 2026-06-26 — release **v2.3.333** (comprehensive v3 documentati
 
 | Version | What shipped | Registries |
 |---|---|---|
+| **v2.3.3333** | Opt-in macOS fast-fsync for the v3 segment store (`NEDB_FAST_FSYNC`, default off) — plain `fsync(2)` instead of `F_FULLFSYNC`, no-op off-mac. Closes the 3's cycle; next is 2.4.0. | PyPI · npm · crates.io |
 | **v2.3.333** | Comprehensive v3 documentation (README section + this log + ideas.md). Engine code unchanged from 2.3.33. | PyPI · npm · crates.io |
 | **v2.3.33** | Durable flush-on-close (`Db::drop` → `flush_all`), cross-platform Windows-safe id-index (percent-encoded filesystem-unsafe ids), idempotent re-writes; `cargo test -p nedb-engine` green (43/43). | PyPI · npm · crates.io |
 | **v2.3.3** | NEDB **v3** segment/pack object store landed behind `--dag-v3` (Phases 1–3: segments, compaction/pruning, `.idx` sidecars). Default off. | PyPI · npm · crates.io |

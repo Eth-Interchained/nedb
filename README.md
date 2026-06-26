@@ -20,9 +20,11 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.3.333 — Production Stable
+## NEDB v2.3.3333 — Production Stable
 
-**Current stable: 2.3.333** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
+**Current stable: 2.3.3333** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
+
+**New in 2.3.3333:** opt-in **macOS fast-fsync** (`NEDB_FAST_FSYNC`) — the v3 segment store skips macOS's slow `F_FULLFSYNC` for a plain `fsync(2)` (default off; no-op on Linux/Windows), cutting flush latency on Fusion/SATA Macs without touching durability semantics by default. Closes the 3's cycle — next is **2.4.0**.
 
 **New in 2.3.333:** comprehensive documentation for the **NEDB v3 segment/pack object store** (see the v3 section below) — the opt-in append-only storage substrate that took a real itcd chainstate flush from *minutes* to **under 2 seconds**. Engine code is unchanged from 2.3.33, which shipped durable **flush-on-close** (a `Db` persists buffered writes when dropped, matching sled/RocksDB), a **cross-platform Windows-safe id-index** (percent-encodes filesystem-unsafe document ids — link ids, paths), and idempotent object re-writes.
 
