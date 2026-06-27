@@ -20,6 +20,17 @@
 #   4. publish-npm downloads all, runs ONE npm publish with the complete bundle
 #   PyPI wheels: each platform uploads independently (--skip-existing, no conflict)
 
+# ── DISTRIBUTIONS (cryptoDB / nitroDB) — FOLLOW-UP ──────────────────────────
+# The flagship nedb-engine macOS wheels/.node are built below. The cryptoDB and
+# nitroDB distributions (the distributions/<distro> submodules, published by
+# .github/workflows/release-distros.yml on GitHub) currently ship Linux + Windows
+# native + the universal pure-Python wheel; their macOS-native wheels are NOT yet
+# built here. To add: duplicate the two macos-* workflows below per distro,
+# `cd distributions/<distro>` before each build step (recursive submodule
+# checkout), and publish under the distro's name with that distro's tokens.
+# Deferred until cryptoDB#1 / nitroDB#1 merge and we validate on a test tag —
+# not shipping unverified cross-compile config blind.
+
 workflows:
 
   # ── Apple Silicon wheel (aarch64) ─────────────────────────────────────

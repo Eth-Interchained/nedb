@@ -1,0 +1,8 @@
+[submodule "distributions/cryptoDB"]
+	path = distributions/cryptoDB
+	url = https://github.com/crypto-datab/cryptoDB
+	branch = distro/cryptodb-layer
+[submodule "distributions/nitroDB"]
+	path = distributions/nitroDB
+	url = https://github.com/nitro-db/nitroDB
+	branch = distro/nitrodb-layer
