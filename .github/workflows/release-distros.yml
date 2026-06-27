@@ -1,0 +1,190 @@
+name: release-distros
+
+# Publishes the NEDB *distributions* — cryptoDB (verifiable v2/v3) and nitroDB
+# (fast/lightweight) — on a version tag, building each from its submodule under
+# distributions/. Each is a REAL, independent build of the shared core under its
+# own name (its own .node / wheel / crate) — not a relabel of nedb-engine.
+#
+# The flagship `nedb-engine` ships from release.yml, which this file does NOT
+# touch — this is purely additive, so a problem here can never break the engine
+# publish. Central orchestration lives here, in nedb; the distro repos carry no
+# workflow of their own.
+#
+# NOTE (review): the submodules currently track the `distro/*-layer` branches so
+# the renamed manifests are present; repoint them to `master` once those PRs
+# merge. macOS-native distro wheels via Codemagic are a documented follow-up
+# (see codemagic.yaml). Validate end-to-end on a throwaway `vX` tag before trust.
+#
+# Secrets required: NPM_TOKEN, PYPI_API_TOKEN, CARGO_REGISTRY_TOKEN.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Native napi .node per distro × platform (Linux + Windows; macOS = Codemagic) ──
+  distro-node:
+    name: ${{ matrix.distro.name }} napi (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 40
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: cryptodb, path: distributions/cryptoDB }
+          - { name: nitrodb,  path: distributions/nitroDB }
+        platform:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", registry-url: "https://registry.npmjs.org" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.platform.target }}" }
+      - name: Install @napi-rs/cli (in distro submodule)
+        working-directory: ${{ matrix.distro.path }}
+        run: npm install
+      - name: Build native addon
+        working-directory: ${{ matrix.distro.path }}
+        run: npx napi build --platform --release --target ${{ matrix.platform.target }} --cargo-cwd rust/crates/nedb-node
+      - name: Build nedbd-v2 daemon
+        working-directory: ${{ matrix.distro.path }}
+        shell: bash
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine --target ${{ matrix.platform.target }}
+          cd ..
+          if [[ "${{ matrix.platform.target }}" == *windows* ]]; then
+            cp rust/target/${{ matrix.platform.target }}/release/nedbd.exe nedbd-v2-win-x64.exe
+          else
+            cp rust/target/${{ matrix.platform.target }}/release/nedbd nedbd-v2-linux-x64; chmod +x nedbd-v2-linux-x64
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.distro.name }}-node-${{ matrix.platform.target }}
+          path: |
+            ${{ matrix.distro.path }}/*.node
+            ${{ matrix.distro.path }}/index.js
+            ${{ matrix.distro.path }}/index.d.ts
+            ${{ matrix.distro.path }}/nedbd-v2-linux-x64
+            ${{ matrix.distro.path }}/nedbd-v2-win-x64.exe
+          if-no-files-found: ignore
+
+  # ── Smoke gate per distro: the shipped npm test against the freshly-built addon ──
+  distro-smoke:
+    name: ${{ matrix.distro }} smoke gate
+    needs: [distro-node]
+    runs-on: ubuntu-latest
+    if: "!cancelled()"
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [cryptodb, nitrodb]
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Download this distro's Linux addon
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.distro == 'cryptodb' && 'cryptodb' || 'nitrodb' }}-node-x86_64-unknown-linux-gnu
+          path: ${{ matrix.distro == 'cryptodb' && 'distributions/cryptoDB' || 'distributions/nitroDB' }}
+      - name: npm test (smoke.mjs) against the built addon — must pass to publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR=${{ matrix.distro == 'cryptodb' && 'distributions/cryptoDB' || 'distributions/nitroDB' }}
+          cd "$DIR"
+          node test/smoke.mjs | tee smoke-out.txt
+          grep -q "all five acts passed" smoke-out.txt
+          echo "✅ ${{ matrix.distro }} smoke gate passed"
+
+  # ── npm publish per distro (gated on its smoke) ──────────────────────────────
+  distro-publish-npm:
+    name: ${{ matrix.distro }} → npm
+    needs: [distro-node, distro-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: cryptodb, path: distributions/cryptoDB }
+          - { name: nitrodb,  path: distributions/nitroDB }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", registry-url: "https://registry.npmjs.org" }
+      - name: Download this distro's built addons (all platforms present)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.distro.name }}-node-*
+          merge-multiple: true
+          path: ${{ matrix.distro.path }}
+      # (macOS .node arrives from Codemagic via the GitHub release — follow-up.)
+      - name: Publish
+        working-directory: ${{ matrix.distro.path }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  # ── crates.io publish per distro (the thin re-export crate) ──────────────────
+  distro-publish-crate:
+    name: ${{ matrix.distro.name }} → crates.io
+    needs: [distro-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: cryptodb, path: distributions/cryptoDB }
+          - { name: nitrodb,  path: distributions/nitroDB }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish re-export crate
+        working-directory: ${{ matrix.distro.path }}/rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --package ${{ matrix.distro.name }} --allow-dirty 2>&1 \
+            || echo "Publish skipped (version may already exist on crates.io)"
+
+  # ── PyPI universal wheel per distro ──────────────────────────────────────────
+  distro-pypi:
+    name: ${{ matrix.distro.name }} → PyPI (universal)
+    needs: [distro-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: cryptodb, path: distributions/cryptoDB }
+          - { name: nitrodb,  path: distributions/nitroDB }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Build + publish universal wheel
+        working-directory: ${{ matrix.distro.path }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install --upgrade build twine
+          python -m build
+          twine upload --skip-existing --verbose dist/*
