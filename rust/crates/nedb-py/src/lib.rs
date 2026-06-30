@@ -166,6 +166,12 @@ impl NedbCore {
         self.inner.tip().as_ref().map(node_to_json_str)
     }
 
+    /// Collection-local tip — the most recent write into `coll`, or None. Lets a
+    /// consumer resume one chain (blocks / tx / utxo) without filtering global tip.
+    fn tip_collection(&self, coll: &str) -> Option<String> {
+        self.inner.tip_collection(coll).as_ref().map(node_to_json_str)
+    }
+
     /// Changefeed page after `after_seq` (exclusive), up to `limit` nodes (0 = the
     /// engine default cap), as a JSON envelope string:
     /// `{nodes, from_seq, to_seq, head_seq, has_more}`. Page while `has_more`,

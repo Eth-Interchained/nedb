@@ -583,6 +583,30 @@ impl Db {
         self.get_by_hash(&hash)
     }
 
+    /// The collection-local tip — the most recent write into `coll` (highest seq in
+    /// that collection), or `None` if the collection has no writes. Scans the seq
+    /// index backward from the head until a node in `coll` is found, resolving
+    /// through the same seq_index → object-store path as a normal read; bounded by
+    /// how recently `coll` was written. Conceptually a different index than the
+    /// global `tip()` (global head vs collection head), kept as a separate method
+    /// so each is explicit — parity with the Python reference's `tip(coll)`. Lets a
+    /// consumer resume one chain (e.g. blocks / tx / utxo) without pulling global
+    /// tip and filtering.
+    pub fn tip_collection(&self, coll: &str) -> Option<Node> {
+        let mut s = self.seq.load(Ordering::SeqCst); // exclusive upper bound (head + 1)
+        while s > 0 {
+            s -= 1;
+            if let Some(hash) = self.get_hash_by_seq(s) {
+                if let Some(node) = self.get_by_hash(&hash) {
+                    if node.coll.as_str() == coll {
+                        return Some(node);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Changefeed page: up to `limit` nodes written AFTER `after_seq` (EXCLUSIVE),
     /// ascending by seq, wrapped in a `SinceBatch` cursor envelope. `after_seq` is
     /// the cursor you last applied (a prior `tip()` seq or `to_seq`). `limit` bounds
@@ -913,6 +937,28 @@ mod tests_v2 {
         assert_eq!(page2.nodes[0].id, "c");
         assert_eq!(page2.to_seq, c.seq);
         assert!(!page2.has_more);
+    }
+
+    #[test]
+    fn tip_collection_per_chain() {
+        // The ITC sync-client case: separate chains in separate collections; a
+        // consumer resumes ONE without pulling global tip and filtering.
+        let db = Db::in_memory();
+        assert!(db.tip_collection("blocks").is_none());
+
+        db.put("blocks", "b0", serde_json::json!({"h": 0}), vec![], None, None).unwrap();
+        db.put("tx",     "t0", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+        let b1 = db.put("blocks", "b1", serde_json::json!({"h": 1}), vec![], None, None).unwrap();
+        let t1 = db.put("tx",     "t1", serde_json::json!({"v": 2}), vec![], None, None).unwrap();
+
+        // global tip = latest write overall (t1)
+        assert_eq!(db.tip().unwrap().id, "t1");
+        // collection-local tips = latest write in each collection
+        let bt = db.tip_collection("blocks").expect("blocks tip");
+        assert_eq!(bt.id, "b1");
+        assert_eq!(bt.seq, b1.seq);
+        assert_eq!(db.tip_collection("tx").unwrap().seq, t1.seq);
+        assert!(db.tip_collection("absent").is_none());
     }
 
     #[test]

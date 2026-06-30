@@ -718,6 +718,22 @@ async fn tip_database(
     ok(json!({"tip": tip, "seq": seq, "head": head}))
 }
 
+// Collection-local tip — GET /v1/databases/:name/collections/:coll/tip.
+async fn tip_collection_database(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath((name, coll)): AxPath<(String, String)>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    let (seq, head) = db_seq_head(&db);
+    let tip = db.tip_collection(&coll).map(|n| serde_json::to_value(&n).unwrap_or(Value::Null));
+    ok(json!({"coll": coll, "tip": tip, "seq": seq, "head": head}))
+}
+
 #[derive(Deserialize)]
 struct SinceQuery { after_seq: Option<u64>, limit: Option<usize> }
 
@@ -862,6 +878,7 @@ pub fn router(mgr: Manager) -> Router {
         .route("/v1/databases/:name/checkpoint",                 post(checkpoint))
         .route("/v1/databases/:name/log",                        get(get_log))
         .route("/v1/databases/:name/tip",                        get(tip_database))
+        .route("/v1/databases/:name/collections/:coll/tip",      get(tip_collection_database))
         .route("/v1/databases/:name/since",                      get(since_database))
         .route("/v1/databases/:name/status",                     get(status_database))
         .route("/v1/databases/:name/subscribe",                  post(subscribe_query))

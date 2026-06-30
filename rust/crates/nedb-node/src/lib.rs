@@ -214,6 +214,13 @@ impl NedbCore {
         self.inner.tip().as_ref().map(node_to_json_str)
     }
 
+    /// Collection-local tip — the most recent write into `coll` as a JSON string,
+    /// or null if the collection has no writes. Resume one chain without filtering.
+    #[napi]
+    pub fn tip_collection(&self, coll: String) -> Option<String> {
+        self.inner.tip_collection(&coll).as_ref().map(node_to_json_str)
+    }
+
     /// Changefeed page after `after_seq` (exclusive), up to `limit` nodes (0 = the
     /// engine default cap), as a JSON envelope string:
     /// `{nodes, from_seq, to_seq, head_seq, has_more}`. Page while `has_more`,
