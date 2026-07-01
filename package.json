@@ -6,12 +6,14 @@
   "types": "index.d.ts",
   "bin": {
     "nedbd-v2": "./nedbd-v2.js",
-    "nedbdv2": "./nedbd-v2.js"
+    "nedbdv2": "./nedbd-v2.js",
+    "nedb-inspector": "./nedb-inspector.mjs"
   },
   "files": [
     "index.js",
     "index.d.ts",
     "nedbd-v2.js",
+    "nedb-inspector.mjs",
     "*.node",
     "nedbd-v2*",
     "test/smoke.mjs",
