@@ -256,12 +256,18 @@ impl Db {
         let seq  = self.seq.fetch_add(1, Ordering::SeqCst);
         let prev = self.id_index.get(coll, id);
 
-        // Remove old node from sorted indexes (it's being superseded)
-        if let Some(old_hash) = &prev {
-            if let Ok(old_node) = self.objects.read(old_hash) {
-                if let Value::Object(ref obj) = old_node.data {
-                    for (field, value) in obj {
-                        self.sorted_indexes.remove(coll, field, value, old_hash);
+        // Remove old node from sorted indexes (it's being superseded).
+        // Skip the old-object disk read entirely when no sorted index exists —
+        // the read (open + BLAKE2b verify + optional AES-GCM decrypt + JSON
+        // parse) was pure waste in the common unindexed case, ~2x read
+        // amplification on every update (the itcd chainstate shape).
+        if !self.sorted_indexes.is_empty() {
+            if let Some(old_hash) = &prev {
+                if let Ok(old_node) = self.objects.read(old_hash) {
+                    if let Value::Object(ref obj) = old_node.data {
+                        for (field, value) in obj {
+                            self.sorted_indexes.remove(coll, field, value, old_hash);
+                        }
                     }
                 }
             }
@@ -328,8 +334,25 @@ impl Db {
         let ts = now();
 
         // Build nodes with assigned seq numbers
+        let index_live = !self.sorted_indexes.is_empty();
         let mut nodes: Vec<Node> = ops.into_iter().enumerate().map(|(i, (coll, id, data, caused_by, valid_from, valid_to))| {
             let prev = self.id_index.get(&coll, &id);
+            // Parity with put(): drop the superseded version's values from any
+            // sorted indexes, so top-k never returns stale hashes after a batch
+            // update. Without this, batch updates left the old version's index
+            // entries in place — ORDER BY surfaced superseded rows alongside
+            // current ones. Only pay the old-object read when an index exists.
+            if index_live {
+                if let Some(old_hash) = &prev {
+                    if let Ok(old_node) = self.objects.read(old_hash) {
+                        if let Value::Object(ref obj) = old_node.data {
+                            for (field, value) in obj {
+                                self.sorted_indexes.remove(&coll, field, value, old_hash);
+                            }
+                        }
+                    }
+                }
+            }
             Node {
                 id, coll, seq: base_seq + i as u64,
                 data, prev, caused_by,
@@ -1057,6 +1080,38 @@ mod tests_v2 {
         for node in &nodes {
             assert_eq!(db.get_hash_by_seq(node.seq), Some(node.hash.clone()));
         }
+    }
+
+    /// Regression: put_batch must remove the superseded version's sorted-index
+    /// entries, exactly like put() does. Old behavior left the old hashes in
+    /// the BTree — ORDER BY returned superseded rows alongside current ones
+    /// (they resolve fine through the content-addressed store, which made the
+    /// stale rows look legitimate).
+    #[test]
+    fn put_batch_removes_superseded_sorted_index_entries() {
+        let db = Db::in_memory();
+        db.create_sorted_index("blocks", "height");
+        db.put("blocks", "x", serde_json::json!({"height": 1}), vec![], None, None).unwrap();
+        db.put_batch(vec![
+            ("blocks".into(), "x".into(), serde_json::json!({"height": 99}), vec![], None, None),
+        ]).unwrap();
+
+        let asc = db.order_by_asc("blocks", "height", 10);
+        assert_eq!(asc.len(), 1, "stale index entry for the superseded version must be gone");
+        assert_eq!(asc[0].data["height"], 99);
+        assert_eq!(asc[0].id, "x");
+    }
+
+    /// Updates without any sorted index must keep full version-chain semantics
+    /// (guards the new skip-old-object-read fast path in put()).
+    #[test]
+    fn update_without_indexes_preserves_chain() {
+        let db = Db::in_memory();
+        let v1 = db.put("docs", "x", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+        let v2 = db.put("docs", "x", serde_json::json!({"v": 2}), vec![], None, None).unwrap();
+        assert_eq!(v2.prev.as_deref(), Some(v1.hash.as_str()), "prev chain must survive the fast path");
+        assert_eq!(db.get("docs", "x").unwrap().data["v"], 2);
+        assert_eq!(db.get_as_of("docs", "x", v1.seq).unwrap().data["v"], 1);
     }
 
     #[test]
