@@ -716,7 +716,7 @@ mod tests_traverse {
         db.link("driver:d1", "handles", "trip:t2").unwrap();
         db.link("driver:d2", "handles", "trip:t3").unwrap();
 
-        let (rows, count) = query(&db, r#"FROM driver WHERE status = "active" TRAVERSE handles"#).unwrap();
+        let (_rows, count) = query(&db, r#"FROM driver WHERE status = "active" TRAVERSE handles"#).unwrap();
         assert_eq!(count, 3);
     }
 
