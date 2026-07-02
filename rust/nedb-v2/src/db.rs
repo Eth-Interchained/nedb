@@ -196,12 +196,27 @@ impl Db {
                 // Fall through to cold scan so the head is rebuilt correctly from objects.
                 if m.head.len() < 8 {
                     eprintln!("  [nedbd] MANIFEST head invalid (len={}), self-healing via cold scan", m.head.len());
-                } else if m.tip_hash.is_empty() {
-                    // Pre-2.5.43 MANIFEST (no persisted tip). Cold-scan once to rebuild
-                    // the seq index and rewrite MANIFEST with tip_hash — warm + tip()-
-                    // durable on every boot thereafter.
-                    eprintln!("  [nedbd] MANIFEST predates durable tip() — cold scan once to upgrade");
                 } else {
+                    // Pre-2.5.43 MANIFEST (no persisted tip): warm-boot ANYWAY.
+                    //
+                    // The old policy forced a full cold scan "once to upgrade" —
+                    // on multi-million-object embedded stores (itcd -dagv3:
+                    // 1.7M+ objects per database) that scan is hours of random
+                    // reads on seek-bound media, it races the host's own boot
+                    // I/O, and if the process exits before it completes the
+                    // NEXT boot pays it again — a permanent boot tax for
+                    // exactly the deployments that can least afford it. And it
+                    // buys nothing that can't heal lazily: seq + head in the
+                    // old MANIFEST are perfectly valid, and flush_manifest
+                    // writes tip_hash + coll_tips from live state, so the very
+                    // first write + flush after boot upgrades the MANIFEST
+                    // organically. Until then tip()/tip_collection() simply
+                    // return None on this boot — exactly their documented
+                    // behavior for an unresolvable tip — and every other read
+                    // and write path is unaffected.
+                    if m.tip_hash.is_empty() {
+                        eprintln!("  [nedbd] MANIFEST predates durable tip() — warm boot; tip()/tip_collection() heal on first flush (no forced scan)");
+                    }
                     self.seq.store(m.seq, Ordering::SeqCst); // m.seq is already the next-to-assign counter
                     *self.head.write() = m.head.clone();
                     // The tip's seq is the last ASSIGNED seq (m.seq is next-to-assign).
@@ -215,7 +230,9 @@ impl Db {
                     }
                     self.startup_ready.store(true, Ordering::SeqCst);
                     println!("  [nedbd] warm start — seq={} head={}... tip={}...",
-                        m.seq, &m.head[..8], &m.tip_hash[..8.min(m.tip_hash.len())]);
+                        m.seq, &m.head[..8],
+                        if m.tip_hash.is_empty() { "(pre-2.5.43, heals on flush)" }
+                        else { &m.tip_hash[..8.min(m.tip_hash.len())] });
                     return Ok(());
                 }
             } else {
@@ -1365,6 +1382,48 @@ mod tests_v2 {
         // Per-collection tip: same contract.
         let ct = db2.tip_collection("c").expect("coll tip survives");
         assert_eq!(ct.seq, total - 1);
+    }
+
+    /// Pre-2.5.43 MANIFESTs (no tip_hash) must warm-boot, NOT force a cold
+    /// scan. The old "cold scan once to upgrade" policy was hours of random
+    /// reads on multi-million-object seek-bound stores (itcd -dagv3), re-paid
+    /// on every boot if the process exited before the scan finished. seq+head
+    /// in the old MANIFEST are valid; tip()/tip_collection() return None until
+    /// the first write+flush organically rewrites MANIFEST with a tip.
+    #[test]
+    fn pre_durable_tip_manifest_warm_boots_and_heals_lazily() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            for i in 0..5u64 {
+                db.put("things", &i.to_string(), serde_json::json!({"i": i}), vec![], None, None).unwrap();
+            }
+            db.flush_all();
+        }
+        // Rewrite MANIFEST in the pre-2.5.43 shape: seq + head only.
+        let manifest_path = dir.path().join("MANIFEST");
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let old_format = serde_json::json!({ "seq": m["seq"], "head": m["head"] });
+        std::fs::write(&manifest_path, serde_json::to_string(&old_format).unwrap()).unwrap();
+
+        // Reopen: must be WARM (startup_ready immediately — no cold scan gate).
+        let db2 = Db::open(dir.path(), None).unwrap();
+        assert!(db2.startup_ready.load(std::sync::atomic::Ordering::SeqCst),
+                "pre-2.5.43 MANIFEST must warm-boot, not fall to a cold scan");
+        // tip() unresolvable this boot — documented None, not a panic or scan.
+        assert!(db2.tip().is_none(), "tip() is None until the manifest heals");
+        // seq continuity: a new write gets a FRESH seq (no reuse).
+        let n = db2.put("things", "next", serde_json::json!({"fresh": true}), vec![], None, None).unwrap();
+        assert_eq!(n.seq, m["seq"].as_u64().unwrap(), "next write takes the persisted next-to-assign seq");
+        db2.flush_all(); // organic upgrade: MANIFEST now carries tip_hash
+        drop(db2);
+
+        // Healed: next boot is warm AND tip() resolves.
+        let db3 = Db::open(dir.path(), None).unwrap();
+        assert!(db3.startup_ready.load(std::sync::atomic::Ordering::SeqCst));
+        let tip = db3.tip().expect("tip() must resolve after the organic upgrade");
+        assert_eq!(tip.id, "next");
     }
 
     /// Regression for the cold-scan MANIFEST seq off-by-one. The scan's old
