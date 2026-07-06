@@ -1,5 +1,17 @@
 # NEDB — Next-Turn Ideas
 
+## ⚑ Queued from the field — NEDB Links dogfooding (2026-07-06, Vex + Mark)
+
+### 0a. NQL parity bug: rust nedb-v2 parses GROUP BY but never executes it
+**What:** implement `group_by` execution in `rust/nedb-v2` (apply after WHERE: bucket rows by field; `COUNT` default, `SUM/AVG/MIN/MAX` with their field operand — note the v2 parser currently consumes NO operand after those keywords, diverging from python's `SUM field`), make the aggregate keyword **optional** to match python + nedb-core, and mirror python's output shape (`[{<field>: key, count: n}]`, see `python/nedb/engine.py:697-722`).
+**Why:** NEDB Links analytics rendered silent all-zeros on `nedbd.exe`: v2.6.1 ships **three** NQL implementations — python `query.py` serves the wheel daemon (`server.py:314 → NEDB → parse_nql`; the embedded rust `NedbCore` loads but is never on the HTTP query path), rust `nedb-core` executes GROUP BY (`lib.rs:384`), and standalone `nedb-v2` parses `group_by` onto the plan with zero consumers — and both daemons swallow NQL errors into empty results, so the drift is invisible until a product ships on top of it.
+
+### 0b. Cross-engine NQL parity suite in CI
+**What:** one fixture set + one assertion script run against BOTH daemons — `python -m nedb.server` (wheel path) and the `nedbd-v2` binary — diffing result rows across the shared grammar (WHERE / ORDER BY / LIMIT / GROUP BY / AS OF / TRACE), wired into CI so a red parity run blocks release tagging.
+**Why:** three engines wear one version badge today and nothing structural keeps them honest; the parity gate also becomes the safety net for the endgame Mark called — routing the python daemon's query path through `NedbCore` so there is exactly ONE NQL implementation ("rust core all around").
+
+---
+
 Grounded in the current state (**v2.4.468** — the 3-distribution split ships green: `nedb-engine` + `crypto-database` + `aof-db` on one tag across npm/PyPI/crates, distro npm now bundles macOS addons, and `scripts/release.py "vFROM" "vTO"` is the one-command release path). The distributions are real and aligned — but still **byte-identical engines** under three names. Each: one line _what_ + one line _why_.
 
 ---
