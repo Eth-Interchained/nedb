@@ -90,6 +90,13 @@ class Sequencer:
     def put(self, coll: str, id: str, doc: dict, **kw: Any) -> Any:
         return self._submit("put", coll, id, doc, **kw)
 
+    def tx(self, ops: list, **kw: Any) -> Any:
+        """Atomic multi-op transaction (see NEDB.tx). Submitted as ONE
+        intent, so the committer validates preconditions and applies all ops
+        with nothing interleaving — the single-writer thread IS the
+        serialization point, exactly as Redis's single thread was for Lua."""
+        return self._submit("tx", ops, **kw)
+
     def delete(self, coll: str, id: str, **kw: Any) -> Any:
         return self._submit("delete", coll, id, **kw)
 
@@ -207,6 +214,8 @@ class Sequencer:
             return db.put_file(*intent.args, **intent.kwargs)
         if k == "checkpoint":
             return db.checkpoint()
+        if k == "tx":
+            return db.tx(*intent.args, **intent.kwargs)
         raise ValueError(f"unknown write kind: {k}")
 
     def close(self) -> None:
