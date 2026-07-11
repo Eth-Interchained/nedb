@@ -12,6 +12,7 @@ Config (env):
   NEDBD_PORT    bind port            (default 7070)
   NEDBD_DATA    data root directory  (default ./nedb-data)
   NEDBD_TOKEN   bearer token         (optional; if set, every /v1 route requires it)
+  NEDBD_SWEEP_S TTL sweep interval s (default 30; 0 disables the sweeper)
 
 Run:
   nedbd                 # console script (pip install nedb-engine)
@@ -24,7 +25,7 @@ HTTP API (all JSON):
   GET    /v1/databases/<name>
   DELETE /v1/databases/<name>
   POST   /v1/databases/<name>/query            {nql}
-  POST   /v1/databases/<name>/put              {coll, id, doc, client?, nonce?, idem?}
+  POST   /v1/databases/<name>/put              {coll, id, doc, client?, nonce?, idem?, ttl_s?}
   POST   /v1/databases/<name>/index            {coll, field, kind}
   POST   /v1/databases/<name>/link             {frm, rel, to}
   DELETE /v1/databases/<name>/rows/<coll>/<id>
@@ -35,6 +36,8 @@ HTTP API (all JSON):
   GET    /v1/databases/<name>/files/<filename>/root?version=N&tier=warm  — Merkle root (anchorable)
   POST   /v1/databases/<name>/proof             {hash}  — Merkle inclusion proof (verifiable offline)
   POST   /v1/databases/<name>/checkpoint        — on-demand checkpoint
+  POST   /v1/databases/<name>/sweep             — delete TTL-expired docs now (also runs
+                                                  automatically every NEDBD_SWEEP_S, default 30)
   POST   /v1/databases/<name>/batch             — ATOMIC multi-op tx: {ops: [{op, coll, id,
                                                   doc?, if_seq?, idem?, client?}], client?}
                                                   all-or-nothing; if_seq CAS preconditions
@@ -327,7 +330,7 @@ def make_handler(manager: Manager, token: Optional[str]):
                         if not coll or rid is None or not isinstance(doc, dict):
                             raise HttpError(400, "coll, id, and doc are required")
                         _scalar = ("client", "nonce", "idem", "evidence", "confidence",
-                                   "valid_from", "valid_to")
+                                   "valid_from", "valid_to", "ttl_s")
                         kw = {k: b[k] for k in _scalar if b.get(k) is not None}
                         # caused_by may live at the top level of the request body
                         # OR inside doc (natural for clients embedding it in the document).
@@ -368,6 +371,10 @@ def make_handler(manager: Manager, token: Optional[str]):
                     if method == "POST" and action == "checkpoint":
                         head = db.checkpoint()
                         self._send(200, {"ok": True, "head": head, "seq": db.seq})
+                        return
+                    if method == "POST" and action == "sweep":
+                        swept = db.sweep()
+                        self._send(200, {"ok": True, "swept": swept, "seq": db.seq})
                         return
                     if method == "GET" and action == "log":
                         limit = int(query.get("limit", ["50"])[0])
@@ -913,6 +920,26 @@ def main() -> None:
     token = args.token
     resp2_port = args.resp2_port
     manager = Manager(data)
+
+    # TTL sweeper: engine expiry is lazy (as_of=None gets) but daemon reads are
+    # snapshot-pinned, so expired docs would linger forever without an active
+    # sweep. Runs every NEDBD_SWEEP_S seconds (default 30; 0 disables) through
+    # each Sequencer's committer intent — single-writer discipline preserved.
+    sweep_s = float(os.environ.get("NEDBD_SWEEP_S", "30"))
+    if sweep_s > 0:
+        def _sweeper():
+            import time as _t
+            while True:
+                _t.sleep(sweep_s)
+                for _name in list(manager._open.keys()):
+                    try:
+                        n = manager._open[_name].sweep()
+                        if n:
+                            _log(f"  [nedbd] ttl sweep [{_name}]: {n} expired", level=1)
+                    except Exception as _e:  # noqa: BLE001
+                        _log(f"  [nedbd] ttl sweep [{_name}] error: {_e}", level=1)
+        threading.Thread(target=_sweeper, name="nedbd-ttl-sweeper", daemon=True).start()
+
     httpd = ThreadingHTTPServer((host, port), make_handler(manager, token))
     auth = "on" if token else "off"
     BANNER = f"""\

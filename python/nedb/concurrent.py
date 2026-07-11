@@ -115,6 +115,11 @@ class Sequencer:
     def checkpoint(self) -> Any:
         return self._submit("checkpoint")
 
+    def sweep(self) -> Any:
+        """TTL sweep as ONE committer intent — sweep appends delete ops, so it
+        must ride the single writer, never race it from another thread."""
+        return self._submit("sweep")
+
     # ── read API: concurrent, snapshot-isolated at committed_seq ───────────────
     def query(self, nql: str) -> List[dict]:
         plan = parse_nql(nql)
@@ -216,6 +221,8 @@ class Sequencer:
             return db.checkpoint()
         if k == "tx":
             return db.tx(*intent.args, **intent.kwargs)
+        if k == "sweep":
+            return db.sweep()
         raise ValueError(f"unknown write kind: {k}")
 
     def close(self) -> None:
