@@ -35,7 +35,11 @@ HTTP API (all JSON):
   GET    /v1/databases/<name>/files/<filename>/root?version=N&tier=warm  — Merkle root (anchorable)
   POST   /v1/databases/<name>/proof             {hash}  — Merkle inclusion proof (verifiable offline)
   POST   /v1/databases/<name>/checkpoint        — on-demand checkpoint
-  GET    /v1/databases/<name>/batch             — batch writes (array of {op,coll,id,doc})
+  POST   /v1/databases/<name>/batch             — ATOMIC multi-op tx: {ops: [{op, coll, id,
+                                                  doc?, if_seq?, idem?, client?}], client?}
+                                                  all-or-nothing; if_seq CAS preconditions
+                                                  (N = exact version, -1 = must-not-exist);
+                                                  409 {error: "precondition_failed", failures}
 """
 from __future__ import annotations
 
@@ -52,6 +56,7 @@ from . import __version__
 from .engine import NEDB
 from .concurrent import Sequencer
 from .log import ReplayError
+from .engine import PreconditionFailed
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
@@ -525,30 +530,43 @@ def make_handler(manager: Manager, token: Optional[str]):
                                      "size": len(data), "tier": tier})
                     return
 
-                # POST /v1/databases/<name>/batch  — multiple ops in one request
-                # Body: {ops: [{op:"put"|"del"|"link", coll, id, doc?, frm?, rel?, to?}, ...]}
+                # POST /v1/databases/<name>/batch  — ATOMIC multi-op transaction.
+                # Body: {ops: [{op:"put"|"del"|"link", coll, id, doc?, frm?, rel?,
+                #               to?, if_seq?, idem?, client?, caused_by?, ttl_s?}, ...],
+                #        client?: default client for ops that don't set one}
+                #
+                # All-or-nothing: every `if_seq` precondition is validated against
+                # current state FIRST (under the Sequencer's single committer
+                # thread — nothing can interleave); if any fails, HTTP 409 with
+                # the structured failure list and NOTHING is applied.
+                #
+                # `if_seq` contract (the Lua-atomics replacement):
+                #   if_seq = N   doc's last_seq must be exactly N (CAS)
+                #   if_seq = -1  doc must not exist (create-once)
+                #   omitted      unconditional
+                #
+                # Per-op `idem` and `client` are forwarded to the op log (idem
+                # keys dedupe engine-side; client attributes provenance).
                 if method == "POST" and len(parts) == 4 and parts[:2] == ["v1", "databases"] and parts[3] == "batch":
                     db = manager.require(parts[2])
                     b = self._body()
                     ops_list = b.get("ops") or []
                     if not isinstance(ops_list, list) or not ops_list:
                         raise HttpError(400, "ops array is required")
-                    results = []
-                    for op in ops_list:
-                        kind = str(op.get("op", "put")).lower()
-                        if kind == "put":
-                            doc = db.put(str(op["coll"]), str(op["id"]), dict(op.get("doc") or {}))
-                            results.append({"op": "put", "id": op["id"], "seq": db.seq})
-                        elif kind == "del":
-                            db.delete(str(op["coll"]), str(op["id"]))
-                            results.append({"op": "del", "id": op["id"], "seq": db.seq})
-                        elif kind == "link":
-                            db.link(str(op["frm"]), str(op["rel"]), str(op["to"]))
-                            results.append({"op": "link", "seq": db.seq})
-                        else:
-                            results.append({"op": kind, "error": "unknown op"})
-                    self._send(200, {"results": results, "count": len(results),
-                                     "seq": db.seq, "head": db.head})
+                    default_client = str(b.get("client") or "http")
+                    try:
+                        out = db.tx(ops_list, default_client=default_client)
+                    except PreconditionFailed as e:
+                        self._send(409, {"error": "precondition_failed",
+                                         "failures": e.failures,
+                                         "seq": db.seq})
+                        return
+                    except ReplayError as e:
+                        raise HttpError(409, str(e))
+                    except (KeyError, TypeError, ValueError) as e:
+                        raise HttpError(400, f"bad op: {e}")
+                    self._send(200, {"results": out["results"], "count": out["count"],
+                                     "atomic": True, "seq": db.seq, "head": db.head})
                     return
 
                 raise HttpError(404, "no such route")

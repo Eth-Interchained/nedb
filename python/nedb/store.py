@@ -40,6 +40,16 @@ class MVCCStore:
             _, val = chain[i]
         return None if val is TOMB else val
 
+    def last_seq(self, key: str) -> Optional[int]:
+        """Seq of the most recent op that touched this key (including a
+        delete's tombstone), or None if the key has never been written.
+
+        This is the version anchor for compare-and-set (`if_seq`): a CAS
+        taken against version N correctly fails after ANY later write or
+        delete, because that op advanced the key's last_seq past N."""
+        seqs = self._seqs.get(key)
+        return seqs[-1] if seqs else None
+
     def keys(self, prefix: str = "", as_of: Optional[int] = None) -> List[str]:
         # Lock-free read: take an atomic snapshot of the key set, then resolve
         # versions by `as_of`. Under the concurrent Sequencer a single committer

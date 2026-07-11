@@ -24,6 +24,23 @@ from .relations import Relations
 from .store import MVCCStore
 
 
+class PreconditionFailed(Exception):
+    """An `if_seq` compare-and-set precondition did not hold; the transaction
+    was rejected as a unit and NOTHING was applied. `.failures` lists every
+    failed check as {index, coll, id, expected, actual}."""
+
+    def __init__(self, failures: List[dict]):
+        self.failures = failures
+        super().__init__(
+            f"{len(failures)} precondition(s) failed: "
+            + "; ".join(
+                f"[{f['index']}] {f['coll']}:{f['id']} expected seq "
+                f"{f['expected']}, actual {f['actual']}"
+                for f in failures
+            )
+        )
+
+
 def apply_op(store: MVCCStore, relations: Relations, indexes: Indexes, op: Op,
              cause_map: Optional[Dict[int, List[int]]] = None) -> None:
     """Deterministically fold one op into materialized state."""
@@ -483,6 +500,91 @@ class NEDB:
         if as_of is None:
             return self._check_ttl(coll, id, doc)
         return doc  # time-travel reads never trigger lazy expiry
+
+    def last_seq(self, coll: str, id: str) -> Optional[int]:
+        """Version anchor for compare-and-set: the seq of the most recent op
+        (put OR delete) that touched this document, or None if never written."""
+        return self.store.last_seq(f"{coll}:{id}")
+
+    def tx(self, ops: List[dict], default_client: str = "local") -> dict:
+        """Atomic multi-op transaction with optional per-op CAS preconditions.
+
+        Each op is a dict:
+          {"op": "put",  "coll", "id", "doc", "if_seq"?, "idem"?, "client"?,
+           "caused_by"?, "ttl_s"?}
+          {"op": "del",  "coll", "id", "if_seq"?, "idem"?, "client"?}
+          {"op": "link", "frm", "rel", "to", "client"?}
+
+        `if_seq` semantics (the Lua-atomics replacement contract):
+          if_seq = N   -> the doc's last_seq must be exactly N (the caller
+                          read version N and nothing has touched it since)
+          if_seq = -1  -> the doc must NOT currently exist (create-once)
+          omitted/None -> unconditional
+
+        Two phases: ALL preconditions are validated against current state
+        first; if any fails, PreconditionFailed is raised and NOTHING is
+        applied. Only then are the ops applied in order (each becoming a
+        normal chained, hash-sealed op-log entry).
+
+        Concurrency contract: this method performs no locking of its own.
+        It is atomic when executed by a single writer — which is exactly how
+        the daemon runs it (one intent on the Sequencer's committer thread,
+        the same single-writer property that made Redis Lua scripts atomic).
+        Embedded multi-threaded callers must route through Sequencer.tx().
+
+        Durability: the Sequencer group-commits, so a tx submitted as one
+        intent shares a single fsync boundary — a crash before it loses the
+        whole tx together, never a prefix of it.
+
+        Precondition reads use the raw store (no TTL side effects): an
+        expired-but-unswept doc still counts as existing for if_seq == -1;
+        call sweep() first where create-once interacts with TTLs.
+        """
+        failures: List[dict] = []
+        for i, op in enumerate(ops):
+            want = op.get("if_seq")
+            if want is None:
+                continue
+            kind = str(op.get("op", "put")).lower()
+            if kind not in ("put", "del", "delete"):
+                continue  # links carry no per-doc version
+            coll, rid = str(op["coll"]), str(op["id"])
+            cur = self.store.last_seq(f"{coll}:{rid}")
+            want = int(want)
+            if want == -1:
+                if self.store.get(f"{coll}:{rid}") is not None:
+                    failures.append({"index": i, "coll": coll, "id": rid,
+                                     "expected": -1, "actual": cur})
+            elif cur != want:
+                failures.append({"index": i, "coll": coll, "id": rid,
+                                 "expected": want, "actual": cur})
+        if failures:
+            raise PreconditionFailed(failures)
+
+        results: List[dict] = []
+        for op in ops:
+            kind = str(op.get("op", "put")).lower()
+            client = str(op.get("client") or default_client)
+            if kind == "put":
+                stored = self.put(str(op["coll"]), str(op["id"]),
+                                  dict(op.get("doc") or {}),
+                                  client=client,
+                                  idem=op.get("idem"),
+                                  ttl_s=op.get("ttl_s"),
+                                  caused_by=op.get("caused_by"))
+                results.append({"op": "put", "id": op["id"], "seq": self.seq,
+                                "doc": stored})
+            elif kind in ("del", "delete"):
+                self.delete(str(op["coll"]), str(op["id"]),
+                            client=client, idem=op.get("idem"))
+                results.append({"op": "del", "id": op["id"], "seq": self.seq})
+            elif kind == "link":
+                self.link(str(op["frm"]), str(op["rel"]), str(op["to"]),
+                          client=client)
+                results.append({"op": "link", "seq": self.seq})
+            else:
+                results.append({"op": kind, "error": "unknown op"})
+        return {"results": results, "count": len(results), "seq": self.seq}
 
     def expire(self, coll: str, id: str, ttl_s: float) -> bool:
         """Set or update the TTL on an existing document. Returns False if not found."""

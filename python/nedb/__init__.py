@@ -16,7 +16,7 @@ as ``nedb._native`` (``nedb.__has_native__`` reports whether it loaded).
 """
 from __future__ import annotations
 
-from .engine import NEDB
+from .engine import NEDB, PreconditionFailed
 from .log import Op, OpLog, ReplayError
 from .query import Query, parse_nql
 from .snapshot import save_snapshot, load_snapshot
@@ -79,7 +79,7 @@ except ImportError:  # pure-Python install (sdist / unsupported platform)
     del _types, _sys, _NativeStub, _native_stub
 
 __all__ = [
-    "NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
+    "NEDB", "PreconditionFailed", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
     "save_snapshot", "load_snapshot",
     "sql_exec", "sql_to_nql", "SQLError", "SQLUnsupportedError",
     "RedisCompat", "RedisError", "RedisUnsupportedError",
