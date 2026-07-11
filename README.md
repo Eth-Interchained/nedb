@@ -155,6 +155,50 @@ MongoClient(db)["users"].find({"status": "active"}).sort("age", -1).to_list()
 
 ---
 
+## Official Python client — talk to nedbd over HTTP
+
+Running the daemon? `nedb.client.NedbClient` is the official client for its
+HTTP API — extracted from the battle-tested clients that ran a production
+Redis→NEDB mainnet migration, speaking the full route surface: queries,
+atomic CAS transactions, TTL, indexes, relations, Merkle proofs, and the
+Mongo-compat endpoint. Env-var defaults (`NEDBD_URL`, `NEDBD_TOKEN`,
+`NEDB_DB`) mirror the daemon's own.
+
+```python
+from nedb import NedbClient, PreconditionFailed, op_put
+
+c = NedbClient("http://127.0.0.1:7070", db="app", token="s3cret")
+c.ensure_database()
+
+c.put("users", "u1", {"id": "u1", "email": "a@b.c"}, idem="signup-u1")
+c.query('FROM users WHERE email = "a@b.c"')      # full NQL rides through
+c.query("FROM users AS OF 41")                    # time-travel included
+
+# Atomic all-or-nothing transaction with engine-checked preconditions —
+# the primitive that replaces Redis Lua scripts (if_seq: N = CAS, -1 = create-once)
+doc = c.get_doc("users", "u1")                    # docs carry _seq
+c.tx([op_put("users", "u1", {**doc, "plan": "pro"}, if_seq=doc["_seq"])])
+
+# Contested writes: retry ONLY on PreconditionFailed, capped backoff
+def bump():
+    d = c.get_doc("counters", "hits") or {"n": 0}
+    return c.tx([op_put("counters", "hits", {"n": d.get("n", 0) + 1},
+                        if_seq=d.get("_seq", -1))])
+c.cas_retry(bump)
+
+# Integrity, verifiable WITHOUT trusting the server
+proof = c.proof(c.log(limit=1)[0]["hash"])
+from nedb import verify_proof; verify_proof(proof)  # -> True, locally
+```
+
+A CAS miss raises the **same `PreconditionFailed`** (with the same
+`.failures` shape) the embedded engine raises — code written against
+`NEDB.tx` ports to the HTTP client without changing its except-clauses.
+Typed errors throughout: `NedbAuthError`, `NedbNotFound`, `NedbBadRequest`,
+`NedbConflict`, `CasExhausted`.
+
+---
+
 ## Redis layer-2 — wrap_redis()
 
 Already running on Redis? Wrap your connection in one line and gain NEDB features *alongside* your existing Redis app — no migration required.

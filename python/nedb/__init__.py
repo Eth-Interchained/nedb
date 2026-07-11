@@ -18,6 +18,11 @@ from __future__ import annotations
 
 from .engine import NEDB, PreconditionFailed
 from .log import Op, OpLog, ReplayError
+from .client import (
+    NedbClient, op_put, op_del,
+    NedbError, NedbAuthError, NedbNotFound, NedbBadRequest,
+    NedbConflict, CasExhausted,
+)
 from .query import Query, parse_nql
 from .snapshot import save_snapshot, load_snapshot
 from .crypto import resolve_tmk, rewrap_dek
