@@ -9,8 +9,48 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::types::PyCFunction;
 use std::sync::{Arc, Weak};
-use nedb_engine::{Db, nql};
+use nedb_engine::{Db, Dek, nql};
 use serde_json::Value;
+
+/// Resolve the 32-byte TMK for embedded at-rest encryption.
+///
+/// Daemon-parity semantics (see `nedbd-v2` main.rs): the key is a 64-char hex
+/// string. Priority: explicit `tmk` argument, then the `NEDB_TMK` environment
+/// variable. Fails CLOSED — a key that was provided but is malformed is an
+/// error, never a silent fall-through to a plaintext open.
+fn resolve_embedded_tmk(explicit: Option<&str>) -> PyResult<Option<[u8; 32]>> {
+    let raw = match explicit {
+        Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(_) => None,
+        None => match std::env::var("NEDB_TMK") {
+            Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        },
+    };
+    let Some(hexstr) = raw else { return Ok(None) };
+    let bytes = hex::decode(&hexstr)
+        .map_err(|e| PyRuntimeError::new_err(format!("NEDB_TMK is not valid hex: {e}")))?;
+    let key: [u8; 32] = bytes.try_into().map_err(|_| {
+        PyRuntimeError::new_err("NEDB_TMK must be exactly 32 bytes (64 hex chars)")
+    })?;
+    Ok(Some(key))
+}
+
+/// DEK salt = the database directory's final path component — exactly the salt
+/// `nedbd-v2` uses (`Dek::from_tmk(&tmk, name.as_bytes())` where the db dir is
+/// `data_dir.join(name)`). Same directory name + same TMK ⇒ same DEK, whether
+/// the store is opened embedded or served by the daemon.
+fn dek_salt_from_path(path: &str) -> PyResult<String> {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "cannot derive database name from path (need a directory whose final \
+                 component is the database name, e.g. /data/nedb/aias)",
+            )
+        })
+}
 
 /// Register a Python `atexit` hook that flushes this durable database on
 /// interpreter shutdown — durable-mode auto-flush-on-exit for the native module.
@@ -47,6 +87,7 @@ fn node_to_json_str(node: &nedb_engine::store::Node) -> String {
 #[pyclass]
 struct NedbCore {
     inner: Arc<Db>,
+    encrypted: bool,
 }
 
 #[allow(unused_variables)]
@@ -55,23 +96,45 @@ impl NedbCore {
     /// Create an in-memory v2 DAG database — zero disk I/O.
     #[new]
     fn new() -> Self {
-        Self { inner: Arc::new(Db::in_memory()) }
+        Self { inner: Arc::new(Db::in_memory()), encrypted: false }
     }
 
     /// Open a durable v2 DAG database at `path`.
+    ///
+    /// Encryption (AES-256-GCM at the object-store layer — NQL untouched):
+    /// pass `tmk="<64-char hex>"` or set the `NEDB_TMK` environment variable
+    /// (explicit argument wins). The DEK is derived exactly as `nedbd-v2`
+    /// derives it — `SHA-256(TMK ‖ <final path component>)` — so a directory
+    /// opened embedded and the same directory served by the daemon under the
+    /// same database name decrypt identically. Composes with `NEDB_DAG_V3`
+    /// (segments store already-encrypted object bytes). A malformed key fails
+    /// the open — never a silent plaintext fall-through.
     ///
     /// Durable-mode auto-flush-on-exit is armed here by registering a Python
     /// `atexit` hook (see `register_atexit_flush`) — the CPython-cooperative path,
     /// NOT a C-level signal handler, which would seize `SIGINT` and break
     /// `KeyboardInterrupt`. The in-memory constructor never arms it.
     #[staticmethod]
-    fn open(py: Python<'_>, path: &str) -> PyResult<Self> {
-        let db = Db::open(std::path::Path::new(path), None)
+    #[pyo3(signature = (path, tmk=None))]
+    fn open(py: Python<'_>, path: &str, tmk: Option<&str>) -> PyResult<Self> {
+        let dek = match resolve_embedded_tmk(tmk)? {
+            Some(key) => Some(Dek::from_tmk(&key, dek_salt_from_path(path)?.as_bytes())),
+            None => None,
+        };
+        let encrypted = dek.is_some();
+        let db = Db::open(std::path::Path::new(path), dek)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let inner = Arc::new(db);
         // Best-effort: a hook-registration hiccup must not fail open().
         let _ = register_atexit_flush(py, Arc::downgrade(&inner));
-        Ok(Self { inner })
+        Ok(Self { inner, encrypted })
+    }
+
+    /// True when this database was opened with a TMK — i.e. every object is
+    /// AES-256-GCM encrypted at rest. Boot checks in embedders (aias) assert
+    /// this instead of trusting env plumbing.
+    fn encrypted(&self) -> bool {
+        self.encrypted
     }
 
     // ── Indexes ────────────────────────────────────────────────────────────────

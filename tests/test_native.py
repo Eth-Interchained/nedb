@@ -274,6 +274,124 @@ check("NEDB().query works",        len(rows) == 1)
 check("NEDB() verify()",           high.verify())
 
 # ══════════════════════════════════════════════════════════════════════════════
+section("Embedded encryption (TMK → AES-256-GCM at rest)")
+# ══════════════════════════════════════════════════════════════════════════════
+# NedbCore.open(path, tmk=...) — added in 2.7.1. Feature-detect so this suite
+# still runs green against older wheels and the pure-Python fallback adapter.
+_TMK_HEX = "aa" * 32          # 64 hex chars = 32 bytes (test key only)
+_WRONG_HEX = "bb" * 32
+_MARKER = "classified-plaintext-marker-do-not-leak"
+_tmk_supported = False
+if _nedb_pkg.__has_native__:
+    _probe_dir = tempfile.mkdtemp(suffix="-nedbtmk")
+    try:
+        _probe = NedbCore.open(os.path.join(_probe_dir, "probe"), tmk=_TMK_HEX)
+        _tmk_supported = True
+        del _probe
+    except TypeError:
+        print("    …  open(tmk=) not supported by this wheel (< 2.7.1) — section skipped")
+    finally:
+        shutil.rmtree(_probe_dir, ignore_errors=True)
+else:
+    print("    …  native core not loaded — section skipped")
+
+if _tmk_supported:
+    _enc_root = tempfile.mkdtemp(suffix="-nedbenc")
+    _saved_tmk = os.environ.pop("NEDB_TMK", None)
+    _saved_dagv3 = os.environ.pop("NEDB_DAG_V3", None)
+    try:
+        # ── 1. Explicit-arg key: write, read back, introspect ─────────────────
+        d_enc = os.path.join(_enc_root, "vault")
+        db_e1 = NedbCore.open(d_enc, tmk=_TMK_HEX)
+        check("encrypted() True with tmk arg", db_e1.encrypted())
+        db_e1.put("secrets", "s1", json.dumps({"payload": _MARKER, "level": 9}))
+        raw = db_e1.get("secrets", "s1")
+        check("keyed session reads own write", raw is not None and _MARKER in raw)
+        check("NQL works on encrypted store",
+              len(db_e1.query("FROM secrets WHERE level = 9")) == 1)
+        db_e1.flush()
+
+        # ── 2. THE at-rest proof: marker must not exist in any on-disk byte ──
+        leaked_on_disk = False
+        for _root, _, _files in os.walk(d_enc):
+            for _fn in _files:
+                with open(os.path.join(_root, _fn), "rb") as _fh:
+                    if _MARKER.encode() in _fh.read():
+                        leaked_on_disk = True
+        check("plaintext marker absent from every on-disk byte", not leaked_on_disk)
+
+        # ── 3. Keyless reopen must not yield plaintext ────────────────────────
+        leaked = False
+        try:
+            r = NedbCore.open(d_enc).get("secrets", "s1")
+            leaked = r is not None and _MARKER in r
+        except Exception:
+            pass  # raising is an acceptable (loud) failure mode
+        check("keyless reopen cannot read plaintext", not leaked)
+
+        # ── 4. Wrong key must not yield plaintext ─────────────────────────────
+        leaked = False
+        try:
+            r = NedbCore.open(d_enc, tmk=_WRONG_HEX).get("secrets", "s1")
+            leaked = r is not None and _MARKER in r
+        except Exception:
+            pass
+        check("wrong TMK cannot read plaintext", not leaked)
+
+        # ── 5. Correct key reopens and reads ──────────────────────────────────
+        db_e2 = NedbCore.open(d_enc, tmk=_TMK_HEX)
+        r = db_e2.get("secrets", "s1")
+        check("correct TMK reopens + reads", r is not None and _MARKER in r)
+        check("verify() green on encrypted store", db_e2.verify())
+
+        # ── 6. Env fallback: NEDB_TMK honored when no arg is passed ──────────
+        os.environ["NEDB_TMK"] = _TMK_HEX
+        db_env = NedbCore.open(os.path.join(_enc_root, "envvault"))
+        check("NEDB_TMK env fallback → encrypted()", db_env.encrypted())
+        db_env.put("secrets", "e1", json.dumps({"payload": _MARKER}))
+        check("env-keyed write reads back",
+              _MARKER in (db_env.get("secrets", "e1") or ""))
+        del os.environ["NEDB_TMK"]
+
+        # ── 7. Malformed keys fail CLOSED (never silent plaintext) ───────────
+        for bad, why in [("zz" * 32, "non-hex"), ("aa" * 8, "too short")]:
+            failed_closed = False
+            try:
+                NedbCore.open(os.path.join(_enc_root, "bad"), tmk=bad)
+            except Exception:
+                failed_closed = True
+            check(f"malformed TMK ({why}) rejects open", failed_closed)
+
+        # ── 8. Composes with NEDB_DAG_V3 (segments carry encrypted bytes) ────
+        os.environ["NEDB_DAG_V3"] = "1"
+        os.environ["NEDB_TMK"] = _TMK_HEX
+        d_v3 = os.path.join(_enc_root, "v3vault")
+        db_v3 = NedbCore.open(d_v3)
+        check("dag-v3 + TMK: encrypted()", db_v3.encrypted())
+        db_v3.put("secrets", "v1", json.dumps({"payload": _MARKER, "tier": 1}))
+        check("dag-v3 + TMK: read back", _MARKER in (db_v3.get("secrets", "v1") or ""))
+        check("dag-v3 + TMK: NQL", len(db_v3.query("FROM secrets WHERE tier = 1")) == 1)
+        db_v3.flush()
+        leaked_on_disk = False
+        for _root, _, _files in os.walk(d_v3):
+            for _fn in _files:
+                with open(os.path.join(_root, _fn), "rb") as _fh:
+                    if _MARKER.encode() in _fh.read():
+                        leaked_on_disk = True
+        check("dag-v3 + TMK: marker absent on disk", not leaked_on_disk)
+        del os.environ["NEDB_DAG_V3"], os.environ["NEDB_TMK"]
+
+        # ── 9. No key at all → encrypted() False (plaintext is explicit) ─────
+        db_plain = NedbCore.open(os.path.join(_enc_root, "plain"))
+        check("no TMK → encrypted() False", not db_plain.encrypted())
+    finally:
+        if _saved_tmk is not None:
+            os.environ["NEDB_TMK"] = _saved_tmk
+        if _saved_dagv3 is not None:
+            os.environ["NEDB_DAG_V3"] = _saved_dagv3
+        shutil.rmtree(_enc_root, ignore_errors=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 section("Performance spot-check")
 # ══════════════════════════════════════════════════════════════════════════════
 N = 10_000
