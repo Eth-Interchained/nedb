@@ -320,11 +320,18 @@ if _tmk_supported:
                         leaked_on_disk = True
         check("plaintext marker absent from every on-disk byte", not leaked_on_disk)
 
+        # Release the first handle before reopening the same dir: as of 2.7.2
+        # the engine holds an exclusive LOCK on the data directory (split-brain
+        # guard) — a live second open of the same dir in ANY process refuses.
+        del db_e1
+
         # ── 3. Keyless reopen must not yield plaintext ────────────────────────
         leaked = False
         try:
-            r = NedbCore.open(d_enc).get("secrets", "s1")
+            db_nokey = NedbCore.open(d_enc)
+            r = db_nokey.get("secrets", "s1")
             leaked = r is not None and _MARKER in r
+            del db_nokey
         except Exception:
             pass  # raising is an acceptable (loud) failure mode
         check("keyless reopen cannot read plaintext", not leaked)
@@ -332,8 +339,10 @@ if _tmk_supported:
         # ── 4. Wrong key must not yield plaintext ─────────────────────────────
         leaked = False
         try:
-            r = NedbCore.open(d_enc, tmk=_WRONG_HEX).get("secrets", "s1")
+            db_wrong = NedbCore.open(d_enc, tmk=_WRONG_HEX)
+            r = db_wrong.get("secrets", "s1")
             leaked = r is not None and _MARKER in r
+            del db_wrong
         except Exception:
             pass
         check("wrong TMK cannot read plaintext", not leaked)
@@ -343,6 +352,17 @@ if _tmk_supported:
         r = db_e2.get("secrets", "s1")
         check("correct TMK reopens + reads", r is not None and _MARKER in r)
         check("verify() green on encrypted store", db_e2.verify())
+
+        # ── 5b. Split-brain guard (2.7.2+): second live open of SAME dir refuses
+        _ver = tuple(int(x) for x in _nedb_pkg.__version__.split(".")[:3])
+        if _ver >= (2, 7, 2):
+            refused = False
+            try:
+                NedbCore.open(d_enc, tmk=_TMK_HEX)  # db_e2 still holds the LOCK
+            except Exception as e:
+                refused = "locked" in str(e).lower() or "split-brain" in str(e).lower()
+            check("second live open of a locked dir refuses (LOCK guard)", refused)
+        del db_e2
 
         # ── 6. Env fallback: NEDB_TMK honored when no arg is passed ──────────
         os.environ["NEDB_TMK"] = _TMK_HEX

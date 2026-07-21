@@ -85,6 +85,16 @@ pub struct Db {
     pub sorted_indexes: SortedIndexes,
     pub graph:          GraphStore,
     pub root:           PathBuf,
+    /// Advisory exclusive lock on the data directory (`LOCK` file), held for
+    /// the Db's lifetime. One process owns a durable store at a time — a
+    /// second opener gets a loud refusal instead of silent split-brain (two
+    /// engines with independent in-memory state on one dir: cross-process
+    /// writes invisible, CAS races — the 2026-07-20 aias multi-worker session
+    /// bug, caught live). Released automatically on drop AND on any process
+    /// death including SIGKILL, because the flock dies with the fd. `None`
+    /// for in-memory databases and under NEDB_SHARED_OPEN=1 (operator
+    /// override for tooling that accepts the risk).
+    _dir_lock:          Option<std::fs::File>,
     /// Dirty flag — set true when head changes, cleared after manifest flush.
     /// Decouples flush_manifest from the hot write path so concurrent writes
     /// don't serialise on 2× file I/O per PUT.
@@ -127,6 +137,7 @@ impl Db {
             sorted_indexes: SortedIndexes::new(),
             graph:          GraphStore::in_memory(),
             root:           std::path::PathBuf::from(":memory:"),
+            _dir_lock:      None,
             seq:            AtomicU64::new(0),
             head:           RwLock::new(String::new()),
             tip_hash:       RwLock::new((0, String::new())),
@@ -137,9 +148,44 @@ impl Db {
         }
     }
 
+    /// Acquire the exclusive advisory lock on a durable data directory.
+    /// Refuses (with the holder's pid when known) rather than allowing a
+    /// second live engine on the same files. NEDB_SHARED_OPEN=1 skips the
+    /// guard entirely — for tooling that knowingly accepts split-brain risk.
+    fn acquire_dir_lock(db_root: &Path) -> Result<Option<std::fs::File>> {
+        if std::env::var("NEDB_SHARED_OPEN").map(|v| v.trim() == "1").unwrap_or(false) {
+            return Ok(None);
+        }
+        use fs2::FileExt as _;
+        use std::io::Write as _;
+        let lock_path = db_root.join("LOCK");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true).read(true).write(true).open(&lock_path)?;
+        if lock_file.try_lock_exclusive().is_err() {
+            let holder = std::fs::read_to_string(&lock_path).unwrap_or_default();
+            let holder = holder.trim();
+            anyhow::bail!(
+                "data directory {:?} is locked by another process{} — refusing a \
+                 split-brain open: a second engine on the same files cannot see this \
+                 process's writes (invisible sessions, CAS races). Stop the other \
+                 process, or set NEDB_SHARED_OPEN=1 only if you accept that risk.",
+                db_root,
+                if holder.is_empty() { String::new() } else { format!(" (pid {holder})") }
+            );
+        }
+        // Best-effort: record our pid for the next contender's error message.
+        let _ = lock_file.set_len(0);
+        let _ = writeln!(&lock_file, "{}", std::process::id());
+        let _ = lock_file.sync_all();
+        Ok(Some(lock_file))
+    }
+
     /// Open (or create) a database. Runs v1→v2 migration automatically if log.aof is present.
     pub fn open(db_root: &Path, dek: Option<Dek>) -> Result<Self> {
         std::fs::create_dir_all(db_root)?;
+
+        // Split-brain guard FIRST — refuse before touching any store state.
+        let dir_lock = Self::acquire_dir_lock(db_root)?;
 
         let objects        = ObjectStore::new(db_root, dek.clone())?;
         let id_index       = IdIndex::new(db_root)?;
@@ -152,6 +198,7 @@ impl Db {
             sorted_indexes,
             graph,
             root: db_root.to_path_buf(),
+            _dir_lock: dir_lock,
             seq:  AtomicU64::new(0),
             head: RwLock::new(String::new()),
             tip_hash: RwLock::new((0, String::new())),

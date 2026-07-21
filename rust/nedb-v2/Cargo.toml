@@ -50,6 +50,10 @@ futures-core = "0.3"
 thiserror    = "1"
 anyhow       = "1"
 
+# Data-dir advisory lock (split-brain guard in Db::open) — flock(2) on unix,
+# LockFileEx on Windows, one cross-platform call.
+fs2          = "0.4"
+
 # Fast-fsync on macOS: std's File::sync_all/sync_data map to F_FULLFSYNC there
 # (full hardware cache flush, 10-100x slower than plain fsync). NEDB_FAST_FSYNC
 # uses libc::fsync(2) instead. Unix-only dep; not pulled on Windows.
