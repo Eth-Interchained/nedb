@@ -51,7 +51,7 @@ DB is unset — run: nedb-use <name>"
   if command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
     local PY; PY=$(command -v python3 || command -v python)
     printf '%s' "$body" | "$PY" -c '
-import json,sys
+import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: print(sys.stdin.read()); raise SystemExit
 if "nql" not in d:
@@ -67,9 +67,28 @@ if d.get("drift"):
     print("              ^ this plan may answer a different question")
 if d.get("executed"):
     n = d.get("count", 0)
+    rows = d.get("rows") or []
     print("  rows       ", n)
-    for r in (d.get("rows") or [])[:8]: print("     ", json.dumps(r))
-    if n > 8: print("      ...", n - 8, "more")
+    # Hide _coll/_hash/_seq by default. A 64-char BLAKE2b hash on every line
+    # buries the actual data -- and the data is what you are here to read.
+    # NEDB_RAW=1 brings them back.
+    raw = os.environ.get("NEDB_RAW") == "1"
+    SHOW = 10
+    hid = False
+    for r in rows[:SHOW]:
+        if not raw and isinstance(r, dict):
+            trimmed = {k: v for k, v in r.items() if k == "_id" or not k.startswith("_")}
+            if len(trimmed) != len(r):
+                hid = True
+            r = trimmed
+        print("     ", json.dumps(r))
+    tail = []
+    if n > SHOW:
+        tail.append("%d more" % (n - SHOW))
+    if hid:
+        tail.append("_hash/_seq hidden, NEDB_RAW=1 to show")
+    if tail:
+        print("      ... " + " | ".join(tail))
 else:
     # Say what did NOT happen, and how to make it happen. "executed no" read
     # as a status field people skim past -- the plan looked like an answer.
