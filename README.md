@@ -501,6 +501,47 @@ Built without the feature, the route returns **501** rather than 404 — clients
 ./scripts/test-cast.sh --boot     # boots a daemon, seeds, casts, executes, checks failure modes
 ```
 
+### Casting from a shell
+
+```bash
+. ./scripts/nedb.sh          # bash / zsh / Git Bash
+
+nedb-dbs                     # which databases exist
+nedb-use shop                # pick one
+cast "orders over 100"       # plan only — nothing runs
+cast -x "orders over 100"    # plan AND execute
+```
+
+```
+  nql         FROM orders WHERE total > 100
+  valid       yes    collection orders known: yes
+  executed    no  (add -x to run it)
+```
+
+The summary leads with the NQL because **reading it is the job**. `valid: yes` means it parses, not that it's what you meant — `LIMIT 100` parses perfectly.
+
+`NEDB=http://host:7070` points at a remote daemon. Prompts are JSON-escaped, so apostrophes and quotes are safe.
+
+### Prompts it handles well
+
+Accuracy varies by clause, so phrasing matters more than length:
+
+| you want | say | eval |
+|---|---|---|
+| `TRACE caused_by` | *what caused these checkpoints* | 96.5% |
+| `TRAVERSE` | *orders traverse placed_by* | 93.3% |
+| one `WHERE` | *orders over 100* · *active drivers* | 91.2% |
+| `LIMIT` | *top 5 orders* | 91.1% |
+| `SEARCH` | *search orders for refund* | 90.5% |
+| `ORDER BY` | *orders sorted by total descending* | 87.7% |
+| two+ `WHERE` | *paid orders with total over 100* | 85.1% |
+| `GROUP BY` + agg | *orders grouped by status with sum of total* | 77.0% |
+
+Two habits that avoid most misses:
+
+- **Name the field** when a number could be a limit. *"orders with total over 100"* beats *"orders over 100"* — bare *"over N"* is what produced the `LIMIT 100` miss above.
+- **Check numbers over four digits.** Digits are tokenized one at a time, so `height 400000` can come back `4000`.
+
 ---
 
 ## Performance

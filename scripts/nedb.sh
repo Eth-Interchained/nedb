@@ -1,0 +1,73 @@
+# NEDB cast helpers — source this:  . ./nedb.sh
+# Works in Git Bash / MINGW64. Needs curl only.
+
+: "${NEDB:=http://127.0.0.1:7070}"   # daemon
+: "${DB:=}"                          # current database
+
+# JSON-escape stdin (backslash, quote, control chars) — prompts with
+# apostrophes or quotes would otherwise produce invalid JSON.
+_nedb_esc() { sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" | tr -d '\r\n'; }
+
+nedb-dbs() { curl -s "$NEDB/v1/databases"; echo; }
+
+nedb-use() {
+  [ -z "$1" ] && { echo "usage: nedb-use <database>"; echo "have: $(nedb-dbs)"; return 1; }
+  DB="$1"; export DB; echo "DB=$DB"
+}
+
+nedb-new() {
+  [ -z "$1" ] && { echo "usage: nedb-new <database>"; return 1; }
+  curl -s -X POST "$NEDB/v1/databases" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$1\"}"; echo; DB="$1"; export DB; echo "DB=$DB"
+}
+
+cast() {
+  if [ -z "$1" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    cat <<'EOF'
+cast "<prompt>"          plan only  (nothing runs)
+cast -x "<prompt>"       plan AND execute
+nedb-dbs                 list databases
+nedb-use <db>            pick one
+nedb-new <db>            create one
+NEDB=http://host:7070    point at another daemon
+EOF
+    [ -n "$DB" ] && echo "" && echo "DB=$DB" || echo "
+DB is unset — run: nedb-use <name>"
+    return 0
+  fi
+  local ex=false
+  if [ "$1" = "-x" ] || [ "$1" = "--execute" ]; then ex=true; shift; fi
+  if [ -z "$DB" ]; then
+    echo "no database selected. try:"; echo "  nedb-use \$(nedb-dbs | tr -d '[]\"' | cut -d, -f1)"
+    echo "  have: $(nedb-dbs)"; return 1
+  fi
+  local p; p=$(printf '%s' "$*" | _nedb_esc)
+  local body; body=$(curl -s -X POST "$NEDB/v1/databases/$DB/cast" \
+       -H 'Content-Type: application/json' \
+       -d "{\"prompt\":\"$p\",\"execute\":$ex}")
+
+  # Readable summary, then the raw JSON. The summary is the point: you are
+  # meant to READ the NQL before trusting it. Falls back to raw if no python.
+  if command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+    local PY; PY=$(command -v python3 || command -v python)
+    printf '%s' "$body" | "$PY" -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(sys.stdin.read()); raise SystemExit
+if "nql" not in d:
+    print("  error:", d.get("error","?")); raise SystemExit(1)
+ok  = "yes" if d.get("valid") else "NO"
+kn  = "yes" if d.get("collection_known") else "NO"
+print("  nql        ", d["nql"])
+print("  valid      ", ok, "   collection", d.get("collection"), "known:", kn)
+if d.get("error"): print("  error      ", d["error"])
+if d.get("executed"):
+    print("  executed    yes -", d.get("count"), "rows")
+    for r in (d.get("rows") or [])[:5]: print("     ", json.dumps(r))
+else:
+    print("  executed    no  (add -x to run it)")
+'
+  else
+    printf '%s\n' "$body"
+  fi
+}
