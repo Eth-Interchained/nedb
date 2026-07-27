@@ -524,6 +524,9 @@ Two gates, because most deployments want neither the model dependency nor the we
 # compile-time
 cargo install nedb-engine --features cast
 
+# or from a source checkout — builds the engine only, not the language bindings
+cd rust && cargo build --release --features cast
+
 # weights (~13 MB) — GitHub release asset, checksum-verified on load
 curl -L -o ./data/model.cast \
   https://github.com/aiassistsecure/nedb-cast-slm/releases/download/v10.30.90/model.cast
