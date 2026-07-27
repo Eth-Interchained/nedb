@@ -15,6 +15,7 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 // ── tiny presentation toolkit ───────────────────────────────────────────────
 const COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -53,11 +54,17 @@ const rm = (d) => { try { fs.rmSync(d, { recursive: true, force: true }); } catc
 
 // ── resolve the native addon (installed package, or in-repo after a build) ───
 let NedbCore;
+// Remember WHICH specifier resolved, so the ACT IV reopen subprocess loads the
+// exact same addon this process did — not a different one that happens to be
+// installed. Getting that wrong would make the reopen test silently meaningless.
+let addonSpecifier;
 try {
   ({ NedbCore } = await import('nedb-engine'));
+  addonSpecifier = 'nedb-engine';
 } catch {
   try {
-    ({ NedbCore } = await import(new URL('../index.js', import.meta.url)));
+    addonSpecifier = new URL('../index.js', import.meta.url).href;
+    ({ NedbCore } = await import(addonSpecifier));
   } catch (err) {
     log(red(bold('\n  nedb-engine native addon not found.')));
     note('This smoke test drives the prebuilt NedbCore binding.');
@@ -163,11 +170,31 @@ try {
   kv('objects/ layout', `${bold(looseObjs)} loose object files  ${dim('(content-addressed, one per object)')}`);
 
   // v3 substrate (env set BEFORE open — the engine reads it per-open).
+  //
+  // The WRITER runs in a child process on purpose. A durable open takes an
+  // exclusive flock on the data dir and the binding exposes no close(), so the
+  // lock lives as long as the handle — and flock is per open-file-description,
+  // not per process tree: a child is blocked by its parent's lock just like any
+  // stranger would be. Letting the writer be a separate process that EXITS is
+  // the only way to release the directory and then genuinely reopen it below.
+  //
+  // It also makes this the real crash-and-restart path — process dies, files
+  // remain, next process picks them up — instead of a same-process handle
+  // shuffle that proves nothing about durability.
   process.env.NEDB_DAG_V3 = '1';
   const segDir = tmp('v3seg'); cleanup.push(segDir);
-  const segDb = NedbCore.open(segDir);
-  for (let i = 0; i < docs; i++) segDb.put('utxo', String(i), sample(i));
-  segDb.flush();
+  const writer = `
+    const { NedbCore } = await import(${JSON.stringify(addonSpecifier)});
+    const db = NedbCore.open(${JSON.stringify(segDir)});
+    for (let i = 0; i < ${docs}; i++) {
+      db.put('utxo', String(i), JSON.stringify({ i, payload: 'coin-' + i, ts: 1719400000 + i }));
+    }
+    db.flush();
+  `;
+  execFileSync(process.execPath, ['--input-type=module', '-e', writer], {
+    env: { ...process.env, NEDB_DAG_V3: '1' },
+    encoding: 'utf8',
+  });
   const segPath = path.join(segDir, 'objects', 'segments');
   const segFiles = fs.existsSync(segPath) ? fs.readdirSync(segPath).filter((f) => f.endsWith('.dat')) : [];
   step(`v3 segment substrate — ${bold(docs)} writes  ${dim('(NEDB_DAG_V3=1)')}`);
@@ -180,9 +207,16 @@ try {
     note('segment file not present yet (objects buffered) — engine still serving from memory+WAL.');
   }
   step('v3 round-trips and verifies after reopen');
+  // The writer process has exited, so the flock is gone and this open is a true
+  // reopen of files written by a process that no longer exists.
+  //
+  // Two wrong ways to make this pass, for the record:
+  //   * NEDB_SHARED_OPEN=1 — silences the split-brain guard instead of testing
+  //   * dropping the assertion — stops covering what it was written for
   const segReopen = NedbCore.open(segDir);  // env still set → reopen as v3
   const rt = JSON.parse(segReopen.get('utxo', '7'));
   kv('reopen → utxo/7', JSON.stringify({ i: rt.i, payload: rt.payload }));
+  note('written by a process that has since exited — this is the restart path');
   tick(`verify() = ${green(String(segReopen.verify()))}  ${dim('— segment store + dual-read of any v2 loose objects')}`);
   expect(rt.i === 7 && segReopen.verify() === true, 'v3 persists and verifies across reopen');
   delete process.env.NEDB_DAG_V3;   // leave the environment as we found it

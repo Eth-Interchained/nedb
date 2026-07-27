@@ -57,6 +57,7 @@ nedbd [OPTIONS] [data_dir]
 |---|---|---|
 | `data_dir` | `./nedb-data` | Directory for database files |
 | `--dag` | off | Use the v2 content-addressed DAG engine |
+| `--cast` | off | Enable natural-language query planning (requires `--features cast`) |
 | `--doctor` | — | Diagnose environment, print fix commands |
 
 ### Environment variables
@@ -69,6 +70,8 @@ nedbd [OPTIONS] [data_dir]
 | `NEDB_TMK` | — | 64-char hex master key for AES-256-GCM encryption at rest |
 | `NEDBD_MEMORY` | — | `1` = pure in-memory mode (no disk I/O) |
 | `NEDBD_DAG` | — | `1` = same as `--dag` flag |
+| `NEDBD_CAST` | — | `1` = same as `--cast` flag |
+| `NEDBD_CAST_MODEL` | — | Explicit path to a `model.cast` container |
 
 ---
 
@@ -86,9 +89,125 @@ POST   /v1/databases/<name>/put         {coll, id, doc, caused_by?}
 POST   /v1/databases/<name>/query       {nql}
 POST   /v1/databases/<name>/link        {frm, rel, to}
 POST   /v1/databases/<name>/neighbors   {node, rel}
+POST   /v1/databases/<name>/cast        {prompt, execute?}    # feature = "cast"
 GET    /v1/databases/<name>/verify
 POST   /v1/databases/<name>/checkpoint
 ```
+
+---
+
+## Cast — natural language into NQL
+
+*Optional. Feature-gated, off by default.*
+
+```bash
+curl -X POST localhost:7070/v1/databases/shop/cast \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"orders over 100"}'
+```
+
+```json
+{
+  "prompt": "orders over 100",
+  "nql": "FROM orders WHERE total > 100",
+  "valid": true,
+  "collection": "orders",
+  "collection_known": true,
+  "collections": ["orders"],
+  "executed": false,
+  "seq": 3,
+  "head": "262fd9…"
+}
+```
+
+A **3.33M-parameter** model ([nedb-cast-slm](https://github.com/aiassistsecure/nedb-cast-slm)) turns a short English prompt into NQL. It runs locally on CPU in a few milliseconds. No API key, no network call, no tokens billed to anyone.
+
+### Why this lives in the engine
+
+The hard part of natural-language querying isn't the model — it's **knowing the schema**. A client has to fetch the collection list and pass it in, and it's stale the moment it arrives. The engine already holds the live list.
+
+So the planner is constrained against real collections at the instant of the call:
+
+```json
+{ "prompt": "show me all stylists",
+  "nql": "FROM stylists",
+  "valid": true,
+  "collection_known": false,
+  "error": "collection \"stylists\" does not exist in \"shop\"" }
+```
+
+HTTP **422**. Not an empty result set — an empty result set reads as *"no matching rows"*, which would be a lie. The query was fine; the collection was imaginary.
+
+Every `nedbd` client inherits this for free instead of reimplementing it.
+
+### Three safety properties
+
+**1 · The model never executes anything.** It emits text. That text goes to the same `nql::query` path a hand-typed query uses. There is no second executor to audit.
+
+**2 · Validation is parsing, not pattern-matching.** `nql::parse` and `nql::execute` share one code path, so they cannot disagree about what is well-formed. Unparseable output returns 422 *with the offending text attached*.
+
+**3 · `execute` defaults to `false`.** You get a plan for review. Opt in explicitly:
+
+```bash
+curl -X POST localhost:7070/v1/databases/shop/cast \
+  -d '{"prompt":"orders over 100","execute":true}'
+# → { …, "executed": true, "count": 2, "rows": [ … ] }
+```
+
+That default is not decoration. Here is a real miss, from a real run:
+
+```
+prompt   "paid orders over 100"
+nql      FROM orders WHERE status = "paid" LIMIT 100      ← wrong
+correct  FROM orders WHERE status = "paid" AND total > 100
+```
+
+It read *"over 100"* as `LIMIT 100` and dropped the second predicate. The row count still came back **2**, because both paid orders happened to exceed 100 — a count-only check would have called that a pass. A human reading `LIMIT 100` catches it instantly. An auto-executing client does not.
+
+Multi-predicate `WHERE` is the model's weakest clause (**85.1%** eval / 61.2% holdout). Ship accordingly.
+
+### Enabling it
+
+Off by default because it pulls a model dependency and expects weights at runtime — most deployments want neither.
+
+```bash
+# 1. build with the feature
+cargo install nedb-engine --features cast
+
+# 2. get the weights (~13 MB)
+curl -L -o model.cast \
+  https://github.com/aiassistsecure/nedb-cast-slm/releases/download/v10.30.90/model.cast
+
+# 3. run
+nedbd --dag --cast ./data
+#   cast     enabled — 3.33M params, vocab 581, ./data/model.cast
+```
+
+Model search order, first hit wins:
+
+1. `$NEDBD_CAST_MODEL`
+2. `<data_dir>/model.cast`
+3. `$CAST_HOME/model.cast`
+4. `~/.cache/nedb-cast-slm/v10.30.90/model.cast` — where the Python and npm packages cache it, so a machine that has run either one is already ready
+
+The container is checksum-verified on load. A silently corrupt model would emit plausible-but-wrong queries, which is the worst possible failure mode for a query planner.
+
+Without the feature the route still exists and returns **501** — so a client can detect the capability instead of guessing. Missing weights on a `--cast` build is loud but non-fatal: the daemon starts and serves everything else normally.
+
+### As a library
+
+```rust
+use nedb_engine::cast::Caster;
+
+let caster = Caster::load(&data_dir)?;
+let out = caster.cast_checked("orders over 100", &db.id_index.collections());
+
+if out.collection_known && nedb_engine::nql::parse(&out.nql).is_ok() {
+    let (rows, count) = nedb_engine::nql::query(&db, &out.nql)?;
+}
+```
+
+Decoding is greedy and deterministic — a DSL has exactly one right answer, so sampling could only hurt. The same prompt always produces the same plan, which makes the endpoint safe to cache.
 
 ---
 

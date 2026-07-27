@@ -74,6 +74,30 @@ export interface QueryResult {
   head: string;
 }
 
+/**
+ * Result of a natural-language cast. The interesting part is the PLAN, not the
+ * rows — `rows`/`count` appear only when `execute: true` was requested.
+ */
+export interface CastResult {
+  prompt: string;
+  /** The generated NQL. Present even on a 422, so you can see what it got wrong. */
+  nql: string;
+  /** Whether the generated NQL parses — checked by the same parser that executes it. */
+  valid: boolean;
+  /** The collection named after FROM, if one could be read off the output. */
+  collection: string | null;
+  /** Whether that collection exists in this database. */
+  collection_known: boolean;
+  /** Every collection this database actually has — what the plan was checked against. */
+  collections: string[];
+  executed: boolean;
+  seq: number;
+  head: string;
+  rows?: Record<string, unknown>[];
+  count?: number;
+  error?: string;
+}
+
 export interface VerifyResult {
   ok: boolean;
   seq: number;
@@ -267,6 +291,61 @@ export class NedbClient {
     }
     if (!resp.ok) await this.raise(resp);
     return resp.json() as Promise<QueryResult>;
+  }
+
+  // ── Cast — natural language into NQL ──────────────────────────────────────
+
+  /**
+   * Turn a short English prompt into NQL, server-side.
+   *
+   * Requires a daemon built with `--features cast` and started with `--cast`.
+   * Returns the full {@link CastResult} rather than rows, because the plan is
+   * the point.
+   *
+   * `execute` defaults to `false` deliberately: the endpoint hands back a plan
+   * for review. A planner that silently runs a wrong guess is worse than one
+   * that admits uncertainty. Pass `{ execute: true }` to get `rows` and `count`
+   * as well.
+   *
+   * Throws {@link NedbError} when the daemon lacks the feature (501), when the
+   * model emits unparseable NQL (422), or when it names a collection this
+   * database does not have (422). That last case is the model's known failure
+   * mode on an unfamiliar schema, and it is reported explicitly rather than as
+   * an empty result set — which would read as "no matching rows" and be a lie.
+   *
+   * @example
+   * ```ts
+   * const plan = await db.cast("orders over 100");
+   * // { nql: 'FROM orders WHERE total > 100', valid: true,
+   * //   collection_known: true, executed: false, ... }
+   *
+   * if (plan.valid && plan.collection_known) {
+   *   const rows = await db.query(plan.nql);   // run it yourself, after looking
+   * }
+   * ```
+   */
+  async cast(prompt: string, opts: { execute?: boolean } = {}): Promise<CastResult> {
+    const resp = await this.fetch("POST", `/v1/databases/${this.db}/cast`, {
+      prompt,
+      execute: opts.execute ?? false,
+    });
+    if (!resp.ok) {
+      // Append the offending NQL to the message. Debugging a cast failure
+      // without seeing what the model generated is guesswork.
+      let msg = resp.statusText;
+      try {
+        const body = await resp.json() as { error?: string; nql?: string };
+        if (body.error) msg = body.error;
+        if (body.nql) msg = `${msg} (generated: ${JSON.stringify(body.nql)})`;
+      } catch { /* ignore */ }
+      throw new NedbError(resp.status, msg);
+    }
+    return resp.json() as Promise<CastResult>;
+  }
+
+  /** Just the NQL string. Convenience wrapper over {@link cast}. */
+  async castNql(prompt: string): Promise<string> {
+    return (await this.cast(prompt)).nql;
   }
 
   // ── Batch ─────────────────────────────────────────────────────────────────
