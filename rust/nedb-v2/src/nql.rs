@@ -383,11 +383,24 @@ fn node_to_json(node: &Node) -> Value {
 }
 
 /// Execute a NQL query against the DAG database.
-pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
+/// Parse NQL into a `Query` WITHOUT touching the database.
+///
+/// `execute` already does exactly this as its first step; exposing it separately
+/// lets callers validate a query before deciding to run it. The natural-language
+/// planner (`/v1/databases/:name/cast`) uses it to answer "is this runnable?"
+/// without side effects — checking the text against the real grammar rather than
+/// pattern-matching it, because the parser is the only authority on that.
+pub fn parse(nql: &str) -> Result<Query> {
     let mut lexer = Lexer::new(nql);
     let toks = lexer.tokenize();
     let mut parser = Parser::new(toks);
-    let q = parser.parse()?;
+    parser.parse()
+}
+
+pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
+    // One parse path, shared with the public `parse()` above — so validation and
+    // execution can never disagree about what is well-formed.
+    let q = parse(nql)?;
 
     // ── Candidate generation ──────────────────────────────────────────────────
 
