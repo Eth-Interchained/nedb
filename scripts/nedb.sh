@@ -66,10 +66,16 @@ if d.get("drift"):
     print("  DRIFT      ", d["drift"])
     print("              ^ this plan may answer a different question")
 if d.get("executed"):
-    print("  executed    yes -", d.get("count"), "rows")
-    for r in (d.get("rows") or [])[:5]: print("     ", json.dumps(r))
+    n = d.get("count", 0)
+    print("  rows       ", n)
+    for r in (d.get("rows") or [])[:8]: print("     ", json.dumps(r))
+    if n > 8: print("      ...", n - 8, "more")
 else:
-    print("  executed    no  (add -x to run it)")
+    # Say what did NOT happen, and how to make it happen. "executed no" read
+    # as a status field people skim past -- the plan looked like an answer.
+    # (no apostrophes in here: this python is inside a single-quoted shell arg)
+    print("  NOT RUN     this is the plan only. to run it:")
+    print("                cast -x " + json.dumps(d.get("prompt","")))
 '
   else
     printf '%s\n' "$body"
