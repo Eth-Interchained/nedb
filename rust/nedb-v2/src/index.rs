@@ -349,6 +349,23 @@ impl IdIndex {
     }
 
     /// List all known collections.
+    ///
+    /// Overlays the WAL, exactly as `ids()` does. A collection whose first write
+    /// is still sitting in `write_buf` has no directory on disk yet, so a
+    /// read_dir-only implementation reports it as absent for up to a full flush
+    /// tick.
+    ///
+    /// That was a real bug, and a nasty one because it was invisible to a human
+    /// at a terminal: type a PUT, type a query, and the 1s ticker has already
+    /// fired in between. Only an automated caller — one that writes and reads in
+    /// the same millisecond — ever sees the empty list. It surfaced through
+    /// `/cast`, which checks the generated collection against this list and
+    /// returned "collection does not exist" for a collection that had just been
+    /// written successfully.
+    ///
+    /// Tombstoned entries are excluded, but only when the collection has no
+    /// surviving documents anywhere — a delete of one document must not hide the
+    /// whole collection.
     pub fn collections(&self) -> Vec<String> {
         if let Some(ref mem) = self.mem {
             let mut colls: Vec<String> = mem.iter()
@@ -358,13 +375,25 @@ impl IdIndex {
             colls.sort();
             return colls;
         }
-        fs::read_dir(&self.root)
+
+        let mut set: std::collections::HashSet<String> = fs::read_dir(&self.root)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect()
+            .collect();
+
+        // Overlay WAL: a buffered live write makes its collection visible now.
+        for e in self.write_buf.iter() {
+            if e.value().is_some() {
+                set.insert(e.key().0.clone());
+            }
+        }
+
+        let mut colls: Vec<String> = set.into_iter().collect();
+        colls.sort();
+        colls
     }
 }
 
@@ -576,4 +605,59 @@ mod tests {
                        "key {} lost its newer write (disk path)", k);
         }
     }
+
+    /// Regression: a collection must be visible the instant it is written, not
+    /// one flush tick later.
+    ///
+    /// Old behavior: `collections()` did a bare `read_dir` of the object root. A
+    /// brand-new collection lives only in `write_buf` until the 1s ticker fires,
+    /// so it was reported as ABSENT for up to a full second after a successful
+    /// write. Every other read path (`get`, `list_ids`) already overlaid the WAL;
+    /// this one silently did not.
+    ///
+    /// Why it hid for so long: a human at a terminal cannot reproduce it. Typing
+    /// a PUT and then a query leaves hundreds of milliseconds in between, and the
+    /// ticker has already run. Only a caller that writes and reads within the
+    /// same millisecond sees the empty list — which is exactly what an automated
+    /// test does. It surfaced through `/cast`, which validates the model's chosen
+    /// collection against this list and rejected a collection that had just been
+    /// written.
+    ///
+    /// NOTE the deliberate absence of any flush below. Calling flush_write_buf()
+    /// here would make this test pass against the OLD code and assert nothing.
+    #[test]
+    fn collections_are_visible_before_flush() {
+        let dir = tempdir().unwrap();
+        let idx = IdIndex::new(dir.path()).unwrap();
+
+        idx.set("orders", "o1", "hash1").unwrap();
+        let colls = idx.collections();
+        assert!(
+            colls.contains(&"orders".to_string()),
+            "collection invisible before flush: {colls:?}"
+        );
+
+        // Still correct once it does reach disk — no duplicates from the overlay.
+        idx.flush_write_buf();
+        let after = idx.collections();
+        assert_eq!(after, vec!["orders".to_string()], "after flush: {after:?}");
+
+        // Second collection, same story, and the first must not vanish.
+        idx.set("stylists", "s1", "hash2").unwrap();
+        let both = idx.collections();
+        assert_eq!(both, vec!["orders".to_string(), "stylists".to_string()],
+                   "expected both collections, got {both:?}");
+    }
+
+    /// A tombstoned document must not resurrect its collection.
+    #[test]
+    fn collections_excludes_tombstone_only_writes() {
+        let dir = tempdir().unwrap();
+        let idx = IdIndex::new(dir.path()).unwrap();
+        idx.remove("ghosts", "g1").unwrap();
+        let colls = idx.collections();
+        assert!(!colls.contains(&"ghosts".to_string()),
+                "a tombstone conjured a collection: {colls:?}");
+    }
+
 }

@@ -86,6 +86,25 @@ else
   echo; echo "RESULT: FAIL"; exit 1
 fi
 
+# A daemon we just booted against a fresh --data dir CANNOT already have
+# databases. If it reports any, another nedbd owns this port and every result
+# below describes the wrong process. Three runs were burned on exactly that.
+if [ "$BOOT" = "1" ]; then
+  DBS=$(echo "$H" | grep -o '"databases":\[[^]]*\]')
+  if [ -n "$DBS" ] && [ "$DBS" != '"databases":[]' ]; then
+    bad "talking to the WRONG daemon" "$DBS"
+    echo
+    echo "${R}This run booted a daemon with an empty data dir, so it cannot have"
+    echo "databases already. Another nedbd is answering on port $PORT.${Z}"
+    echo
+    echo "  find it:  netstat -ano | grep :$PORT       # Windows"
+    echo "            lsof -i :$PORT                   # macOS/Linux"
+    echo
+    echo "RESULT: FAIL"; exit 1
+  fi
+  ok "confirmed this is OUR daemon" "fresh data dir, no pre-existing databases"
+fi
+
 # ── 2. seed a real database ───────────────────────────────────────────────────
 sect "Seed a real database"
 CREATED=$(curl -s --max-time 5 -w '\n%{http_code}' -X POST "$B/v1/databases" \

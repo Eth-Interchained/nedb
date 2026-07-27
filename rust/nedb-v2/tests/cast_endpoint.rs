@@ -45,17 +45,62 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 }
 
 /// A small real database: three orders, two of them over 100.
+///
+/// The `flush_all()` here is convenience, not realism — see
+/// `collections_visible_without_explicit_flush` below, which deliberately does
+/// NOT flush, because that flush was hiding a real bug.
 fn seeded_db(tag: &str) -> (Db, std::path::PathBuf) {
     let dir = tmpdir(tag);
-    let db = Db::open(&dir, None).expect("open db");
+    let db = seeded_db_unflushed_at(&dir);
+    db.flush_all();
+    (db, dir)
+}
+
+fn seeded_db_unflushed_at(dir: &std::path::Path) -> Db {
+    let db = Db::open(dir, None).expect("open db");
     db.put("orders", "o1", json!({"total": 150, "status": "paid"}), vec![], None, None)
         .expect("put o1");
     db.put("orders", "o2", json!({"total": 40, "status": "pending"}), vec![], None, None)
         .expect("put o2");
     db.put("orders", "o3", json!({"total": 900, "status": "paid"}), vec![], None, None)
         .expect("put o3");
-    db.flush_all();
-    (db, dir)
+    db
+}
+
+/// Regression: `/cast` validates the model's collection against
+/// `db.id_index.collections()`. That list must reflect a write IMMEDIATELY.
+///
+/// The bug: `collections()` was a bare `read_dir` of the object root, while every
+/// other read path overlaid the WAL write buffer. A brand-new collection has no
+/// directory until the 1s flush ticker fires, so for up to a second after a
+/// successful PUT the engine reported it as absent — and `/cast` answered
+/// `422 collection "orders" does not exist` for a collection holding three rows.
+///
+/// Why the rest of this file missed it: `seeded_db` calls `flush_all()`. That one
+/// line made the directory exist and the assertion pass. The test helper was
+/// hiding the defect it was supposed to expose — which is why this test seeds
+/// WITHOUT flushing, exactly as the live server does between a PUT and a cast.
+///
+/// Do not "tidy" a `flush_all()` into this test. It would still pass, and it
+/// would stop testing anything.
+#[test]
+fn collections_visible_without_explicit_flush() {
+    let dir = tmpdir("noflush");
+    let db = seeded_db_unflushed_at(&dir);
+
+    let colls = db.id_index.collections();
+    assert!(
+        colls.contains(&"orders".to_string()),
+        "collection invisible before flush — /cast would 422 a collection that \
+         exists. got {colls:?}"
+    );
+
+    // And the data really is readable at the same instant, so this is a pure
+    // visibility bug rather than the write not having happened.
+    let (_rows, count) = nql::query(&db, "FROM orders").expect("query orders");
+    assert_eq!(count, 3, "expected 3 seeded orders, got {count}");
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ── parse/execute agreement — no model needed ─────────────────────────────────
