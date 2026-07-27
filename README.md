@@ -504,6 +504,7 @@ Built without the feature, the route returns **501** rather than 404 — clients
 ### Casting from a shell
 
 ```bash
+./scripts/seed-shop.sh       # a shop database the model already understands
 . ./scripts/nedb.sh          # bash / zsh / Git Bash
 
 nedb-dbs                     # which databases exist
@@ -511,6 +512,10 @@ nedb-use shop                # pick one
 cast "orders over 100"       # plan only — nothing runs
 cast -x "orders over 100"    # plan AND execute
 ```
+
+**Seed the names it was trained on.** The model learned six synthetic domains, and `shop` is one of them — `orders(total, status, quantity, customer, placed_at, discounted)`, `products(price, stock, category, rating, title)`, `customers(age, city, tier, lifetime_value, name)`, plus the relations `purchased` / `reviewed` / `belongs_to`. Those names live in its 581-token vocabulary.
+
+Call your collection `purchases` with a `cost` field and it will still emit `FROM orders WHERE total > …`, because that is what it knows. It is a 3.3M-parameter model, not a schema reader. On an unfamiliar schema you get `collection_known: false` — caught, not silently wrong, but caught.
 
 ```
   nql         FROM orders WHERE total > 100
