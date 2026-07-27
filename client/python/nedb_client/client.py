@@ -240,6 +240,61 @@ class NedbClient:
         """Like :meth:`query` but returns the full response including ``seq`` and ``head``."""
         return await self._query_raw(nql)
 
+    # ── Cast — natural language into NQL ──────────────────────────────────────
+
+    async def cast(self, prompt: str, execute: bool = False) -> Dict[str, Any]:
+        """
+        Turn a short English prompt into NQL, server-side.
+
+        Requires a daemon built with ``--features cast`` and started with
+        ``--cast``. Returns the full response dict rather than rows, because the
+        interesting part is the PLAN::
+
+            {"prompt": ..., "nql": "FROM orders WHERE total > 100",
+             "valid": True, "collection": "orders", "collection_known": True,
+             "collections": [...], "executed": False, "seq": 3, "head": "..."}
+
+        ``execute`` defaults to False on purpose. The endpoint hands back a plan
+        for review; a planner that silently runs a wrong guess is worse than one
+        that admits uncertainty. With ``execute=True`` the response also carries
+        ``rows`` and ``count``.
+
+        Raises :class:`NedbError` when the daemon lacks the feature (501), when
+        the model emits unparseable NQL (422), or when it names a collection this
+        database does not have (422) -- that last case is the model's known
+        failure mode on an unfamiliar schema, and it is reported explicitly
+        rather than returned as an empty result set, which would read as
+        "no matching rows" and be a lie.
+
+        Example::
+
+            plan = await db.cast("orders over 100")
+            if plan["valid"] and plan["collection_known"]:
+                rows = await db.query(plan["nql"])   # run it yourself, after looking
+        """
+        resp = await self._rc().post(
+            f"/v1/databases/{self._db}/cast",
+            json={"prompt": prompt, "execute": execute},
+        )
+        if not resp.is_success:
+            # Surface the server's own explanation, and append the offending NQL
+            # when the model produced something the parser rejected -- debugging a
+            # cast failure without seeing what it generated is guesswork.
+            try:
+                body = resp.json()
+                msg = body.get("error", resp.text)
+                nql = body.get("nql")
+                if nql:
+                    msg = f"{msg} (generated: {nql!r})"
+            except Exception:
+                msg = resp.text
+            raise NedbError(resp.status_code, msg)
+        return resp.json()
+
+    async def cast_nql(self, prompt: str) -> str:
+        """Just the NQL string. Convenience wrapper over :meth:`cast`."""
+        return (await self.cast(prompt))["nql"]
+
     # ── Batch ─────────────────────────────────────────────────────────────────
 
     async def batch(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

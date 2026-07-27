@@ -60,9 +60,13 @@ npm install nedb-engine   # or: pip install nedb-engine
 # v2 DAG engine (recommended — instant cold start, tamper-evident)
 NEDBD_DAG=1 nedbd --data ./data
 
+# With natural-language planning (see `cast` below)
+#   needs a build with --features cast, plus model.cast in the data dir
+NEDBD_DAG=1 NEDBD_CAST=1 nedbd --data ./data
+
 # Check health
 curl http://127.0.0.1:7070/health
-# {"ok":true,"version":"2.0.8","service":"nedbd","encrypted":true}
+# {"ok":true,"version":"2.8.0","service":"nedbd","encrypted":true}
 ```
 
 ---
@@ -126,6 +130,65 @@ FROM <collection>
   [SEARCH "text"]                full-text search
 ```
 
+### Cast — natural language into NQL
+
+| Method | Description |
+|--------|-------------|
+| `db.cast(prompt, opts?)` | English → `CastResult` (the plan). `opts.execute` defaults to `false` |
+| `db.castNql(prompt)` | English → just the NQL string |
+
+Requires a daemon built with `--features cast` and started with `--cast`. A **3.33M-parameter** model ([nedb-cast-slm](https://github.com/aiassistsecure/nedb-cast-slm)) runs server-side on CPU — no API key, no per-token bill.
+
+```typescript
+const plan = await db.cast("orders over 100");
+// {
+//   nql: 'FROM orders WHERE total > 100',
+//   valid: true,
+//   collection: 'orders',
+//   collection_known: true,
+//   collections: ['orders'],
+//   executed: false,
+//   seq: 3, head: '262fd9…'
+// }
+```
+
+**`execute` defaults to `false` on purpose.** You get a plan to look at, not a query that already ran:
+
+```typescript
+if (plan.valid && plan.collection_known) {
+  const rows = await db.query(plan.nql);        // review, then run
+}
+
+const run = await db.cast("orders over 100", { execute: true });
+run.count;  // 2
+run.rows;   // [...]
+```
+
+That default matters. A real miss from a real run:
+
+```
+prompt   "paid orders over 100"
+nql      FROM orders WHERE status = "paid" LIMIT 100      ← wrong
+correct  FROM orders WHERE status = "paid" AND total > 100
+```
+
+It read *"over 100"* as `LIMIT 100`. The count still came back correct **by coincidence** — both paid orders exceeded 100. Multi-predicate `WHERE` is the model's weakest clause (85.1% eval / 61.2% holdout). Show the plan to a human when you can.
+
+**Errors are explicit, never empty results.** The server checks the plan against the collections this database actually has:
+
+```typescript
+try {
+  await db.cast("show me all stylists");
+} catch (e) {
+  if (e instanceof NedbError) {
+    e.status;   // 422
+    e.message;  // collection "stylists" does not exist in "shop" (generated: "FROM stylists")
+  }
+}
+```
+
+Zero rows would read as *"no matching data"* — a lie, when the truth is the collection was imagined. Status **501** means the daemon was built without the feature, so you can detect the capability rather than guess at it.
+
 ### Integrity
 
 | Method | Description |
@@ -184,6 +247,7 @@ One HTTP request, multiple ops — best throughput for bulk ingestion.
 
 - **Engine:** [pip install nedb-engine](https://pypi.org/project/nedb-engine/) · [npm install nedb-engine](https://www.npmjs.com/package/nedb-engine)
 - **Python client:** [pip install nedb-engine-client](https://pypi.org/project/nedb-engine-client/)
+- **Cast model:** [nedb-cast-slm](https://github.com/aiassistsecure/nedb-cast-slm) — the 3.3M-param planner behind `db.cast()`
 - **Source:** [github.com/Eth-Interchained/nedb](https://github.com/Eth-Interchained/nedb)
 - **Studio:** [studio.interchained.org](https://studio.interchained.org)
 

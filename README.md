@@ -20,9 +20,29 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.5.34 — Production Stable
+## NEDB v2.8.0 — Production Stable
 
-**Current stable: 2.5.34** — NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with full mac + linux + windows native addons (see [**Releasing**](#releasing) below). On the engine side it remains a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+**Current stable: 2.8.0** — NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with full mac + linux + windows native addons (see [**Releasing**](#releasing) below). All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+
+### New in 2.8.0 — Cast: the database understands English
+
+`POST /v1/databases/<name>/cast` turns a short English prompt into NQL, using a **3.33M-parameter model that runs locally on CPU**. No API key, no network call, no per-token bill.
+
+```bash
+nedbd --dag --cast ./data     # requires: cargo install nedb-engine --features cast
+
+curl -X POST localhost:7070/v1/databases/shop/cast \
+  -d '{"prompt":"orders over 100"}'
+# → {"nql":"FROM orders WHERE total > 100","valid":true,"collection_known":true,"executed":false}
+```
+
+The model ([**nedb-cast-slm**](https://github.com/aiassistsecure/nedb-cast-slm)) was trained on NQL using NEDB's own parser as generator, grader, and gate — then shipped to PyPI, crates.io, and npm, all three loading the identical weights.
+
+**Why it lives in the engine and not in a client:** the hard part of natural-language querying is knowing the schema, and the engine already holds the live collection list. A plan naming a collection that doesn't exist returns **422 with the reason**, never a silently empty result set. See [**Cast**](#cast--natural-language-into-nql) below.
+
+Off by default — feature-gated at compile time, flag-gated at runtime, and `execute` defaults to `false` so you review the plan before it runs.
+
+**Also in 2.8.0 — an engine bug the feature exposed.** `IdIndex::collections()` did a bare `read_dir` while every other read path overlaid the WAL write buffer, so a brand-new collection was invisible until the 1s flush ticker fired. Unreachable by hand (the ticker fires between keystrokes) but reliable from a script, and latent in `Db::compact()` too, where a missed collection's live objects would be reclaimed as garbage. Fixed, with regression tests that seed *without* flushing.
 
 **New in 2.5.x:**
 
@@ -304,6 +324,8 @@ Alongside the daemon, `cargo install nedb-engine` ships **`nedb-cli`** — opera
 | `NEDBD_TOKEN` | unset | Optional bearer token; required on every `/v1/*` request when set. |
 | `NEDB_TMK` | unset | 32-byte hex AES-256-GCM at-rest encryption key. |
 | `NEDBD_DATA` | `./nedb-data` | Root directory. v2 creates `dag/`, IdIndex sharded across **256 subdirectories**, and a small `MANIFEST` file. |
+| `NEDBD_CAST` | `0` | Set `1` to enable the `/cast` natural-language planner. Same as `--cast`. Requires a build with `--features cast`. See [**Cast**](#cast--natural-language-into-nql). |
+| `NEDBD_CAST_MODEL` | unset | Explicit path to a `model.cast` container. Otherwise searched in the data dir, `$CAST_HOME`, and `~/.cache/nedb-cast-slm/`. |
 
 ```bash
 # Create a database with seed data and relations
@@ -356,6 +378,127 @@ Combine both time axes:
 ```python
 # What did the system know at seq 200 about what was true on 2024-02-15?
 db.query('FROM policy AS OF 200 VALID AS OF "2024-02-15"')
+```
+
+---
+
+## Cast — natural language into NQL
+
+*New in 2.8.0. Optional, feature-gated, off by default.*
+
+Ten clauses and six operators. That's the whole grammar above — small enough that a **3.33M-parameter** model can learn it completely, and small enough that shipping every query to a frontier model is an absurd amount of machinery.
+
+So we trained one. It runs on CPU, in-process, in milliseconds.
+
+```bash
+curl -X POST localhost:7070/v1/databases/shop/cast \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"orders over 100"}'
+```
+
+```json
+{
+  "prompt": "orders over 100",
+  "nql": "FROM orders WHERE total > 100",
+  "valid": true,
+  "collection": "orders",
+  "collection_known": true,
+  "collections": ["orders"],
+  "executed": false,
+  "seq": 3,
+  "head": "262fd9…"
+}
+```
+
+### NEDB is on both ends of this
+
+The model is [**nedb-cast-slm**](https://github.com/aiassistsecure/nedb-cast-slm), and NEDB built it as much as it consumes it.
+
+**NEDB's parser was the training pipeline.** It generated the corpus (sample a random plan → render NQL → render a human paraphrase; 200,000 pairs in 16.5 seconds, perfect labels, zero annotation cost). It was the grader — scoring *parsed plan* equality, not string equality, so `FROM orders WHERE total > 99` and `from orders where total>99` both earn full credit. And it was the gate: no example entered the corpus unless it round-tripped through the real parser to a canonically identical plan.
+
+> Most text-to-DSL projects hand-write a verifier and hope it's right. We didn't write one — it already shipped, and it's the same code the database runs in production.
+
+**Training lineage lives in NEDB too**, chained by `caused_by`:
+
+```
+datasets ──▶ training_runs ──▶ checkpoints ──▶ evals
+```
+
+```python
+db.query("FROM evals TRACE caused_by")   # the exact data behind any score
+```
+
+### Why the planner lives in the engine
+
+The hard part of natural-language querying is not the model. It's the **schema** — and a client has to fetch the collection list and pass it in, where it's stale on arrival. The engine already holds the live list.
+
+So the plan is checked against collections that actually exist, at the moment of the call:
+
+```json
+{ "prompt": "show me all stylists",
+  "nql": "FROM stylists",
+  "valid": true,
+  "collection_known": false,
+  "error": "collection \"stylists\" does not exist in \"shop\"" }
+```
+
+HTTP **422**. Not zero rows — zero rows reads as *"no matching data"*, which would be a lie. The query was perfectly well-formed; the collection was imagined. That's the model's known failure mode on an unfamiliar schema, and the engine is the one component positioned to catch it.
+
+Every `nedbd` client — Python, Node, Studio, `curl` — inherits this without writing a line.
+
+### Three safety properties
+
+| | |
+|---|---|
+| **The model never executes** | It emits text. The text goes to the same `nql::query` path a hand-typed query uses. No second executor exists to audit. |
+| **Validation is parsing** | `nql::parse` and `nql::execute` share one code path, so they cannot disagree about what is well-formed. Invalid output returns 422 *with the offending text*. |
+| **`execute` defaults to false** | You get a plan for review. Running a guess silently is worse than admitting uncertainty. |
+
+That last default earns its keep. A real miss, from a real run:
+
+```
+prompt   "paid orders over 100"
+nql      FROM orders WHERE status = "paid" LIMIT 100      ← wrong
+correct  FROM orders WHERE status = "paid" AND total > 100
+```
+
+It read *"over 100"* as `LIMIT 100` and dropped the predicate. The count still came back **2** — because both paid orders happened to exceed 100. A count-only assertion would have scored it a pass. A human reading `LIMIT 100` catches it in a heartbeat; an auto-executing client does not.
+
+Multi-predicate `WHERE` is the model's weakest clause: **85.1%** exact-plan match on eval, 61.2% on adversarial holdout. The [model card](https://github.com/aiassistsecure/nedb-cast-slm#what-it-gets-wrong) documents every failure mode with examples.
+
+To run it anyway, ask:
+
+```bash
+curl -X POST localhost:7070/v1/databases/shop/cast \
+  -d '{"prompt":"orders over 100","execute":true}'
+# → { …, "executed": true, "count": 2, "rows": [ … ] }
+```
+
+### Enabling it
+
+Two gates, because most deployments want neither the model dependency nor the weights:
+
+```bash
+# compile-time
+cargo install nedb-engine --features cast
+
+# weights (~13 MB) — GitHub release asset, checksum-verified on load
+curl -L -o ./data/model.cast \
+  https://github.com/aiassistsecure/nedb-cast-slm/releases/download/v10.30.90/model.cast
+
+# runtime
+nedbd --dag --cast ./data
+#   cast     enabled — 3.33M params, vocab 581, ./data/model.cast
+```
+
+Search order: `$NEDBD_CAST_MODEL` → `<data_dir>/model.cast` → `$CAST_HOME/model.cast` → `~/.cache/nedb-cast-slm/v10.30.90/model.cast` (the Python/npm cache location, so a machine that has run either package is already ready).
+
+Built without the feature, the route returns **501** rather than 404 — clients can detect the capability instead of guessing. Built with it but missing weights, the daemon logs loudly and serves everything else normally.
+
+**Verify the whole path:**
+
+```bash
+./scripts/test-cast.sh --boot     # boots a daemon, seeds, casts, executes, checks failure modes
 ```
 
 ---
