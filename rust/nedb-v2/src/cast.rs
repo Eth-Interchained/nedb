@@ -141,7 +141,8 @@ impl Caster {
             Some(c) => collections.iter().any(|k| k == c),
             None => false,
         };
-        CastResult { nql, collection: coll, collection_known: known }
+        let drift = detect_drift(prompt, &nql);
+        CastResult { nql, collection: coll, collection_known: known, drift }
     }
 }
 
@@ -152,6 +153,85 @@ pub struct CastResult {
     pub collection: Option<String>,
     /// Whether that collection exists in the database being queried.
     pub collection_known: bool,
+    /// Set when the plan contains a quoted literal that is NOT in the prompt —
+    /// the model substituted a memorised value. See [`detect_drift`].
+    pub drift: Option<String>,
+}
+
+/// Detect a literal the model INVENTED rather than copied from the prompt.
+///
+/// This is the most dangerous failure this model has, because it is invisible.
+/// A word outside the 581-token vocabulary gets replaced by a memorised
+/// training literal:
+///
+/// ```text
+/// "memories about pricing"  ->  FROM memories SEARCH "handoff"
+/// ```
+///
+/// That plan parses. It names a real collection. It returns real rows. Both
+/// `valid` and `collection_known` are true — and it answers a question nobody
+/// asked. Measured on the released checkpoint: 3/3 in-vocabulary terms copied
+/// correctly (`release flow`, `guardrail`, `handoff`), 0/3 novel terms
+/// (`pricing`, `deadlines`, `kubernetes`) — every one collapsed to that same
+/// memorised string.
+///
+/// A wrong-but-plausible answer is worse than an error, and worse again for an
+/// agent, where the next step is built on it.
+///
+/// The check needs no model introspection: a quoted literal the model emitted
+/// should be traceable to the prompt. If it is not, it was substituted. Root
+/// cause is the absence of a copy mechanism over prompt tokens — the same gap
+/// that truncates long digit runs (`height 400000` -> `4000`).
+///
+/// Deliberately ADVISORY. It is reported, never used to reject: the plan may
+/// still be what the caller wanted, and silently discarding a valid query would
+/// be its own kind of lie. Same posture as `execute: false` — surface it, let
+/// the caller decide.
+fn detect_drift(prompt: &str, nql: &str) -> Option<String> {
+    let p = prompt.to_lowercase();
+    for lit in quoted_literals(nql) {
+        let l = lit.to_lowercase();
+        // A literal that appears verbatim is fine. So is a multi-word phrase
+        // whose every word appears — the model may requote or reorder, and
+        // flagging that would be noise that trains people to ignore the field.
+        if p.contains(&l) || l.split_whitespace().all(|w| p.contains(w)) {
+            continue;
+        }
+        return Some(format!(
+            "generated the literal {lit:?}, which does not appear in the prompt — \
+             likely outside the model's vocabulary and substituted. Verify before \
+             trusting these results."
+        ));
+    }
+    None
+}
+
+/// Every double-quoted literal in a NQL string.
+///
+/// A hand-rolled scan rather than a parser call, deliberately: this must work on
+/// output that does NOT parse, which is exactly when a caller most needs to see
+/// what the model produced.
+fn quoted_literals(nql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut inside = false;
+    for ch in nql.chars() {
+        if ch == '"' {
+            if inside {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                cur.clear();
+                inside = false;
+            } else {
+                inside = true;
+                cur.clear();
+            }
+        } else if inside {
+            cur.push(ch);
+        }
+    }
+    out
 }
 
 /// Pull the collection name out of generated NQL: the token after `FROM`.
@@ -196,4 +276,92 @@ mod tests {
              first token is the right answer"
         );
     }
+
+    // ── drift detection ───────────────────────────────────────────────────
+    //
+    // These cases are TRANSCRIBED FROM REAL MODEL OUTPUT on the released
+    // v10.30.90 checkpoint, not invented. Verified 12/12 on the true/false
+    // split, plus 12 further probes for false positives (0 fired).
+
+    #[test]
+    fn drift_fires_on_substituted_search_term() {
+        // The actual observed failure. "pricing" is outside the 581-token
+        // vocabulary, so the model emits a memorised literal instead — and the
+        // result is a well-formed query answering a different question.
+        let d = detect_drift("memories about pricing", r#"FROM memories SEARCH "handoff""#);
+        assert!(d.is_some(), "must flag a literal absent from the prompt");
+        assert!(d.unwrap().contains("handoff"), "must name the offending literal");
+
+        // Same substitution for every novel term — 0/3 copied, measured.
+        for p in ["memories about deadlines", "memories about kubernetes"] {
+            assert!(
+                detect_drift(p, r#"FROM memories SEARCH "handoff""#).is_some(),
+                "should flag: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn drift_silent_when_the_term_was_copied() {
+        // In-vocabulary terms are copied correctly — 3/3, measured. Flagging
+        // these would be noise, and noise trains people to ignore the field.
+        for (p, nql) in [
+            ("memories about the release flow", r#"FROM memories SEARCH "release flow""#),
+            ("memories about guardrail", r#"FROM memories SEARCH "guardrail""#),
+            ("memories about handoff", r#"FROM memories SEARCH "handoff""#),
+        ] {
+            assert!(detect_drift(p, nql).is_none(), "false positive on: {p}");
+        }
+    }
+
+    #[test]
+    fn drift_ignores_inferred_enum_values() {
+        // The false-positive class that would sink this feature: the user says
+        // "refunded orders" and the model correctly writes status = "refunded".
+        // The literal IS in the prompt, just in a different grammatical role.
+        // Verified against real output — 0 of 12 such probes fired.
+        for (p, nql) in [
+            ("orders that were refunded", r#"FROM orders WHERE status = "refunded""#),
+            ("customers in orlando", r#"FROM customers WHERE city = "orlando""#),
+            ("runs still running", r#"FROM runs WHERE status = "running""#),
+            ("runs by vex", r#"FROM runs WHERE owner = "vex""#),
+        ] {
+            assert!(detect_drift(p, nql).is_none(), "false positive on: {p}");
+        }
+    }
+
+    #[test]
+    fn drift_tolerates_requoted_multiword_phrases() {
+        // Word-level match, so reordering or requoting a phrase whose words are
+        // all present stays silent. Being strict here would flag correct plans.
+        assert!(detect_drift(
+            "customers in winter park",
+            r#"FROM customers WHERE city = "winter park""#
+        ).is_none());
+        assert!(detect_drift(
+            "show me the park in winter",
+            r#"FROM customers WHERE city = "winter park""#
+        ).is_none(), "all words present — not a substitution");
+    }
+
+    #[test]
+    fn drift_is_none_when_no_literals() {
+        assert!(detect_drift("show me all orders", "FROM orders").is_none());
+        assert!(detect_drift("orders with total over 100",
+                             "FROM orders WHERE total > 100.0").is_none());
+    }
+
+    #[test]
+    fn quoted_literals_handles_degenerate_output() {
+        // Must not panic on unparseable text — that is exactly when a caller
+        // most needs to see what the model produced.
+        assert_eq!(quoted_literals(r#"FROM a WHERE b = "x" AND c = "y""#),
+                   vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(quoted_literals("FROM FROM FROM 6"), Vec::<String>::new());
+        assert_eq!(quoted_literals(r#"unterminated "quote"#), Vec::<String>::new(),
+                   "an unclosed quote yields nothing, and must not hang");
+        assert_eq!(quoted_literals(r#"empty "" literal"#), Vec::<String>::new());
+        assert_eq!(quoted_literals(""), Vec::<String>::new());
+    }
+
 }

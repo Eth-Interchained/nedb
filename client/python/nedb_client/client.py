@@ -266,10 +266,20 @@ class NedbClient:
         rather than returned as an empty result set, which would read as
         "no matching rows" and be a lie.
 
+        The response may also carry ``drift``: a quoted literal in the plan that
+        is NOT in your prompt, meaning the model substituted a memorised value
+        for a word outside its 581-token vocabulary::
+
+            "memories about pricing"  ->  FROM memories SEARCH "handoff"
+
+        That query is valid, the collection exists, and rows come back -- for a
+        different question. ``valid`` and ``collection_known`` cannot catch it.
+        Check ``drift`` before acting on results unattended.
+
         Example::
 
             plan = await db.cast("orders over 100")
-            if plan["valid"] and plan["collection_known"]:
+            if plan["valid"] and plan["collection_known"] and not plan.get("drift"):
                 rows = await db.query(plan["nql"])   # run it yourself, after looking
         """
         resp = await self._rc().post(

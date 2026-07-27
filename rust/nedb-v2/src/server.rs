@@ -352,6 +352,12 @@ struct QueryBody { nql: String }
 
 // ── Natural-language planning (feature: cast) ─────────────────────────────────
 
+// Both fields are read only by the `cast`-enabled handler. The
+// `cfg(not(feature = "cast"))` stub still deserializes this body — so that a
+// malformed request is rejected as 400 before the 501, keeping the two builds
+// behaviourally consistent — but never looks at the values, which without this
+// attribute produces a dead_code warning on every default build.
+#[cfg_attr(not(feature = "cast"), allow(dead_code))]
 #[derive(Deserialize)]
 struct CastBody {
     prompt: String,
@@ -417,6 +423,16 @@ async fn cast_prompt(
         "seq":  seq,
         "head": head,
     });
+
+    // A literal the model invented rather than copied. Advisory, not fatal —
+    // the plan is well-formed and may be exactly right, so we surface it and
+    // let the caller judge. Warned-about-and-correct is a cost worth paying to
+    // avoid confidently-wrong-and-silent, which for an agent poisons every
+    // subsequent step. Absent from the response when there is nothing to say,
+    // so `"drift" in response` is a usable test.
+    if let Some(d) = &result.drift {
+        out["drift"] = json!(d);
+    }
 
     if let Some(e) = parse_err {
         // Report the failure WITH the offending text. Never swallow it into an
@@ -1018,7 +1034,15 @@ pub fn router(mgr: Manager) -> Router {
 
 /// Start the nedbd v2 server.
 pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>, memory_mode: bool) -> anyhow::Result<()> {
+    // `mut` is required by the cast block below, which assigns mgr.caster. With
+    // the feature off nothing mutates it, so an unconditional `mut` warns on
+    // every default build — and warnings people are used to seeing are warnings
+    // people stop reading.
+    #[cfg(feature = "cast")]
     let mut mgr = Manager::new(Path::new(data_dir), tmk, token, memory_mode);
+    #[cfg(not(feature = "cast"))]
+    let mgr = Manager::new(Path::new(data_dir), tmk, token, memory_mode);
+
     mgr.open_all().await?;
 
     // Load the natural-language planner if this build has the feature AND the
@@ -1040,6 +1064,9 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
             }
         }
     }
+    // Freeze it: nothing past this point should mutate the manager. Only
+    // meaningful in the cast build, where `mgr` was declared `mut` above.
+    #[cfg(feature = "cast")]
     let mgr = mgr;
 
     let has_token = mgr.token.is_some();

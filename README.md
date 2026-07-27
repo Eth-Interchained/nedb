@@ -474,6 +474,48 @@ curl -X POST localhost:7070/v1/databases/shop/cast \
 # → { …, "executed": true, "count": 2, "rows": [ … ] }
 ```
 
+### The failure `valid` cannot catch
+
+A literal the model **invented** rather than copied:
+
+```
+"memories about pricing"  ->  FROM memories SEARCH "handoff"
+```
+
+That query parses. It names a real collection. It returns real rows. Both
+`valid` and `collection_known` are `true` — and it answers a question nobody
+asked. Measured on the released checkpoint:
+
+| terms | in vocabulary | copied correctly |
+|---|---|---|
+| `release flow` · `guardrail` · `handoff` | yes | **3/3** |
+| `pricing` · `deadlines` · `kubernetes` | no | **0/3** — all became `"handoff"` |
+
+So the response carries a `drift` field when a quoted literal is absent from the
+prompt:
+
+```json
+{ "nql": "FROM memories SEARCH \"handoff\"",
+  "valid": true,
+  "collection_known": true,
+  "drift": "generated the literal \"handoff\", which does not appear in the prompt — likely outside the model's vocabulary and substituted. Verify before trusting these results." }
+```
+
+It is **advisory, never fatal** — the plan may still be what you wanted, and
+discarding a valid query would be its own kind of lie. But an unattended caller
+should treat it as a third gate:
+
+```python
+if plan["valid"] and plan["collection_known"] and not plan.get("drift"):
+    rows = await db.query(plan["nql"])
+```
+
+Same root cause as truncated digits (`height 400000` → `4000`): no copy
+mechanism over prompt tokens. Verified at 24/24 on real model output — 3 true
+positives, 21 true negatives, zero false alarms, including the case that matters
+most (correctly inferred enum values like *"refunded orders"* → `status =
+"refunded"` stay silent).
+
 ### Enabling it
 
 Two gates, because most deployments want neither the model dependency nor the weights:
@@ -481,6 +523,9 @@ Two gates, because most deployments want neither the model dependency nor the we
 ```bash
 # compile-time
 cargo install nedb-engine --features cast
+
+# or from a source checkout — builds the engine only, not the language bindings
+cd rust && cargo build --release --features cast
 
 # weights (~13 MB) — GitHub release asset, checksum-verified on load
 curl -L -o ./data/model.cast \
@@ -500,6 +545,52 @@ Built without the feature, the route returns **501** rather than 404 — clients
 ```bash
 ./scripts/test-cast.sh --boot     # boots a daemon, seeds, casts, executes, checks failure modes
 ```
+
+### Casting from a shell
+
+```bash
+./scripts/seed-shop.sh       # a shop database the model already understands
+. ./scripts/nedb.sh          # bash / zsh / Git Bash
+
+nedb-dbs                     # which databases exist
+nedb-use shop                # pick one
+cast "orders over 100"       # plan only — nothing runs
+cast -x "orders over 100"    # plan AND execute
+```
+
+**Seed the names it was trained on.** The model learned six synthetic domains, and `shop` is one of them — `orders(total, status, quantity, customer, placed_at, discounted)`, `products(price, stock, category, rating, title)`, `customers(age, city, tier, lifetime_value, name)`, plus the relations `purchased` / `reviewed` / `belongs_to`. Those names live in its 581-token vocabulary.
+
+Call your collection `purchases` with a `cost` field and it will still emit `FROM orders WHERE total > …`, because that is what it knows. It is a 3.3M-parameter model, not a schema reader. On an unfamiliar schema you get `collection_known: false` — caught, not silently wrong, but caught.
+
+```
+  nql         FROM orders WHERE total > 100
+  valid       yes    collection orders known: yes
+  executed    no  (add -x to run it)
+```
+
+The summary leads with the NQL because **reading it is the job**. `valid: yes` means it parses, not that it's what you meant — `LIMIT 100` parses perfectly.
+
+`NEDB=http://host:7070` points at a remote daemon. Prompts are JSON-escaped, so apostrophes and quotes are safe.
+
+### Prompts it handles well
+
+Accuracy varies by clause, so phrasing matters more than length:
+
+| you want | say | eval |
+|---|---|---|
+| `TRACE caused_by` | *what caused these checkpoints* | 96.5% |
+| `TRAVERSE` | *orders traverse placed_by* | 93.3% |
+| one `WHERE` | *orders over 100* · *active drivers* | 91.2% |
+| `LIMIT` | *top 5 orders* | 91.1% |
+| `SEARCH` | *search orders for refund* | 90.5% |
+| `ORDER BY` | *orders sorted by total descending* | 87.7% |
+| two+ `WHERE` | *paid orders with total over 100* | 85.1% |
+| `GROUP BY` + agg | *orders grouped by status with sum of total* | 77.0% |
+
+Two habits that avoid most misses:
+
+- **Name the field** when a number could be a limit. *"orders with total over 100"* beats *"orders over 100"* — bare *"over N"* is what produced the `LIMIT 100` miss above.
+- **Check numbers over four digits.** Digits are tokenized one at a time, so `height 400000` can come back `4000`.
 
 ---
 

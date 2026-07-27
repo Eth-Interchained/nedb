@@ -7,6 +7,29 @@ members = [
     "nedb-v2",
 ]
 
+# A bare `cargo build` at the workspace root builds the ENGINE, not the language
+# bindings. Both bindings need a toolchain the engine does not:
+#
+#   nedb-node  napi-rs. On Windows it supports MSVC only -- its build script
+#              calls setup_gnu() when CARGO_CFG_TARGET_ENV == "gnu" and panics
+#              with "libnode.dll not found in any search path". A MINGW64 /
+#              Git Bash shell defaults to x86_64-pc-windows-gnu, so a plain
+#              `cargo build` on Windows failed before reaching any engine code.
+#   nedb-py    maturin/pyo3, needs a Python dev environment.
+#
+# CI is unaffected: every workflow build already names its crate explicitly
+# (`--package nedb-engine`) or drives the binding through its own tool
+# (`napi build --cargo-cwd`). default-members only changes what you get when
+# you name NOTHING.
+#
+# To build a binding deliberately:
+#   cargo build -p nedb-node --target x86_64-pc-windows-msvc   # or: npx napi build
+#   maturin build -m crates/nedb-py/Cargo.toml
+default-members = [
+    "crates/nedb-core",
+    "nedb-v2",
+]
+
 [workspace.package]
 version = "2.8.1"
 edition = "2021"
