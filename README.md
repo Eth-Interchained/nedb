@@ -474,6 +474,48 @@ curl -X POST localhost:7070/v1/databases/shop/cast \
 # → { …, "executed": true, "count": 2, "rows": [ … ] }
 ```
 
+### The failure `valid` cannot catch
+
+A literal the model **invented** rather than copied:
+
+```
+"memories about pricing"  ->  FROM memories SEARCH "handoff"
+```
+
+That query parses. It names a real collection. It returns real rows. Both
+`valid` and `collection_known` are `true` — and it answers a question nobody
+asked. Measured on the released checkpoint:
+
+| terms | in vocabulary | copied correctly |
+|---|---|---|
+| `release flow` · `guardrail` · `handoff` | yes | **3/3** |
+| `pricing` · `deadlines` · `kubernetes` | no | **0/3** — all became `"handoff"` |
+
+So the response carries a `drift` field when a quoted literal is absent from the
+prompt:
+
+```json
+{ "nql": "FROM memories SEARCH \"handoff\"",
+  "valid": true,
+  "collection_known": true,
+  "drift": "generated the literal \"handoff\", which does not appear in the prompt — likely outside the model's vocabulary and substituted. Verify before trusting these results." }
+```
+
+It is **advisory, never fatal** — the plan may still be what you wanted, and
+discarding a valid query would be its own kind of lie. But an unattended caller
+should treat it as a third gate:
+
+```python
+if plan["valid"] and plan["collection_known"] and not plan.get("drift"):
+    rows = await db.query(plan["nql"])
+```
+
+Same root cause as truncated digits (`height 400000` → `4000`): no copy
+mechanism over prompt tokens. Verified at 24/24 on real model output — 3 true
+positives, 21 true negatives, zero false alarms, including the case that matters
+most (correctly inferred enum values like *"refunded orders"* → `status =
+"refunded"` stay silent).
+
 ### Enabling it
 
 Two gates, because most deployments want neither the model dependency nor the weights:

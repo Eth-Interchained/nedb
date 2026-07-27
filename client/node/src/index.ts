@@ -96,6 +96,20 @@ export interface CastResult {
   rows?: Record<string, unknown>[];
   count?: number;
   error?: string;
+  /**
+   * Present when the plan contains a quoted literal that is NOT in the prompt —
+   * the model substituted a memorised value instead of copying yours.
+   *
+   * ```
+   * "memories about pricing"  ->  FROM memories SEARCH "handoff"
+   * ```
+   *
+   * The query is valid, the collection exists, rows come back — and it answers
+   * a different question. `valid` and `collection_known` cannot catch this, so
+   * **check `drift` before acting on results unattended.** Advisory only: the
+   * plan may still be what you wanted.
+   */
+  drift?: string;
 }
 
 export interface VerifyResult {

@@ -90,14 +90,27 @@ That query parses. It names a real collection. It returns real rows. `valid:
 true` and `collection_known: true` are both satisfied — and it answers a
 question nobody asked. **Worse than an error, because it looks like an answer.**
 
-`_search_drift()` catches it with one check: the SEARCH term must appear in the
-prompt. If it doesn't, the model invented it, and the turn is a miss rather than
-a confident lie.
+**The engine catches it** (nedbd >= 2.8.2). `cast_checked` compares every quoted
+literal in the plan against the prompt; one that isn't there was substituted, and
+the response carries a `drift` field saying so.
+
+That check started here, in this example. It belongs in the daemon — every
+client inherits it instead of each one reimplementing it, exactly like the
+collection check. A safety property that production callers need does not belong
+in an examples directory.
+
+Advisory, never fatal: the plan may still be right. But an unattended caller
+should gate on all three —
+
+```python
+if plan["valid"] and plan["collection_known"] and not plan.get("drift"):
+    rows = query(plan["nql"])
+```
 
 ```
 [6] memories about pricing
     nql  FROM memories SEARCH "handoff"
-    drift model searched for "handoff" but that phrase is not in the prompt
+    drift generated the literal "handoff", which does not appear in the prompt
     → rephrase using words the model knows, or use `query` with explicit NQL
 ```
 

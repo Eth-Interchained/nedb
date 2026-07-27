@@ -418,6 +418,16 @@ async fn cast_prompt(
         "head": head,
     });
 
+    // A literal the model invented rather than copied. Advisory, not fatal —
+    // the plan is well-formed and may be exactly right, so we surface it and
+    // let the caller judge. Warned-about-and-correct is a cost worth paying to
+    // avoid confidently-wrong-and-silent, which for an agent poisons every
+    // subsequent step. Absent from the response when there is nothing to say,
+    // so `"drift" in response` is a usable test.
+    if let Some(d) = &result.drift {
+        out["drift"] = json!(d);
+    }
+
     if let Some(e) = parse_err {
         // Report the failure WITH the offending text. Never swallow it into an
         // empty result set — that reads as "no matching rows", which is a lie.

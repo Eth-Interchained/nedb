@@ -61,6 +61,10 @@ kn  = "yes" if d.get("collection_known") else "NO"
 print("  nql        ", d["nql"])
 print("  valid      ", ok, "   collection", d.get("collection"), "known:", kn)
 if d.get("error"): print("  error      ", d["error"])
+if d.get("drift"):
+    # The failure valid/known cannot catch: a literal the model invented.
+    print("  DRIFT      ", d["drift"])
+    print("              ^ this plan may answer a different question")
 if d.get("executed"):
     print("  executed    yes -", d.get("count"), "rows")
     for r in (d.get("rows") or [])[:5]: print("     ", json.dumps(r))

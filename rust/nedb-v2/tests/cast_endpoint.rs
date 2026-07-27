@@ -275,6 +275,43 @@ mod with_model {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Drift must be reported through the same `cast_checked` path the endpoint
+    /// uses, so every client gets it without opting in.
+    #[test]
+    fn drift_surfaces_through_cast_checked() {
+        let (db, dir) = seeded_db("drift");
+        let Some(c) = caster(&dir) else {
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        };
+        let collections = db.id_index.collections();
+
+        // "pricing" is outside the 581-token vocabulary. On the released
+        // checkpoint this yields SEARCH "handoff" -- a valid query answering a
+        // different question. Asserted loosely because the substituted literal
+        // is a property of the checkpoint: what MUST hold is that a literal
+        // absent from the prompt is reported.
+        let res = c.cast_checked("memories about pricing", &collections);
+        eprintln!("  cast -> {} | drift={:?}", res.nql, res.drift);
+        if res.nql.contains("SEARCH") {
+            let lit = res.nql.split('"').nth(1).unwrap_or("");
+            if !lit.is_empty() && !"memories about pricing".contains(lit) {
+                assert!(
+                    res.drift.is_some(),
+                    "emitted literal {lit:?} absent from the prompt but drift was None"
+                );
+            }
+        }
+
+        // And a plan with no invented literal must stay quiet -- a check that
+        // fires on correct output is a check people learn to ignore.
+        let clean = c.cast_checked("show me all orders", &collections);
+        eprintln!("  cast -> {} | drift={:?}", clean.nql, clean.drift);
+        assert!(clean.drift.is_none(), "false positive on {:?}", clean.nql);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn decoding_is_deterministic() {
         // Greedy decoding. Same prompt must give the same plan every time, or the

@@ -104,40 +104,30 @@ def recall(question: str, execute: bool = True) -> dict:
     code, body = _post(f"{DB}/cast", {"prompt": question, "execute": execute})
     if code == 501:
         sys.exit(f"{R}this nedbd was built without --features cast{Z}")
-    out = {"ok": code == 200, "status": code, **body}
-    if drift := _search_drift(question, out.get("nql", "")):
-        out["drift"] = drift
-    return out
+    # `drift` arrives from the ENGINE (nedbd >= 2.8.2). It is set when the plan
+    # contains a quoted literal that is absent from the prompt -- the model
+    # substituted a memorised value for a word outside its vocabulary.
+    #
+    # This check used to live here, in the example. It belongs in the daemon:
+    # every client inherits it instead of each one reimplementing it, exactly
+    # like the collection check. An example is the wrong place for a safety
+    # property that production callers need.
+    return {"ok": code == 200, "status": code, **body}
 
 
-def _search_drift(prompt: str, nql: str) -> str | None:
-    """Detect a SEARCH term the model invented instead of copying.
+def trustworthy(plan: dict) -> bool:
+    """The three-way guard an unattended caller should apply.
 
-    The single most dangerous failure mode for an agent, because it is INVISIBLE:
+    `valid` and `collection_known` are necessary and NOT sufficient:
 
         "memories about pricing"  ->  FROM memories SEARCH "handoff"
 
-    That parses, names a real collection, returns real rows, and answers a
-    question nobody asked. `valid: true` and `collection_known: true` are both
-    satisfied. Measured on this checkpoint: 3/3 terms from the training
-    vocabulary copied correctly, 0/3 novel terms -- every novel term collapsed
-    to the same memorised literal.
-
-    Digits are tokenized one at a time and long runs get truncated the same way,
-    so the same check covers `height 400000 -> 4000`.
-
-    Cheap defense: the SEARCH term should appear in the prompt. If it does not,
-    the model made it up. Do not silently answer a different question.
+    That is valid, names a real collection, and returns real rows -- for a
+    question nobody asked. Only `drift` catches it.
     """
-    import re
-    m = re.search(r'SEARCH\s+"([^"]+)"', nql)
-    if not m:
-        return None
-    term = m.group(1).lower()
-    if term in prompt.lower():
-        return None
-    return (f'model searched for "{term}" but that phrase is not in the prompt '
-            f'-- it is outside the 581-token vocabulary and was substituted')
+    return (bool(plan.get("valid"))
+            and bool(plan.get("collection_known"))
+            and not plan.get("drift"))
 
 
 def remember(text: str, category: str = "project", importance: int = 3,
