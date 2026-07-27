@@ -16,7 +16,12 @@
 
 set -uo pipefail
 
-B="${NEDB_URL:-http://127.0.0.1:7070}"
+# A --boot run uses a private port so it cannot silently talk to a nedbd that
+# was already running. That exact confusion produced an impossible result on the
+# first real run: "cast DISABLED" alongside a 200 with generated NQL, because
+# the boot instance lost the port race and every request went to another daemon.
+PORT="${NEDB_PORT:-7070}"
+B="${NEDB_URL:-http://127.0.0.1:$PORT}"
 DB="casttest_$$"
 PASS=0; FAIL=0; SKIP=0
 BOOT=0; PID=""
@@ -49,12 +54,27 @@ if [ "$BOOT" = "1" ]; then
     exit 1
   fi
   D_DIR="$(mktemp -d)"
-  echo "booting $BIN --cast --data $D_DIR"
-  "$BIN" --cast --data "$D_DIR" > /tmp/nedbd-cast-test.log 2>&1 &
+  PORT=$(( 17070 + (RANDOM % 2000) ))
+  B="http://127.0.0.1:$PORT"
+  echo "booting $BIN --cast --port $PORT --data $D_DIR"
+  "$BIN" --cast --port "$PORT" --data "$D_DIR" > /tmp/nedbd-cast-test.log 2>&1 &
   PID=$!
   sleep 3
-  grep -i "cast" /tmp/nedbd-cast-test.log | head -3
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "${R}the daemon exited immediately. Log:${Z}"
+    cat /tmp/nedbd-cast-test.log
+    exit 1
+  fi
+  grep -iE "cast|listen" /tmp/nedbd-cast-test.log | head -4
+  # Record whether THIS daemon has a model, so later checks can tell the
+  # difference between "cast is off" and "cast answered anyway".
+  if grep -q "cast     enabled" /tmp/nedbd-cast-test.log; then
+    BOOT_CAST=1
+  else
+    BOOT_CAST=0
+  fi
 fi
+BOOT_CAST="${BOOT_CAST:-unknown}"
 
 # ── 1. daemon reachable ───────────────────────────────────────────────────────
 sect "Daemon"
@@ -68,19 +88,40 @@ fi
 
 # ── 2. seed a real database ───────────────────────────────────────────────────
 sect "Seed a real database"
-curl -s --max-time 5 -X POST "$B/v1/databases" -H 'Content-Type: application/json' \
-  -d "{\"name\":\"$DB\"}" >/dev/null
+CREATED=$(curl -s --max-time 5 -w '\n%{http_code}' -X POST "$B/v1/databases" \
+  -H 'Content-Type: application/json' -d "{\"name\":\"$DB\"}")
+CC=$(echo "$CREATED" | tail -1)
+echo "      ${D}create db -> $CC $(echo "$CREATED" | sed '$d' | cut -c1-90)${Z}"
+
+# Never discard the write response. Swallowing it is why an empty database
+# looked like a mystery instead of an error message.
 for row in '{"coll":"orders","id":"o1","doc":{"total":150,"status":"paid"}}' \
            '{"coll":"orders","id":"o2","doc":{"total":40,"status":"pending"}}' \
            '{"coll":"orders","id":"o3","doc":{"total":900,"status":"paid"}}'; do
-  curl -s --max-time 5 -X POST "$B/v1/databases/$DB/put" \
-    -H 'Content-Type: application/json' -d "$row" >/dev/null
+  PR=$(curl -s --max-time 5 -w '\n%{http_code}' -X POST "$B/v1/databases/$DB/put" \
+    -H 'Content-Type: application/json' -d "$row")
+  PC=$(echo "$PR" | tail -1); PB=$(echo "$PR" | sed '$d')
+  if [ "$PC" != "200" ]; then
+    echo "      ${R}put -> $PC $(echo "$PB" | cut -c1-140)${Z}"
+  else
+    echo "      ${D}put -> 200 $(echo "$PB" | grep -o '\"_id\":\"[^\"]*\"' | head -1)${Z}"
+  fi
 done
-COLLS=$(curl -s --max-time 5 "$B/v1/databases/$DB" | grep -o '"collections":\[[^]]*\]')
-if echo "$COLLS" | grep -q orders; then
-  ok "seeded 3 orders" "$COLLS"
+# Verify by querying the data back. The collections list is a weaker signal --
+# it was empty on a run where the writes had actually landed, which turned a
+# real problem into a confusing one.
+SEEDED=$(curl -s --max-time 5 -X POST "$B/v1/databases/$DB/query" \
+  -H 'Content-Type: application/json' -d '{"nql":"FROM orders"}' \
+  | grep -o '"count":[0-9]*' | cut -d: -f2)
+if [ "$SEEDED" = "3" ]; then
+  ok "seeded 3 orders" "verified by reading them back"
 else
-  bad "seed failed" "$COLLS"
+  bad "seed failed" "FROM orders returned ${SEEDED:-nothing}; every later check depends on this"
+  echo
+  echo "${R}Aborting: without seed data the remaining assertions are meaningless.${Z}"
+  echo "passed $PASS  failed $FAIL  skipped $SKIP"
+  echo "RESULT: FAIL"
+  exit 1
 fi
 
 # ── 3. is cast enabled? ───────────────────────────────────────────────────────
@@ -94,7 +135,13 @@ case "$CODE" in
        echo; echo "passed $PASS  failed $FAIL  skipped $SKIP"; echo "RESULT: SKIPPED"; exit 0 ;;
   503) skip "cast not enabled at runtime" "start nedbd with --cast and provide model.cast"
        echo; echo "passed $PASS  failed $FAIL  skipped $SKIP"; echo "RESULT: SKIPPED"; exit 0 ;;
-  200) ok "POST /cast responded 200" ;;
+  200)
+    if [ "$BOOT_CAST" = "0" ]; then
+      bad "IMPOSSIBLE: daemon logged 'cast DISABLED' but /cast returned 200" \
+          "you are almost certainly talking to a DIFFERENT nedbd. Check: curl $B/health"
+    else
+      ok "POST /cast responded 200"
+    fi ;;
   *)   bad "unexpected status $CODE" "$(echo "$BODY" | cut -c1-160)" ;;
 esac
 
@@ -110,6 +157,18 @@ echo "$BODY" | grep -q '"executed":false' \
   || bad "executed without being asked"
 
 # ── 4. execute:true returns correct rows ──────────────────────────────────────
+#
+# NOTE on what "correct" means here. Observed on a real run:
+#
+#   prompt  "paid orders over 100"
+#   nql     FROM orders WHERE status = "paid" LIMIT 100     <- WRONG
+#   right   FROM orders WHERE status = "paid" AND total > 100
+#
+# The model read "over 100" as LIMIT 100 and dropped the second predicate. The
+# row COUNT still came out at 2, because both paid orders happen to exceed 100 —
+# a count-only assertion would have called that a pass. So this section checks
+# the returned rows satisfy the filter, not just how many came back. Multi-
+# predicate WHERE is the model'"'"'s known weak clause (85.1% eval / 61.2% holdout).
 sect "Cast and execute"
 R2=$(curl -s --max-time 30 -X POST "$B/v1/databases/$DB/cast" \
   -H 'Content-Type: application/json' \
