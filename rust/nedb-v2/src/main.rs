@@ -114,6 +114,12 @@ async fn main() -> anyhow::Result<()> {
             "-m" | "--memory" => {
                 memory_mode = true;
             }
+            "--cast" => {
+                // Natural-language planning. Requires a build with
+                // --features cast; without it the endpoint returns 501 rather
+                // than pretending the URL does not exist.
+                std::env::set_var("NEDBD_CAST", "1");
+            }
             "-d" | "--data" => {
                 data_dir = Some(need_val(&args, &mut i, inline.as_deref(), "--data"));
             }

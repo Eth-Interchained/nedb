@@ -22,6 +22,8 @@ pub mod migrate;
 pub mod db;
 pub mod exit;
 pub mod nql;
+#[cfg(feature = "cast")]
+pub mod cast;
 pub mod server;
 
 pub use store::{Dek, Node, ObjectStore};

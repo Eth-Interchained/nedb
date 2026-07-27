@@ -62,6 +62,11 @@ pub struct Manager {
     /// Live query subscriptions: (db_name, sub_id) → (nql, last_hash, event_tx)
     subs:    Arc<DashMap<SubKey, SubVal>>,
     sub_ctr: Arc<AtomicU64>,
+    /// Natural-language planner. None unless built with --features cast AND
+    /// enabled at runtime; the whole feature is opt-in so a default nedbd
+    /// carries no model and no extra bytes.
+    #[cfg(feature = "cast")]
+    pub caster: Option<crate::cast::Caster>,
 }
 
 struct ManagerInner {
@@ -83,6 +88,8 @@ impl Manager {
             })),
             token,
             log_tx,
+            #[cfg(feature = "cast")]
+            caster: None,
             subs:    Arc::new(DashMap::new()),
             sub_ctr: Arc::new(AtomicU64::new(1)),
         }
@@ -342,6 +349,128 @@ async fn drop_database(
 
 #[derive(Deserialize)]
 struct QueryBody { nql: String }
+
+// ── Natural-language planning (feature: cast) ─────────────────────────────────
+
+#[derive(Deserialize)]
+struct CastBody {
+    prompt: String,
+    /// Run the plan immediately. Defaults to FALSE on purpose: the endpoint hands
+    /// back a plan for review rather than executing a guess. A planner that
+    /// silently runs the wrong query is worse than one that admits uncertainty.
+    #[serde(default)]
+    execute: bool,
+}
+
+/// POST /v1/databases/:name/cast — turn a short English prompt into NQL.
+///
+/// The model only ever produces TEXT. Execution goes through the same
+/// `nql::query` path a hand-typed query uses, so there is no second code path
+/// with different validation.
+#[cfg(feature = "cast")]
+async fn cast_prompt(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath(name): AxPath<String>,
+    Json(body): Json<CastBody>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+
+    let caster = match &mgr.caster {
+        Some(c) => c,
+        None => return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cast is not enabled; start nedbd with --cast (or NEDBD_CAST=1) \
+             and place model.cast in the data directory",
+        ),
+    };
+
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    if body.prompt.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "prompt is required");
+    }
+
+    // The engine knows the real schema, so constrain against it. This is the
+    // whole reason the planner lives here instead of in a client.
+    let collections = db.id_index.collections();
+    let result = caster.cast_checked(&body.prompt, &collections);
+
+    // Validate by PARSING, not by pattern-matching the text. The parser is the
+    // only authority on whether something is runnable.
+    let parse_err = match nql::parse(&result.nql) {
+        Ok(_)  => None,
+        Err(e) => Some(e.to_string()),
+    };
+
+    let (seq, head) = db_seq_head(&db);
+    let mut out = json!({
+        "prompt":            body.prompt,
+        "nql":               result.nql,
+        "valid":             parse_err.is_none(),
+        "collection":        result.collection,
+        "collection_known":  result.collection_known,
+        "collections":       collections,
+        "executed":          false,
+        "seq":  seq,
+        "head": head,
+    });
+
+    if let Some(e) = parse_err {
+        // Report the failure WITH the offending text. Never swallow it into an
+        // empty result set — that reads as "no matching rows", which is a lie.
+        out["error"] = json!(format!("NQL error: {}", e));
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(out)).into_response();
+    }
+
+    if !result.collection_known {
+        // Parses fine, but names a collection this database does not have. That
+        // is a model miss, not a user error, and it deserves to be said plainly
+        // rather than returning zero rows.
+        out["error"] = json!(format!(
+            "collection {:?} does not exist in {:?}",
+            result.collection.unwrap_or_default(), name
+        ));
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(out)).into_response();
+    }
+
+    if !body.execute {
+        return ok(out);
+    }
+
+    // Same executor as /query. No special path.
+    let nql_text = out["nql"].as_str().unwrap_or("").to_string();
+    match nql::query(&db, &nql_text) {
+        Ok((rows, count)) => {
+            out["executed"] = json!(true);
+            out["rows"]     = json!(rows);
+            out["count"]    = json!(count);
+            ok(out)
+        }
+        Err(e) => {
+            out["error"] = json!(format!("NQL error: {}", e));
+            (StatusCode::BAD_REQUEST, Json(out)).into_response()
+        }
+    }
+}
+
+/// Stub so the route table compiles identically with the feature off. Callers get
+/// a clear 501 instead of a 404, which would wrongly suggest the URL is wrong.
+#[cfg(not(feature = "cast"))]
+async fn cast_prompt(
+    State(_mgr): State<Manager>,
+    _headers: HeaderMap,
+    AxPath(_name): AxPath<String>,
+    Json(_body): Json<CastBody>,
+) -> Response {
+    err(
+        StatusCode::NOT_IMPLEMENTED,
+        "this nedbd was built without the `cast` feature; \
+         rebuild with --features cast to enable natural-language planning",
+    )
+}
 
 async fn query_database(
     State(mgr): State<Manager>,
@@ -869,6 +998,7 @@ pub fn router(mgr: Manager) -> Router {
         .route("/v1/databases",                                  get(list_databases).post(create_database))
         .route("/v1/databases/:name",                            get(get_database).delete(drop_database))
         .route("/v1/databases/:name/query",                      post(query_database))
+        .route("/v1/databases/:name/cast",                       post(cast_prompt))
         .route("/v1/databases/:name/put",                        post(put_document))
         .route("/v1/databases/:name/link",                       post(link_document))
         .route("/v1/databases/:name/rows/:coll/:id",             delete(delete_document))
@@ -888,8 +1018,29 @@ pub fn router(mgr: Manager) -> Router {
 
 /// Start the nedbd v2 server.
 pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>, memory_mode: bool) -> anyhow::Result<()> {
-    let mgr = Manager::new(Path::new(data_dir), tmk, token, memory_mode);
+    let mut mgr = Manager::new(Path::new(data_dir), tmk, token, memory_mode);
     mgr.open_all().await?;
+
+    // Load the natural-language planner if this build has the feature AND the
+    // operator asked for it. Failure to load is reported loudly but is NOT fatal:
+    // a missing model should not stop a database from serving queries.
+    #[cfg(feature = "cast")]
+    {
+        let want = std::env::var("NEDBD_CAST").map(|v| v == "1").unwrap_or(false);
+        if want {
+            match crate::cast::Caster::load(Path::new(data_dir)) {
+                Ok(c) => {
+                    println!("  cast     enabled — {:.2}M params, vocab {}, {}",
+                             c.n_params() as f64 / 1e6, c.vocab_size(), c.source());
+                    mgr.caster = Some(c);
+                }
+                Err(e) => {
+                    eprintln!("  cast     DISABLED — {}", e);
+                }
+            }
+        }
+    }
+    let mgr = mgr;
 
     let has_token = mgr.token.is_some();
     let mgr_for_shutdown = mgr.clone();

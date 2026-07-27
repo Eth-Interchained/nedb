@@ -23,7 +23,20 @@ path = "src/bin/nedb-cli.rs"
 name = "nedb_engine"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Natural-language query planning via nedb-cast-slm. OFF by default: it pulls a
+# 3.34M-param model and expects a model.cast container at runtime, and most
+# deployments do not want either. Enable with --features cast, then start the
+# daemon with --cast (or NEDBD_CAST=1).
+cast = ["dep:nedb-cast-slm"]
+
 [dependencies]
+# Natural-language planning (optional, feature = "cast").
+# nedb-cast-slm has an EMPTY dependency tree by design, so enabling this adds
+# exactly one crate and no transitive surface.
+nedb-cast-slm = { version = "10.30", optional = true }
+
 # Storage
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
