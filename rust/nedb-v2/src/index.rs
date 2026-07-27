@@ -290,15 +290,19 @@ impl IdIndex {
     /// List all doc IDs in a collection (memory map or disk + WAL merge).
     pub fn list_ids(&self, coll: &str) -> Vec<String> {
         if let Some(ref mem) = self.mem {
-            return mem.iter()
+            // DashMap iteration order is also unspecified — sort here too, so
+            // memory mode and disk mode agree.
+            let mut ids: Vec<String> = mem.iter()
                 .filter(|e| e.key().0 == coll)
                 .map(|e| e.key().1.clone())
                 .collect();
+            ids.sort_unstable();
+            return ids;
         }
         // Read from disk then overlay WAL (adds buffered writes, removes tombstones)
         let id_root = self.root.join(coll).join("id");
         // Each entry in id_root is a 2-char hex shard dir
-        fs::read_dir(&id_root)
+        let mut ids: Vec<String> = fs::read_dir(&id_root)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
@@ -333,7 +337,24 @@ impl IdIndex {
                     .map(|v| v.is_some())
                     .unwrap_or(true)
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // Deterministic order. The dedup above runs through HashSet, and Rust
+        // seeds its hasher randomly PER PROCESS — so without this the same query
+        // over unchanged data returns rows in a different order on every restart:
+        //
+        //   run 1:  o5 o8 o7 o4 o6 ...
+        //   run 2:  o7 o5 o2 o6 o8 ...
+        //
+        // Cosmetic for a full scan, but not for `LIMIT 5` with no ORDER BY,
+        // which then returns an arbitrary 5 of 8 and calls it an answer. It also
+        // makes any snapshot/diff test flaky for reasons that look like data
+        // corruption.
+        //
+        // Sorted by id, which for the common case of sequential ids is also
+        // insertion order. Callers that want a different order say ORDER BY.
+        ids.sort_unstable();
+        ids
     }
 
     /// Remove the id index entry for a document (tombstone / delete).
@@ -647,6 +668,54 @@ mod tests {
         let both = idx.collections();
         assert_eq!(both, vec!["orders".to_string(), "stylists".to_string()],
                    "expected both collections, got {both:?}");
+    }
+
+    /// Regression: `list_ids` must return a STABLE order.
+    ///
+    /// The dedup path runs through `HashSet`, and Rust seeds its hasher randomly
+    /// per process. Observed on a real daemon — same query, same data, three
+    /// consecutive runs:
+    ///
+    /// ```text
+    ///   o5 o8 o7 o4 o6 ...
+    ///   o7 o5 o2 o6 o8 ...
+    ///   o6 o1 o5 o4 o7 ...
+    /// ```
+    ///
+    /// Cosmetic on a full scan. NOT cosmetic for `LIMIT 5` with no `ORDER BY`,
+    /// which then hands back an arbitrary 5 of 8 as though it were an answer.
+    ///
+    /// NOTE the id set below. Sequential ids (`o1`..`o8`) can land in a
+    /// consistent order by chance, which would let this pass against the old
+    /// code. These are deliberately hash-scattered strings, and 24 of them, so a
+    /// single unsorted run being accidentally sorted is vanishingly unlikely.
+    #[test]
+    fn list_ids_order_is_stable() {
+        let dir = tempdir().unwrap();
+        let idx = IdIndex::new(dir.path()).unwrap();
+
+        let ids: Vec<String> = (0..24).map(|i| format!("zq{:x}-{}", i * 7919, i)).collect();
+        for id in &ids {
+            idx.set("orders", id, "h").unwrap();
+        }
+
+        // Buffered (pre-flush) and on-disk (post-flush) must BOTH be sorted, and
+        // must agree with each other — a flush is not a reordering event.
+        let mut want = ids.clone();
+        want.sort_unstable();
+
+        let before = idx.list_ids("orders");
+        assert_eq!(before, want, "unsorted before flush");
+
+        idx.flush_write_buf();
+        let after = idx.list_ids("orders");
+        assert_eq!(after, want, "unsorted after flush");
+        assert_eq!(before, after, "flush changed the order");
+
+        // Repeat reads within a process must not drift either.
+        for _ in 0..5 {
+            assert_eq!(idx.list_ids("orders"), want, "order varied between reads");
+        }
     }
 
     /// A tombstoned document must not resurrect its collection.
