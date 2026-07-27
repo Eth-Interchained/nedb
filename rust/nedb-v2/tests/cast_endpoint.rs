@@ -26,7 +26,7 @@
 //!     That is the model's known failure mode on unfamiliar schemas, and it must
 //!     surface as an explicit error, never as zero rows.
 
-use nedb_engine::db::Db;
+use nedb_engine::Db;
 use nedb_engine::nql;
 use serde_json::json;
 
@@ -48,12 +48,13 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 fn seeded_db(tag: &str) -> (Db, std::path::PathBuf) {
     let dir = tmpdir(tag);
     let db = Db::open(&dir, None).expect("open db");
-    db.put("orders", "o1", json!({"total": 150, "status": "paid"}), None, None, None)
+    db.put("orders", "o1", json!({"total": 150, "status": "paid"}), vec![], None, None)
         .expect("put o1");
-    db.put("orders", "o2", json!({"total": 40, "status": "pending"}), None, None, None)
+    db.put("orders", "o2", json!({"total": 40, "status": "pending"}), vec![], None, None)
         .expect("put o2");
-    db.put("orders", "o3", json!({"total": 900, "status": "paid"}), None, None, None)
+    db.put("orders", "o3", json!({"total": 900, "status": "paid"}), vec![], None, None)
         .expect("put o3");
+    db.flush_all();
     (db, dir)
 }
 
