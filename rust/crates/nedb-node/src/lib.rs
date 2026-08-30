@@ -25,6 +25,23 @@ fn node_to_json_str(node: &nedb_engine::store::Node) -> String {
     obj.insert("_hash".into(), Value::String(node.hash.clone()));
     obj.insert("_seq".into(),  serde_json::json!(node.seq));
     obj.insert("_coll".into(), Value::String(node.coll.clone()));
+    // Project the causal + bitemporal lanes exactly as the daemon's NQL
+    // serializer (nedb-v2/src/nql.rs node_to_json) does, so an embedded
+    // (napi) consumer sees the same node shape as an HTTP one. Without this,
+    // `_caused_by` is invisible to embedded readers even though the causal
+    // edge exists and TRACE resolves it — a silent read-projection gap that
+    // forced downstreams (e.g. mantel) to reconstruct it from residual data.
+    if !node.caused_by.is_empty() {
+        obj.insert("_caused_by".into(), Value::Array(
+            node.caused_by.iter().map(|h| Value::String(h.clone())).collect()
+        ));
+    }
+    if let Some(ref vf) = node.valid_from {
+        obj.insert("_valid_from".into(), Value::String(vf.clone()));
+    }
+    if let Some(ref vt) = node.valid_to {
+        obj.insert("_valid_to".into(), Value::String(vt.clone()));
+    }
     Value::Object(obj).to_string()
 }
 
@@ -254,5 +271,58 @@ impl NedbCore {
             "indexed_seq_min": s.indexed_seq_min, "indexed_seq_max": s.indexed_seq_max,
             "indexed_count": s.indexed_count
         }).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::node_to_json_str;
+    use nedb_engine::store::Node;
+    use serde_json::Value;
+
+    fn node() -> Node {
+        Node {
+            id: "sig1".into(),
+            coll: "signals".into(),
+            seq: 7,
+            data: serde_json::json!({ "claim": "fits in 24GB" }),
+            prev: None,
+            caused_by: vec!["a".into(), "b".into()],
+            ts: 1_718_400_000.0,
+            valid_from: Some("2026-01-01".into()),
+            valid_to: None,
+            hash: "deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn serializes_causal_and_bitemporal_lanes_like_the_daemon() {
+        let v: Value = serde_json::from_str(&node_to_json_str(&node())).unwrap();
+        // The bug this fix closes: _caused_by must be present on the embedded
+        // read projection, matching nedb-v2/src/nql.rs node_to_json.
+        assert_eq!(
+            v["_caused_by"],
+            serde_json::json!(["a", "b"]),
+            "embedded serializer must project _caused_by"
+        );
+        assert_eq!(v["_valid_from"], serde_json::json!("2026-01-01"));
+        // valid_to is None -> the key is omitted, not null (daemon parity).
+        assert!(v.get("_valid_to").is_none(), "absent valid_to omits the key");
+        // The pre-existing lanes still hold.
+        assert_eq!(v["_id"], serde_json::json!("sig1"));
+        assert_eq!(v["_hash"], serde_json::json!("deadbeef"));
+        assert_eq!(v["_seq"], serde_json::json!(7));
+        assert_eq!(v["_coll"], serde_json::json!("signals"));
+        assert_eq!(v["claim"], serde_json::json!("fits in 24GB"));
+    }
+
+    #[test]
+    fn omits_caused_by_when_empty() {
+        let mut n = node();
+        n.caused_by = vec![];
+        let v: Value = serde_json::from_str(&node_to_json_str(&n)).unwrap();
+        // An empty causal set omits the key entirely — a root write is not
+        // "caused by nothing", it simply has no _caused_by field.
+        assert!(v.get("_caused_by").is_none(), "empty caused_by omits the key");
     }
 }
