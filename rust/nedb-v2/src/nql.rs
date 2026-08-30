@@ -53,15 +53,41 @@ impl<'a> Lexer<'a> {
 
         let c = self.peek_char().unwrap();
 
-        // Quoted string
+        // Quoted string.
+        //
+        // A backslash escapes a following double-quote (\" -> a literal " that
+        // does NOT end the string). This is purely additive: a literal quote
+        // was previously impossible to express — the first " always closed the
+        // string — so no existing query can rely on the old meaning of \" and
+        // nothing breaks. Every OTHER backslash stays literal, so raw-backslash
+        // values (e.g. a Windows path) keep matching exactly as before; a
+        // regression test pins that. (A fully C-style scheme where \\ -> \
+        // would instead change the meaning of every existing backslash query,
+        // so it is deliberately NOT done here.)
         if c == '"' {
             self.pos += 1;
-            let start = self.pos;
-            while self.pos < self.src.len() && self.peek_char() != Some('"') {
-                self.pos += self.peek_char().unwrap().len_utf8();
+            let mut s = String::new();
+            while let Some(ch) = self.peek_char() {
+                if ch == '"' {
+                    break;
+                }
+                if ch == '\\' {
+                    // Look at the next char: only \" collapses to ". A trailing
+                    // backslash (nothing after it) or \x for any other x stays
+                    // a literal backslash, preserving prior behavior.
+                    let next = self.src[self.pos + 1..].chars().next();
+                    if next == Some('"') {
+                        s.push('"');
+                        self.pos += 1 + 1; // consume the backslash and the quote
+                        continue;
+                    }
+                }
+                s.push(ch);
+                self.pos += ch.len_utf8();
             }
-            let s = self.src[start..self.pos].to_string();
-            if self.peek_char() == Some('"') { self.pos += 1; }
+            if self.peek_char() == Some('"') {
+                self.pos += 1;
+            }
             return Tok::Str(s);
         }
 
@@ -678,6 +704,50 @@ mod tests {
         let (rows, _) = query(&db, r#"FROM events VALID AS OF "2025-03-01""#).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["type"], "a");
+    }
+
+    // ── String-literal escaping ──────────────────────────────────────────────
+
+    #[test]
+    fn escaped_quote_matches_a_value_containing_a_quote() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("m", "q", serde_json::json!({ "name": "say \"hi\"" }), vec![], None, None)
+            .unwrap();
+        db.put("m", "p", serde_json::json!({ "name": "plain" }), vec![], None, None).unwrap();
+
+        // \" inside the literal is a literal quote; the string does not end there.
+        let (rows, count) = query(&db, r#"FROM m WHERE name = "say \"hi\"""#).unwrap();
+        assert_eq!(count, 1, "the escaped-quote literal matches exactly one row");
+        assert_eq!(rows[0]["_id"], "q");
+    }
+
+    #[test]
+    fn raw_backslash_still_matches_literally() {
+        // REGRESSION GUARD: a lone backslash stays literal, so pre-existing
+        // backslash queries (Windows paths etc.) keep matching. This is the
+        // property that makes the \" addition non-breaking.
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("m", "b", serde_json::json!({ "p": "back\\slash" }), vec![], None, None).unwrap();
+
+        let (rows, count) = query(&db, r#"FROM m WHERE p = "back\slash""#).unwrap();
+        assert_eq!(count, 1, "a raw backslash literal matches as before");
+        assert_eq!(rows[0]["_id"], "b");
+    }
+
+    #[test]
+    fn a_quote_can_no_longer_inject_trailing_clauses() {
+        // The security motivation: previously a value of `x" LIMIT 1` would
+        // terminate the literal and inject `LIMIT 1`. With \" the caller can
+        // escape the quote so it stays part of the value and matches nothing
+        // rogue. Here the escaped form matches the literal value verbatim.
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("m", "x", serde_json::json!({ "v": "a\"b" }), vec![], None, None).unwrap();
+        let (rows, count) = query(&db, r#"FROM m WHERE v = "a\"b""#).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rows[0]["_id"], "x");
     }
 }
 
