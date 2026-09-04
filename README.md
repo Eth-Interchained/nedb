@@ -47,6 +47,7 @@ Off by default — feature-gated at compile time, flag-gated at runtime, and `ex
 **New in 2.5.x:**
 
 - **Durable-mode auto-flush-on-exit** — a durable store flushes buffered writes on `Ctrl+C` / `SIGTERM`, not just on a clean `Drop`. Automatic in the Node and Python bindings; `Db::install_exit_flush(Arc<Db>)` for standalone Rust binaries. See [**docs/DURABILITY.md**](docs/DURABILITY.md).
+- **2.8.5 — embedded bindings flush on a cadence.** `NedbCore.open()` (Node + Python) now runs the 1 s manifest ticker exactly as `nedbd` does, so a `SIGKILL` / OOM / power cut loses at most one tick of acknowledged writes instead of everything since open. `NEDB_FLUSH_MS` tunes or disables it. See [docs/DURABILITY.md](docs/DURABILITY.md).
 - **`nedb-cli`** — operate on a store directory offline (`head` · `status` · `verify` · `get` · `scan` · `flush` · `repair` · `export`), and **`nedb-inspector`** — a deterministic (no-regex, no-LLM) checker that warns when a durable open lacks flush-on-exit wiring. See [**docs/CLI.md**](docs/CLI.md).
 - **Replication contract** — `tip()` (the latest write), a bounded `since()` changefeed, and a `scan_status()` readiness gate. See [**docs/REPLICATION.md**](docs/REPLICATION.md).
 

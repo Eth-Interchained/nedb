@@ -596,6 +596,33 @@ impl Db {
     /// Start a background thread that flushes both the id-index WAL and MANIFEST
     /// every `interval_ms` milliseconds.
     /// Call this after Arc::new(db) — the Arc keeps Db alive for the thread's lifetime.
+    /// Flush cadence for EMBEDDED durable handles (the napi and pyo3 `open()` paths).
+    ///
+    /// `nedbd` has always run the manifest ticker at 1 s, so a server flushes the id-index WAL and
+    /// MANIFEST every second and a hard kill loses at most a second of acknowledged writes. The
+    /// embedded bindings did not start a ticker at all: their WAL was flushed only by the exit hooks
+    /// (SIGINT/SIGTERM/atexit) — so an embedded app killed with SIGKILL, OOM-killed, or cut by power
+    /// lost EVERY write since open, with no bound. Found by CHALK / Sports-Rater on 2026-09-04
+    /// (acknowledged fan writes gone after `kill -9`). Since 2.8.5 the bindings start the ticker on
+    /// durable open with this cadence — parity with nedbd.
+    ///
+    /// `NEDB_FLUSH_MS` overrides: an integer of milliseconds (min 50), or `0` / `off` to disable
+    /// (only for hosts that own their own flush cadence). Unset → 1000.
+    pub fn embedded_flush_interval_ms() -> Option<u64> {
+        match std::env::var("NEDB_FLUSH_MS") {
+            Err(_) => Some(1000),
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                if v.is_empty() { return Some(1000); }
+                if v == "0" || v == "off" || v == "false" || v == "no" { return None; }
+                match v.parse::<u64>() {
+                    Ok(ms) => Some(ms.max(50)),
+                    Err(_) => { eprintln!("nedb: NEDB_FLUSH_MS={:?} is not a number — using 1000", v); Some(1000) }
+                }
+            }
+        }
+    }
+
     pub fn start_manifest_ticker(self_arc: Arc<Self>, interval_ms: u64) {
         let db = self_arc;
         std::thread::spawn(move || {

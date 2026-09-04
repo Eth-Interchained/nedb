@@ -125,6 +125,10 @@ impl NedbCore {
         let db = Db::open(std::path::Path::new(path), dek)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let inner = Arc::new(db);
+        // Durability parity with nedbd (2.8.5): periodic WAL + MANIFEST flush, not only at exit.
+        if let Some(ms) = Db::embedded_flush_interval_ms() {
+            Db::start_manifest_ticker(Arc::clone(&inner), ms);
+        }
         // Best-effort: a hook-registration hiccup must not fail open().
         let _ = register_atexit_flush(py, Arc::downgrade(&inner));
         Ok(Self { inner, encrypted })
