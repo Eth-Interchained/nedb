@@ -19,11 +19,17 @@
 
 const native = require('./native.js');
 
-const { NedbCore } = native;
+const Native = native.NedbCore;
 
-if (NedbCore && typeof NedbCore.open === 'function' && !NedbCore.__exitFlushWrapped) {
-  const nativeOpen = NedbCore.open.bind(NedbCore);
-
+// The napi class defines `open` as a NON-writable, NON-configurable static, so the
+// 2.5.x wrapper's `NedbCore.open = …` threw ("Cannot assign to read only property")
+// — and CI's `napi build` was overwriting this file with the generated loader
+// anyway, so the published package never carried the wrapper at all. Both fixed
+// in 2.8.5: wrap by SUBCLASS (an own static on the subclass shadows the parent's),
+// build with `--js native.js` so this file survives, and gate the publish on
+// `NedbCore.__exitFlushWrapped` (see test/durability.test.mjs).
+let NedbCore = Native;
+if (Native && typeof Native.open === 'function' && !Native.__exitFlushWrapped) {
   // Durable handles opened in this process. Strong refs: a durable DB is meant to
   // live for the process, and we must be able to flush it on the way out.
   const live = new Set();
@@ -57,21 +63,19 @@ if (NedbCore && typeof NedbCore.open === 'function' && !NedbCore.__exitFlushWrap
     process.on('SIGTERM', onSignal(15));
   };
 
-  NedbCore.open = function open(path) {
-    const db = nativeOpen(path);
-    live.add(db);
-    arm();
-    return db;
+  NedbCore = class NedbCore extends Native {
+    static open(path) {
+      const db = Native.open(path);
+      live.add(db);
+      arm();
+      return db;
+    }
   };
-
   // Mark so a re-require (or a wrapped re-export) never double-wraps.
-  Object.defineProperty(NedbCore, '__exitFlushWrapped', {
-    value: true,
-    enumerable: false,
-  });
+  Object.defineProperty(NedbCore, '__exitFlushWrapped', { value: true, enumerable: false });
 }
 
-module.exports = native;
+module.exports = { ...native, NedbCore };
 // Explicit named re-export so ESM `import { NedbCore } from 'nedb-engine'` (used
 // by the test suite) resolves the class through cjs-module-lexer.
 module.exports.NedbCore = NedbCore;

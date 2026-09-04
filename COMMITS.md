@@ -2,7 +2,7 @@
 
 Living progress log for the NEDB engine and its published **distributions**. The engine is the source of truth; the distributions (`crypto-database`, `aof-db`) and downstream consumers (itcd) are tracked where they exercise engine capabilities.
 
-_Last updated: 2026-06-27 — release **v2.4.468** (3-distribution split live: nedb-engine + crypto-database + aof-db on one tag; one-command `scripts/release.py`; distro npm now bundles macOS addons)._
+_Last updated: 2026-09-04 — release **v2.8.5** (embedded bindings run the 1 s manifest ticker; SIGKILL loses at most one tick, was: everything since open)._
 
 ---
 
@@ -10,6 +10,7 @@ _Last updated: 2026-06-27 — release **v2.4.468** (3-distribution split live: n
 
 | Version | What shipped | Registries |
 |---|---|---|
+| **v2.8.5** | **Embedded durability parity with nedbd.** `NedbCore.open()` in Node and Python now starts the manifest ticker (1 s; `NEDB_FLUSH_MS` tunes/disables) so a `SIGKILL` / OOM-kill / power cut loses at most one tick of acknowledged writes — before, only the exit hooks flushed and an embedded app lost every write since open. Found by CHALK / Sports-Rater (acknowledged fan writes gone after `kill -9`). Also: the Node exit-flush wrapper had **never shipped** (CI's `napi build` overwrote `index.js` with the generated loader) and could not have worked (`open` is a non-writable static) — now wraps by subclass, CI builds with `--js native.js` and gates the publish on the wrapper + `test/durability.test.mjs` (SIGKILL kept via ticker · SIGTERM kept via wrapper · ticker-off SIGKILL lost, the control). | PyPI · npm · crates.io |
 | **v2.4.468** | Distro **npm packages now bundle macOS native addons** — `release-distros` waits for Codemagic's `<distro>.darwin-arm64/-x64.node` and assembles them before `npm publish` (mirrors the flagship), so crypto-database/aof-db ship full **mac + linux + windows**. Adds the committed **`scripts/release.py "vFROM" "vTO"`** — a one-command, idempotent tri-distribution release tool. `nedb-engine` default realigns everywhere (2.4.468 > 2.4.444). | npm · PyPI · crates.io |
 | **v2.4.68** | First **fully-green 3-distribution release**: **nedb-engine** (flagship) + **crypto-database** (verifiable v2/v3 DAG) + **aof-db** (fast append-only) all ship on one tag across npm/PyPI/crates. Two fixes brought it green: the engine crate `rust/nedb-v2` was stranded at `2.4.3` while each wrapper required `^2.4.x` (broke the napi/cargo build) — every version line aligned; and the `release-distros` **startup_failure** caused by double-quoted `"refs/tags/"` in three `if:` conditions (GitHub Actions expressions require single quotes). | npm · PyPI · crates.io |
 | **v2.4.3** | **3-distribution split introduced.** Distros live in org forks (`crypto-datab/cryptoDB` → crypto-database, `nitro-db/aof-DB` → aof-db), submoduled under `distributions/`; the central `codemagic.yaml` builds all 6 macOS wheels and `release-distros.yml` publishes the distros — no workflows in the forks. Each distro carries a distinct README + napi/crate/PyPI identity. (Flagship shipped; distro naming + CI iterated to green at v2.4.68.) | PyPI · npm · crates.io (flagship) |

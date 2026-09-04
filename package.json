@@ -1,6 +1,6 @@
 {
   "name": "nedb-engine",
-  "version": "2.8.4",
+  "version": "2.8.5",
   "description": "NEDB — hash-chained, time-traveling, bi-temporal embedded database with Rust native core. SQL, Redis, MongoDB adapters. Causal Write Provenance. RESP2 wire protocol.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -19,6 +19,7 @@
     "*.node",
     "nedbd-v2*",
     "test/smoke.mjs",
+    "test/durability.test.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -59,7 +60,7 @@
   "scripts": {
     "build": "napi build --release --platform --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts",
     "build:debug": "napi build --platform --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts",
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs && node test/durability.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"

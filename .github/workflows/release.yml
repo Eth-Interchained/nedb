@@ -309,7 +309,13 @@ jobs:
       - name: Install @napi-rs/cli
         run: npm install
       - name: Build native addon
-        run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node
+        # --js native.js / --dts native.d.ts: the generated loader must NOT overwrite index.js —
+        # index.js is the hand-written durable-mode wrapper (exit flush). Until 2.8.5 this step
+        # clobbered it and the published package shipped the bare loader.
+        run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts
+      - name: Wrapper gate — index.js must be the durable-mode wrapper, not the generated loader
+        shell: bash
+        run: node -e "const {NedbCore}=require('./index.js'); if (!NedbCore.__exitFlushWrapped) { console.error('index.js is not the exit-flush wrapper'); process.exit(1) } console.log('wrapper present')"
       - name: Build nedbd-v2 binary (DAG engine daemon)
         shell: bash
         run: |
@@ -351,6 +357,8 @@ jobs:
             nedbd-v2-win-x64.exe
             index.js
             index.d.ts
+            native.js
+            native.d.ts
           if-no-files-found: ignore
 
   # ---------------------------------------------------- smoke gate -----
@@ -377,11 +385,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Testing freshly-built artifacts:"; ls -lh *.node index.js test/smoke.mjs
+          echo "Testing freshly-built artifacts:"; ls -lh *.node index.js native.js test/smoke.mjs test/durability.test.mjs
           # Exit code is the gate; the banner grep is the explicit parse.
           node test/smoke.mjs | tee smoke-out.txt
           grep -q "all five acts passed" smoke-out.txt
-          echo "✅ smoke gate passed — clearing npm publish"
+          # Durability gate (2.8.5): SIGKILLed child keeps its write (ticker), SIGTERMed child keeps
+          # its write with the ticker off (exit-flush wrapper), ticker-off SIGKILL loses it (control).
+          node test/durability.test.mjs | tee dur-out.txt
+          grep -q "durability contract holds" dur-out.txt
+          echo "✅ smoke + durability gates passed — clearing npm publish"
 
   publish-npm:
     needs: [node-binaries, smoke-gate]

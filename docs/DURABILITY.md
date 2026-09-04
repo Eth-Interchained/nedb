@@ -30,6 +30,18 @@ Flushing happens in three ways:
 
 ---
 
+## Embedded bindings run the manifest ticker (2.8.5)
+
+Until 2.8.4 only `nedbd` ran the manifest ticker; `NedbCore.open()` in Node and Python flushed **only** through the exit hooks above. That closed Ctrl+C / `SIGTERM` — but `SIGKILL`, an OOM-kill, or power loss never runs a hook, and an embedded app lost **every write since open**, with no bound. Found in production by CHALK / Sports-Rater (2026-09-04): fan writes acknowledged with a hash, readable, then gone after `kill -9` of the host process.
+
+Since **2.8.5** a durable `open()` in either binding starts `start_manifest_ticker` at **1000 ms** — the same cadence `nedbd` has always used — so the loss window on a hard kill is at most one tick. Override with `NEDB_FLUSH_MS=<ms>` (min 50), or `NEDB_FLUSH_MS=0` to disable when the host owns its own `flush()` cadence. `:memory:` databases are unaffected. Exit hooks stay in place; the two are complementary (the hook covers the last partial tick on a graceful exit).
+
+The contract, stated plainly: **an acknowledged write is on disk within one tick, or at exit — whichever comes first.** A put still returns before its index entry is durable; a host that needs per-write durability calls `flush()` after the put.
+
+### The Node wrapper never shipped before 2.8.5
+
+Two defects, found together: (1) the napi class defines `open` as a non-writable, non-configurable static, so the wrapper's `NedbCore.open = …` threw on load; (2) the release workflow's `napi build` wrote the generated loader to `index.js`, overwriting the wrapper — so the published `nedb-engine` package carried no exit flush at all, and the "automatic on durable open" contract below was false for every npm embedder. 2.8.5 wraps by subclass, builds with `--js native.js`, and gates the publish on `NedbCore.__exitFlushWrapped` plus `test/durability.test.mjs` (SIGKILL keeps the write via the ticker; SIGTERM with the ticker off keeps it via the wrapper; ticker-off SIGKILL loses it — the control).
+
 ## Rust — `Db::install_exit_flush`
 
 For a **standalone Rust binary** (a relay node, a job runner — anything that owns the process and may be signalled):

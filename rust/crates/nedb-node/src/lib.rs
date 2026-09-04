@@ -67,9 +67,15 @@ impl NedbCore {
     /// clobber libuv's own signal machinery.
     #[napi(factory)]
     pub fn open(path: String) -> Result<Self> {
-        Db::open(std::path::Path::new(&path), None)
-            .map(|db| Self { inner: Arc::new(db) })
-            .map_err(|e| Error::from_reason(e.to_string()))
+        let db = Db::open(std::path::Path::new(&path), None)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let inner = Arc::new(db);
+        // Durability parity with nedbd (2.8.5): flush the id-index WAL + MANIFEST on a cadence, not
+        // only on exit. Without this an embedded app killed with SIGKILL lost every write since open.
+        if let Some(ms) = Db::embedded_flush_interval_ms() {
+            Db::start_manifest_ticker(Arc::clone(&inner), ms);
+        }
+        Ok(Self { inner })
     }
 
     // ── Indexes ────────────────────────────────────────────────────────────────
