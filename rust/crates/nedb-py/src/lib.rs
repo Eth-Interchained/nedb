@@ -289,7 +289,7 @@ impl NedbCore {
     fn scan_status(&self) -> String {
         let s = self.inner.scan_status();
         serde_json::json!({
-            "scan_complete": s.scan_complete, "tip_seq": s.tip_seq,
+            "scan_complete": s.scan_complete, "seq_index_ready": s.seq_index_ready, "tip_seq": s.tip_seq,
             "indexed_seq_min": s.indexed_seq_min, "indexed_seq_max": s.indexed_seq_max,
             "indexed_count": s.indexed_count
         }).to_string()

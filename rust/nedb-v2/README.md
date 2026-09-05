@@ -16,6 +16,83 @@ nedbd --dag ./data        # DAG engine (v2, content-addressed, recommended)
 
 ---
 
+## ⚠️ New in 2.8.6 — Durability & Recovery (read this if you store anything you care about)
+
+Three defects found by killing a real engine at every persistence boundary and by filling a real
+filesystem to zero free blocks. All three are fixed. **If you are on 2.8.5 or earlier, upgrade.**
+
+### 1. A failed flush silently discarded acknowledged writes
+
+`IdIndex::flush_write_buf` cleared every buffered entry regardless of whether its disk write
+succeeded. So a flush that hit `ENOSPC` threw the entry away, and no later flush retried it.
+
+Reproduced on a full 22 MiB filesystem: **30 rows acknowledged by `put() -> Ok`, then `list()`
+returned 0 after reopen — while `verify()` reported all 30 objects healthy.** The content-addressed
+objects were durable; the id-index entries that make them findable were gone.
+
+```
+before:  try_flush_all() -> (no return value)      reopen -> 0 rows, verify() = 30 ok
+after:   try_flush_all() -> Err("id-index leaf rows/buf_25: No space left on device (os error 28)")
+         ...free space, retry -> Ok                reopen -> 30 rows
+```
+
+**Fixed:** an entry leaves the WAL only when its write actually landed. Failures stay buffered and
+retry on the next flush.
+
+### 2. Flush errors were unobservable — new `try_flush_all()`
+
+`flush_all()` returns `()` and logged fsync failures to stderr, so a caller could not tell a durable
+flush from a failed one. Anything that takes a destructive or externally-visible action on the
+strength of a persisted record needs to know.
+
+```rust
+// Use this when the outcome matters:
+db.try_flush_all()?;      // Result<()> — id-index WAL + segment sync + MANIFEST
+
+// Still available, still logs, nowhere to propagate (ticker / Drop):
+db.flush_all();
+```
+
+Also new: `Db::try_flush_manifest()` and `IdIndex::try_flush_write_buf()`.
+
+### 3. `repair` could not repair, and `since()` claimed "caught up" while behind
+
+The cold scan rebuilt `seq_index`, per-collection tips, the Merkle head and `MANIFEST` — but **never
+the id index**. A database whose WAL never reached disk came back with every object verifying and
+`list()` empty, and `nedb-cli repair` printed success without fixing it, because
+`start_cold_scan()` is a deliberate no-op on a warm store.
+
+```bash
+nedb-cli repair ./data
+# repaired: 203 id-index entr(ies) rebuilt, 203 node(s) verified, flushed
+```
+
+```rust
+let restored = db.repair()?;   // rebuild id index from objects; highest seq wins
+```
+
+Every object carries its own `coll`, `id` and `seq`, so the id index is fully derivable — a lost WAL
+is recoverable and nothing is invented. `repair()` also recomputes head and tips, so a repaired
+database reopens **warm** instead of coming back up cold with an empty head.
+
+Separately, `since()` set `has_more = hit_limit` alone. On a warm boot the seq index is empty **by
+design** (that is why warm start is O(1)), so every lookup missed and `since()` returned zero nodes
+with `has_more = false` — indistinguishable from genuinely up to date. A consumer following the
+documented drain loop stopped one call in, with every record unread.
+
+**Fixed:** `has_more` is true whenever the cursor is behind the log head. `ScanStatus` gains
+**`seq_index_ready`** — replication consumers should gate on that, not on `scan_complete`, which is
+true on a warm boot precisely because the scan was skipped.
+
+### Known sharp edge (documented, not changed)
+
+`since()`'s cursor is **exclusive** and seqs start at 0, so `since(0, _)` returns `(0, head]` and the
+very first write in a database (seq 0) is unreachable through any cursor value. Ten writes drain as
+nine records. Changing the convention would break existing consumers; a replica seeded from
+`since()` alone starts one record short.
+
+---
+
 ## What is NEDB v2?
 
 NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**:
