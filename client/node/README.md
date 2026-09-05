@@ -9,6 +9,26 @@ Connect to any running `nedbd` instance from Node.js or the browser. No engine e
 
 ---
 
+---
+
+## ⚠️ Upgrade your server to nedbd 2.8.6
+
+This client talks to `nedbd`, so its durability comes from the server. **2.8.6 fixes three defects in
+2.8.5 and earlier** — a flush that hit a full disk silently discarded acknowledged writes, flush
+failures were unobservable, and `nedb-cli repair` could not actually rebuild a damaged id index.
+
+If a database ever returned rows and now returns none while `/verify` reports every object healthy,
+that is the lost-id-index symptom and it is recoverable:
+
+```bash
+nedb-cli repair ./data
+```
+
+Replication consumers paging `/since`: gate historical catch-up on **`seq_index_ready`** from
+`/status`, not on `scan_complete`. `scan_complete` is true on a warm boot precisely because the scan
+was skipped, and before 2.8.6 `since` reported `has_more: false` in that state — which reads as
+"caught up" on a database with every record unread.
+
 ## Install
 
 ```bash

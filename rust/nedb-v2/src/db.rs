@@ -77,6 +77,13 @@ pub struct ScanStatus {
     pub indexed_seq_max: u64,
     /// Number of seqs currently resolvable via the index.
     pub indexed_count:   usize,
+    /// True when the seq index actually covers the log — i.e. `since()` can
+    /// resolve historical seqs. DISTINCT from `scan_complete`: a warm boot is
+    /// "startup complete" in O(1) precisely because it SKIPS the scan, so
+    /// `scan_complete` is true while this is false and `since()` resolves
+    /// nothing. Replication consumers must gate on this field, not on
+    /// `scan_complete`; call `rebuild_id_index()`/`repair()` to populate it.
+    pub seq_index_ready: bool,
 }
 
 pub struct Db {
@@ -316,6 +323,74 @@ impl Db {
         });
     }
 
+    /// Rebuild the id index from the object store, synchronously.
+    ///
+    /// Every object carries its own `coll`, `id` and `seq`, so the id index is
+    /// fully derivable: for each (coll, id) the highest seq wins. Use this to
+    /// recover a database whose id-index WAL never reached disk — the objects
+    /// are intact and verify, but `list()`/`get()` return nothing.
+    ///
+    /// Idempotent, and safe on a healthy store (it rewrites the same winners).
+    /// Returns the number of entries written. Flushes before returning.
+    pub fn rebuild_id_index(&self) -> Result<usize> {
+        let hashes: Vec<String> = self.objects.all_hashes().collect();
+        let mut nodes: Vec<Node> = Vec::with_capacity(hashes.len());
+        for h in &hashes {
+            if let Ok(node) = self.objects.read(h) {
+                self.seq_index.insert(node.seq, node.hash.clone());
+                nodes.push(node);
+            }
+        }
+        let written = rebuild_id_index_from_nodes(self, &nodes);
+
+        // Per-collection tips, so tip_collection() resolves after a repair.
+        let mut coll_max: std::collections::HashMap<String, (u64, String)> =
+            std::collections::HashMap::new();
+        for node in &nodes {
+            coll_max
+                .entry(node.coll.clone())
+                .and_modify(|cur| {
+                    if node.seq > cur.0 {
+                        *cur = (node.seq, node.hash.clone());
+                    }
+                })
+                .or_insert((node.seq, node.hash.clone()));
+        }
+        for (coll, (seq, hash)) in coll_max {
+            self.coll_tip_hash.insert(coll, (seq, hash));
+        }
+
+        let max_seq = nodes.iter().map(|n| n.seq).max().unwrap_or(0);
+        // Keep the seq counter ahead of everything we just found, so the next
+        // write cannot reuse a seq that already exists in the log.
+        let next = max_seq + 1;
+        if !nodes.is_empty() && self.seq.load(Ordering::SeqCst) < next {
+            self.seq.store(next, Ordering::SeqCst);
+        }
+
+        // Recompute head + tip through the shared implementation, so a repaired
+        // database reopens WARM with a valid MANIFEST instead of coming back up
+        // cold with an empty head (which reads as corruption to the next boot).
+        if !nodes.is_empty() {
+            recompute_head_and_tip(self, hashes, max_seq);
+        }
+
+        self.try_flush_all()?;
+        Ok(written)
+    }
+
+    /// Full repair: rebuild the seq index and the id index from objects, even on
+    /// a WARM store, then flush.
+    ///
+    /// [`start_cold_scan`] deliberately no-ops when startup is already complete,
+    /// which meant the documented repair path ("idempotent — a no-op on a warm
+    /// store, a full self-heal on a stale MANIFEST") could never repair a
+    /// database that had a valid MANIFEST and a damaged id index. This is the
+    /// forcing entry point; `start_cold_scan` keeps its O(1) warm-boot contract.
+    pub fn repair(&self) -> Result<usize> {
+        self.rebuild_id_index()
+    }
+
     /// Write a document. Returns the new node with its content hash set.
     pub fn put(
         &self,
@@ -513,15 +588,38 @@ impl Db {
         self.manifest_dirty.store(true, Ordering::Release);
     }
 
-    /// Flush both the id-index WAL and MANIFEST. Used on graceful shutdown.
-    pub fn flush_all(&self) {
-        self.id_index.flush_write_buf();
+    /// Flush both the id-index WAL and MANIFEST, REPORTING failure.
+    ///
+    /// This is the durability boundary: until it returns `Ok(())`, writes that
+    /// `put()` acknowledged may not be on disk. Callers that must not lose data
+    /// — anything about to take a destructive or externally-visible action on
+    /// the strength of a persisted record — should use this, not [`flush_all`].
+    ///
+    /// Every stage is attempted even if an earlier one fails (a MANIFEST flush
+    /// is still worth doing when one index leaf failed), and the first error is
+    /// returned. Failed id-index entries stay in the WAL for retry.
+    pub fn try_flush_all(&self) -> Result<()> {
+        let index_result = self.id_index.try_flush_write_buf();
         // v3: fsync the active segment (no-op for loose/in-memory stores).
         // One durability point per batch instead of one fsync per object.
-        if let Err(e) = self.objects.sync() {
-            eprintln!("nedb: segment sync failed: {}", e);
+        let sync_result = self.objects.sync();
+        let manifest_result = self.try_flush_manifest();
+
+        index_result.map_err(|e| anyhow::anyhow!("id-index WAL flush failed: {}", e))?;
+        sync_result.map_err(|e| anyhow::anyhow!("object segment sync failed: {}", e))?;
+        manifest_result.map_err(|e| anyhow::anyhow!("MANIFEST flush failed: {}", e))?;
+        Ok(())
+    }
+
+    /// Flush both the id-index WAL and MANIFEST. Used on graceful shutdown.
+    ///
+    /// Errors are logged, not returned — kept for back-compat and for the
+    /// ticker/`Drop` paths that have nowhere to propagate. Prefer
+    /// [`try_flush_all`] whenever the outcome matters.
+    pub fn flush_all(&self) {
+        if let Err(e) = self.try_flush_all() {
+            eprintln!("nedb: flush_all failed: {}", e);
         }
-        self.flush_manifest();
     }
 
     /// Compact the v3 packed object store: keep the CURRENT version of every
@@ -555,9 +653,15 @@ impl Db {
         }
     }
 
-    /// Atomically persist current seq+head to MANIFEST. No-op for in-memory databases.
-    pub fn flush_manifest(&self) {
-        if self.root == std::path::PathBuf::from(":memory:") { return; }
+    /// Atomically persist current seq+head to MANIFEST, reporting failure.
+    /// No-op (`Ok`) for in-memory databases.
+    ///
+    /// A silently failed MANIFEST write is not data loss — the startup
+    /// self-heal rescans — but it IS a warm-boot regression and, on a full
+    /// disk, the first symptom that persistence is failing. Callers deserve
+    /// to know.
+    pub fn try_flush_manifest(&self) -> std::io::Result<()> {
+        if self.root == std::path::PathBuf::from(":memory:") { return Ok(()); }
         let seq  = self.seq.load(Ordering::SeqCst);
         let head = self.head.read().clone();
         let tip_hash = self.tip_hash.read().1.clone();
@@ -566,32 +670,45 @@ impl Db {
             .map(|kv| (kv.key().clone(), kv.value().1.clone()))
             .collect();
         let m = Manifest { seq, head, tip_hash, coll_tips };
-        if let Ok(json) = serde_json::to_string(&m) {
-            let path = self.root.join("MANIFEST");
-            let tmp  = self.root.join("MANIFEST.tmp");
-            // fsync the tmp file BEFORE the rename: rename-without-fsync can
-            // leave a zero-length/partial MANIFEST at the final path after
-            // power loss (ext4 delayed allocation). The startup self-heal
-            // (invalid head -> cold scan) catches that, but a full rescan is
-            // exactly the cost MANIFEST exists to avoid. One fsync per flush,
-            // and flushes are already off the hot write path (ticker-driven).
-            let wrote = (|| -> std::io::Result<()> {
-                use std::io::Write;
-                let mut f = fs::File::create(&tmp)?;
-                f.write_all(json.as_bytes())?;
-                f.sync_all()
-            })();
-            if wrote.is_ok() && fs::rename(&tmp, &path).is_ok() {
-                // Make the rename itself durable (directory entry). Unix-only;
-                // on Windows directory handles don't support this and the
-                // rename is already journaled by NTFS.
-                #[cfg(unix)]
-                if let Ok(dir) = fs::File::open(&self.root) {
-                    let _ = dir.sync_all();
-                }
-            }
+        let json = serde_json::to_string(&m)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = self.root.join("MANIFEST");
+        let tmp  = self.root.join("MANIFEST.tmp");
+        // fsync the tmp file BEFORE the rename: rename-without-fsync can
+        // leave a zero-length/partial MANIFEST at the final path after
+        // power loss (ext4 delayed allocation). The startup self-heal
+        // (invalid head -> cold scan) catches that, but a full rescan is
+        // exactly the cost MANIFEST exists to avoid. One fsync per flush,
+        // and flushes are already off the hot write path (ticker-driven).
+        let wrote = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = wrote {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, &path)?;
+        // Make the rename itself durable (directory entry). Unix-only;
+        // on Windows directory handles don't support this and the
+        // rename is already journaled by NTFS.
+        #[cfg(unix)]
+        if let Ok(dir) = fs::File::open(&self.root) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Atomically persist current seq+head to MANIFEST. No-op for in-memory databases.
+    /// Errors are logged; prefer [`try_flush_manifest`] when the outcome matters.
+    pub fn flush_manifest(&self) {
+        if let Err(e) = self.try_flush_manifest() {
+            eprintln!("nedb: MANIFEST flush failed: {}", e);
         }
     }
+
 
     /// Start a background thread that flushes both the id-index WAL and MANIFEST
     /// every `interval_ms` milliseconds.
@@ -860,7 +977,15 @@ impl Db {
             }
             s += 1;
         }
-        SinceBatch { nodes, from_seq: after_seq, to_seq, head_seq, has_more: hit_limit }
+        // `has_more` must never say "caught up" while the cursor is behind the
+        // log head. Before 2.8.6 this was `hit_limit` alone, so any page whose
+        // seqs could not be resolved (the whole range, on a warm boot: the warm
+        // path skips the scan, leaving seq_index empty) returned zero nodes with
+        // has_more=false — indistinguishable from genuinely up to date. A
+        // consumer following the documented drain loop stopped forever, one call
+        // in, on a database with every record unread.
+        let has_more = hit_limit || to_seq < head_seq;
+        SinceBatch { nodes, from_seq: after_seq, to_seq, head_seq, has_more }
     }
 
     /// Replication readiness — see `ScanStatus`. `scan_complete` gates safe
@@ -887,6 +1012,9 @@ impl Db {
             indexed_seq_min: min,
             indexed_seq_max: max,
             indexed_count:   count,
+            // The seq index covers the log when it resolves as many seqs as the
+            // log has entries. On a warm boot it is empty while the log is not.
+            seq_index_ready: count > 0 && (count as u64) >= next.saturating_sub(1),
         }
     }
 
@@ -961,10 +1089,8 @@ impl Drop for Db {
 /// Background cold-scan worker. Takes Arc<Db> — safe, Db is on the heap.
 fn cold_scan_background_arc(db: Arc<Db>) {
     use rayon::prelude::*;
-    use blake2::{Blake2b512, Digest};
 
     let objects        = &db.objects;
-    let head           = &db.head;
     let seq_atomic     = &db.seq;
     let sorted_indexes = &db.sorted_indexes;
     let seq_index      = &db.seq_index;
@@ -1038,24 +1164,24 @@ fn cold_scan_background_arc(db: Arc<Db>) {
         db.coll_tip_hash.insert(coll, (seq, hash));
     }
 
-    // Compute Merkle head from sorted hashes
-    let mut sorted_hashes = hashes;
-    sorted_hashes.sort();
-    let mut h = Blake2b512::new();
-    h.update(max_seq.to_le_bytes());
-    for hash_str in &sorted_hashes {
-        h.update(hash_str.as_bytes());
+    // Rebuild the id index when it has no collections at all — the lost-WAL
+    // case. Until 2.8.6 the cold scan restored seq_index, coll_tips, head and
+    // MANIFEST but NEVER the id index, so a database whose id-index WAL never
+    // reached disk came back with every object present and verifying while
+    // `list()` and `get()` returned nothing — and `nedb-cli repair`, whose whole
+    // job is this, reported success without fixing it.
+    //
+    // Gated on "no collections" so a normal cold boot of a healthy store (itcd:
+    // millions of objects) does not pay N extra index writes. A partially lost
+    // index is repaired by the explicit `rebuild_id_index()` path.
+    if db.id_index.collections().is_empty() && !nodes.is_empty() {
+        let restored = rebuild_id_index_from_nodes(&db, &nodes);
+        println!("  [nedbd] id index was empty — rebuilt {} entries from objects", restored);
     }
-    let new_head = hex::encode(&h.finalize()[..32]);
-    *head.write() = new_head;
 
-    // Tip = the highest-seq object we indexed. Persist its hash so tip() resolves
-    // O(1) on the next warm boot, before any scan repopulates the seq index.
-    let tip_hash = db.seq_index.iter()
-        .max_by_key(|kv| *kv.key())
-        .map(|kv| kv.value().clone())
-        .unwrap_or_default();
-    *db.tip_hash.write() = (max_seq, tip_hash);
+    // Merkle head + tip, through the one shared implementation so the cold scan
+    // and the explicit repair path can never drift apart.
+    recompute_head_and_tip(&db, hashes, max_seq);
 
     // Write MANIFEST through the one canonical writer. The hand-rolled write
     // this replaces stored `seq: max_seq` (the last USED seq) — but the warm
@@ -1068,6 +1194,66 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     // Signal server: writes can now proceed
     ready_flag.store(true, Ordering::SeqCst);
     println!("  [nedbd] background scan complete — seq={} objects={} MANIFEST written", max_seq, total);
+}
+
+/// Recompute the Merkle head and the tip hash from the full object-hash set.
+///
+/// Shared by the cold scan and by `repair()` so the two can never disagree
+/// about what the head of a rebuilt database is. `hashes` must be every object
+/// hash in the store; `max_seq` the highest seq observed.
+fn recompute_head_and_tip(db: &Db, hashes: Vec<String>, max_seq: u64) {
+    use blake2::{Blake2b512, Digest};
+    let mut sorted_hashes = hashes;
+    sorted_hashes.sort();
+    let mut h = Blake2b512::new();
+    h.update(max_seq.to_le_bytes());
+    for hash_str in &sorted_hashes {
+        h.update(hash_str.as_bytes());
+    }
+    *db.head.write() = hex::encode(&h.finalize()[..32]);
+
+    // Tip = the highest-seq object indexed. Persisting its hash lets tip()
+    // resolve O(1) on the next warm boot, before any scan repopulates seq_index.
+    let tip_hash = db.seq_index.iter()
+        .max_by_key(|kv| *kv.key())
+        .map(|kv| kv.value().clone())
+        .unwrap_or_default();
+    *db.tip_hash.write() = (max_seq, tip_hash);
+}
+
+/// Reconstruct id-index entries from already-read nodes: for every (coll, id),
+/// the winner is the HIGHEST seq, which is exactly what `put()` would have left
+/// behind. Returns the number of entries written.
+///
+/// The id index is fully derivable from the object store because every object
+/// carries its own `coll`, `id` and `seq` — so a lost WAL is recoverable, and
+/// nothing here invents data.
+fn rebuild_id_index_from_nodes(db: &Db, nodes: &[Node]) -> usize {
+    let mut winner: std::collections::HashMap<(String, String), (u64, String)> =
+        std::collections::HashMap::new();
+    for node in nodes {
+        let key = (node.coll.clone(), node.id.clone());
+        winner
+            .entry(key)
+            .and_modify(|cur| {
+                if node.seq > cur.0 {
+                    *cur = (node.seq, node.hash.clone());
+                }
+            })
+            .or_insert((node.seq, node.hash.clone()));
+    }
+    let mut written = 0usize;
+    for ((coll, id), (_seq, hash)) in &winner {
+        if db.id_index.set(coll, id, hash).is_ok() {
+            written += 1;
+        }
+    }
+    // Persist immediately: a rebuild that only lands in the WAL would be lost
+    // again by the very crash class this recovers from.
+    if let Err(e) = db.id_index.try_flush_write_buf() {
+        eprintln!("nedb: id-index rebuild flush failed: {}", e);
+    }
+    written
 }
 
 fn now() -> f64 {
@@ -1303,6 +1489,116 @@ mod tests_v2 {
         let nb = db.neighbors("driver:d1", "handles");
         assert_eq!(nb.len(), 1);
         assert_eq!(nb[0].id, "t1");
+    }
+
+    /// A lost id-index WAL must be recoverable: the objects carry coll/id/seq,
+    /// so `repair()` can reconstruct every row, and the repaired database must
+    /// reopen WARM with a valid head.
+    ///
+    /// Regression for 2.8.5, where the cold scan rebuilt seq_index, coll_tips,
+    /// head and MANIFEST but never the id index — so a database in this state
+    /// returned 0 rows from `list()` while `verify()` reported every object
+    /// healthy, and `nedb-cli repair` printed success without fixing anything.
+    #[test]
+    fn repair_rebuilds_id_index_after_lost_wal() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            for i in 0..25 {
+                db.put("rows", &format!("r{}", i), serde_json::json!({"i": i}), vec![], None, None)
+                    .unwrap();
+            }
+            db.put("rows", "r0", serde_json::json!({"i": 0, "v": 2}), vec![], None, None).unwrap();
+            db.try_flush_all().unwrap();
+        }
+
+        // Simulate the lost WAL: objects survive, the id index does not.
+        std::fs::remove_dir_all(dir.path().join("indexes")).unwrap();
+
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            assert_eq!(db.list("rows").len(), 0, "precondition: rows unreachable");
+            let (ok, bad) = db.verify();
+            assert!(ok > 0 && bad.is_empty(), "objects must still be intact and verifying");
+
+            let written = db.repair().unwrap();
+            assert_eq!(written, 25, "one entry per distinct (coll, id)");
+            assert_eq!(db.list("rows").len(), 25, "every row must come back");
+
+            // The winner for a re-put id is the HIGHEST seq, matching put().
+            let r0 = db.get("rows", "r0").expect("r0 present");
+            assert_eq!(r0.data.get("v").and_then(|v| v.as_i64()), Some(2),
+                "repair must restore the latest version, not an older one");
+        }
+
+        // A repaired database must reopen warm with a real head.
+        let db3 = Db::open(dir.path(), None).unwrap();
+        assert_eq!(db3.list("rows").len(), 25);
+        assert!(!db3.head().is_empty(), "repair must leave a valid MANIFEST head");
+        assert!(db3.tip_collection("rows").is_some(), "tip_collection must resolve after repair");
+    }
+
+    /// `since()` must never report "caught up" while the cursor is behind head.
+    ///
+    /// Regression for 2.8.5: on a warm boot the seq index is empty by design
+    /// (the warm path skips the scan), so every seq lookup missed and `since()`
+    /// returned zero nodes with `has_more = false` — identical to genuinely up
+    /// to date. A consumer following the documented drain loop stopped one call
+    /// in, on a database with every record unread.
+    #[test]
+    fn since_never_reports_caught_up_while_behind_head() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            for i in 0..10 {
+                db.put("rows", &format!("r{}", i), serde_json::json!({"i": i}), vec![], None, None)
+                    .unwrap();
+            }
+            db.try_flush_all().unwrap();
+        }
+
+        // Warm reopen: startup is "complete" in O(1) because the scan is skipped.
+        let db2 = Db::open(dir.path(), None).unwrap();
+        let st = db2.scan_status();
+        assert!(st.tip_seq > 0, "log has entries");
+        assert!(
+            !st.seq_index_ready,
+            "warm boot leaves the seq index cold — that is the honest signal"
+        );
+
+        let batch = db2.since(0, 100);
+        assert!(
+            batch.to_seq < batch.head_seq,
+            "cursor is behind the log head in this state"
+        );
+        assert!(
+            batch.has_more,
+            "has_more must be true while the cursor is behind head — otherwise the \
+             consumer reads 'caught up' and stops with every record unread"
+        );
+
+        // After a repair the index resolves and the drain actually completes.
+        db2.repair().unwrap();
+        assert!(db2.scan_status().seq_index_ready);
+        let drained = db2.since(0, 100);
+        assert!(!drained.has_more, "genuinely caught up reports has_more=false");
+
+        // KNOWN SHARP EDGE, pinned here deliberately: the cursor is EXCLUSIVE
+        // and seqs start at 0, so `since(0, _)` returns (0, head] and the very
+        // first write in a database (seq 0) is not reachable through any cursor
+        // value. 10 writes therefore drain as 9 records. Changing the cursor
+        // convention would break existing replication consumers, so this is
+        // documented rather than silently altered — but a replica seeded from
+        // since() alone starts one record short.
+        assert_eq!(
+            drained.nodes.len(),
+            9,
+            "since(0) is exclusive of seq 0 — see the sharp edge noted above"
+        );
+        assert!(
+            drained.nodes.iter().all(|n| n.seq >= 1),
+            "seq 0 is unreachable via since()"
+        );
     }
 
     #[test]

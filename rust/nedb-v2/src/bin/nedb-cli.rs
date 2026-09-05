@@ -93,6 +93,7 @@ fn cmd_status(rest: &[String]) -> i32 {
         "head": db.head(),
         "seq": db.seq.load(Ordering::SeqCst),
         "scan_complete": s.scan_complete,
+        "seq_index_ready": s.seq_index_ready,
         "tip_seq": s.tip_seq,
         "indexed_seq_min": s.indexed_seq_min,
         "indexed_seq_max": s.indexed_seq_max,
@@ -167,10 +168,20 @@ fn cmd_repair(rest: &[String]) -> i32 {
         waited += 50;
         if waited > 120_000 { eprintln!("nedb-cli: repair scan still running after 120s — aborting wait"); break; }
     }
+    // start_cold_scan is a deliberate no-op on a warm store, so it cannot fix a
+    // database that has a valid MANIFEST and a damaged id index — exactly the
+    // state a lost WAL leaves behind. Force the rebuild.
+    let rebuilt = match db.repair() {
+        Ok(n) => n,
+        Err(e) => { eprintln!("nedb-cli: repair failed: {e}"); return 1; }
+    };
     let (checked, tampered) = db.verify();
-    db.flush_all();
+    if let Err(e) = db.try_flush_all() {
+        eprintln!("nedb-cli: repair could not be persisted: {e}");
+        return 1;
+    }
     if tampered.is_empty() {
-        println!("repaired: index rebuilt, {checked} node(s) verified, flushed");
+        println!("repaired: {rebuilt} id-index entr(ies) rebuilt, {checked} node(s) verified, flushed");
         0
     } else {
         eprintln!("repaired index + flushed, but {} of {} node(s) FAILED verify:", tampered.len(), checked);

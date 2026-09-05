@@ -182,45 +182,112 @@ impl IdIndex {
 
     /// Flush the WAL write buffer to disk in parallel. Called by the background ticker.
     /// No-op for in-memory databases. Safe to call concurrently with writes.
-    pub fn flush_write_buf(&self) {
-        if self.mem.is_some() || self.write_buf.is_empty() { return; }
+    /// Flush the in-memory WAL to disk, reporting I/O failure to the caller.
+    /// Every entry is attempted; the first error is returned after the pass.
+    ///
+    /// DURABILITY INVARIANT: an entry is dropped from `write_buf` ONLY when its
+    /// disk write actually succeeded. A failed write (ENOSPC, EIO, EROFS) leaves
+    /// the entry buffered so the next tick retries it.
+    ///
+    /// Before 2.8.6 this cleared the buffer unconditionally, which silently and
+    /// permanently discarded acknowledged writes whenever a flush hit a full
+    /// disk: `put()` had already returned `Ok` and the content-addressed object
+    /// was durable (so `verify()` still counted it), but no id-index entry ever
+    /// reached disk — so the row was simply absent on reopen, with no error
+    /// anywhere. Reproduced on a full 22 MiB filesystem: 30 rows acknowledged,
+    /// `verify()` reported 30 healthy objects, `list()` returned 0.
+    pub fn try_flush_write_buf(&self) -> std::io::Result<()> {
+        if self.mem.is_some() || self.write_buf.is_empty() { return Ok(()); }
         use rayon::prelude::*;
         // Drain all pending entries and write them in parallel
         let entries: Vec<((String, String), Option<String>)> = self.write_buf
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
-        entries.par_iter().for_each(|((coll, id), hash_opt)| {
-            match hash_opt {
-                Some(hash) => {
-                    // Write/update: tmp → rename
-                    let path = self.path(coll, id);
-                    if let Some(parent) = path.parent() {
-                        let _ = fs::create_dir_all(parent);
+        let results: Vec<std::io::Result<()>> = entries.par_iter()
+            .map(|((coll, id), hash_opt)| -> std::io::Result<()> {
+                match hash_opt {
+                    Some(hash) => {
+                        // Write/update: tmp → rename
+                        let path = self.path(coll, id);
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        let tmp = path.with_extension("tmp");
+                        if let Err(e) = fs::write(&tmp, hash) {
+                            // A partial/empty tmp must not be left behind on a
+                            // full disk — it consumes the very space needed to
+                            // retry, and it is not a valid index leaf.
+                            let _ = fs::remove_file(&tmp);
+                            return Err(e);
+                        }
+                        if let Err(e) = fs::rename(&tmp, &path) {
+                            let _ = fs::remove_file(&tmp);
+                            return Err(e);
+                        }
+                        Ok(())
                     }
-                    let tmp = path.with_extension("tmp");
-                    if fs::write(&tmp, hash).is_ok() {
-                        let _ = fs::rename(&tmp, &path);
+                    None => {
+                        // Tombstone: remove the file (encoded leaf + legacy raw if distinct).
+                        // Already-absent is success — the desired end state holds.
+                        let path = self.path(coll, id);
+                        match fs::remove_file(&path) {
+                            Ok(()) => {}
+                            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e),
+                        }
+                        let raw = self.raw_path(coll, id);
+                        if raw != path {
+                            match fs::remove_file(&raw) {
+                                Ok(()) => {}
+                                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Ok(())
                     }
                 }
-                None => {
-                    // Tombstone: remove the file (encoded leaf + legacy raw if distinct)
-                    let path = self.path(coll, id);
-                    let _ = fs::remove_file(&path);
-                    let raw = self.raw_path(coll, id);
-                    if raw != path { let _ = fs::remove_file(&raw); }
+            })
+            .collect();
+
+        // Clear flushed entries — but ONLY when the write SUCCEEDED, and only
+        // when the buffered value is still the exact value we flushed. An
+        // unconditional remove() here would delete a NEWER value written between
+        // the snapshot above and this point: that write would never reach disk
+        // (the file holds the stale hash we just wrote) and get() would serve the
+        // old version once the buffer check misses — a silent lost update.
+        // remove_if closes the race; a newer value simply stays buffered and
+        // flushes on the next tick.
+        let mut first_err: Option<std::io::Error> = None;
+        for ((key, flushed_val), result) in entries.iter().zip(results.iter()) {
+            match result {
+                Ok(()) => {
+                    self.write_buf.remove_if(key, |_, current| current == flushed_val);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(std::io::Error::new(
+                            e.kind(),
+                            format!("id-index leaf {}/{}: {}", key.0, key.1, e),
+                        ));
+                    }
                 }
             }
-        });
-        // Clear flushed entries — but ONLY when the buffered value is still the
-        // exact value we flushed. An unconditional remove() here would delete a
-        // NEWER value written between the snapshot above and this point: that
-        // write would never reach disk (the file holds the stale hash we just
-        // wrote) and get() would serve the old version once the buffer check
-        // misses — a silent lost update. remove_if closes the race; a newer
-        // value simply stays buffered and flushes on the next tick.
-        for (key, flushed_val) in &entries {
-            self.write_buf.remove_if(key, |_, current| current == flushed_val);
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Back-compat wrapper around [`try_flush_write_buf`]: flushes and logs.
+    /// Prefer the `try_` form — a swallowed flush error is a lost write.
+    pub fn flush_write_buf(&self) {
+        if let Err(e) = self.try_flush_write_buf() {
+            eprintln!(
+                "nedb: id-index flush failed ({}) — affected writes are RETAINED in the WAL and will be retried on the next flush",
+                e
+            );
         }
     }
 
@@ -492,6 +559,70 @@ impl SortedIndexes {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A failed flush must RETAIN the entry for retry, never discard it.
+    ///
+    /// Regression for the 2.8.5 silent-loss bug: `flush_write_buf` cleared every
+    /// snapshotted key regardless of whether its disk write succeeded, so a
+    /// flush that hit ENOSPC/EACCES permanently dropped acknowledged writes.
+    /// The fault is injected by planting a regular FILE where the collection
+    /// directory must go, so `create_dir_all` fails with NotADirectory. That is
+    /// deliberately independent of file permissions: containers frequently run
+    /// as root or hold `cap_dac_override`, where a chmod-0555 fixture is
+    /// silently writable and the test would pass without exercising anything.
+    #[test]
+    fn failed_flush_retains_entries_for_retry() {
+        let dir = tempdir().unwrap();
+        let idx = IdIndex::new(dir.path()).unwrap();
+
+        idx.set("rows", "a", "hash_a").unwrap();
+        idx.set("rows", "b", "hash_b").unwrap();
+
+        // Block the leaf path: `indexes/rows` is a file, so the index cannot
+        // create `indexes/rows/id/<shard>/` beneath it.
+        let blocker = dir.path().join("indexes").join("rows");
+        fs::write(&blocker, b"not a directory").unwrap();
+
+        let result = idx.try_flush_write_buf();
+        assert!(
+            result.is_err(),
+            "flush must report the I/O failure, got Ok — callers cannot detect lost writes"
+        );
+
+        // THE INVARIANT: the entries are still buffered, so a later flush retries.
+        assert_eq!(
+            idx.write_buf.len(),
+            2,
+            "failed flush discarded buffered writes — acknowledged data would be lost"
+        );
+
+        // Clear the fault and retry: the writes must now land.
+        fs::remove_file(&blocker).unwrap();
+        idx.try_flush_write_buf()
+            .expect("retry after the fault clears must succeed");
+        assert!(idx.write_buf.is_empty(), "successful flush must drain the WAL");
+
+        // Reopen from disk only — proves the retry actually persisted.
+        let idx2 = IdIndex::new(dir.path()).unwrap();
+        assert_eq!(idx2.get("rows", "a").as_deref(), Some("hash_a"));
+        assert_eq!(idx2.get("rows", "b").as_deref(), Some("hash_b"));
+    }
+
+    /// A successful flush still drains the buffer and reports Ok.
+    /// Guards the false-positive direction: the new error path must not make
+    /// healthy flushes look like failures.
+    #[test]
+    fn successful_flush_reports_ok_and_drains() {
+        let dir = tempdir().unwrap();
+        let idx = IdIndex::new(dir.path()).unwrap();
+        for i in 0..64 {
+            idx.set("rows", &format!("id{}", i), &format!("h{}", i)).unwrap();
+        }
+        idx.try_flush_write_buf().expect("healthy flush must be Ok");
+        assert!(idx.write_buf.is_empty());
+        let idx2 = IdIndex::new(dir.path()).unwrap();
+        assert_eq!(idx2.get("rows", "id63").as_deref(), Some("h63"));
+    }
 
     #[test]
     fn id_index_roundtrip() {
