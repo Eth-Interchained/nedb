@@ -10,8 +10,7 @@ She wraps her connection with NEDB in ONE LINE.
 Her existing Redis code still works 100%.
 New code gets time-travel, NQL, causal provenance.
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import os, sys, json
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 

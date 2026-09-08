@@ -15,8 +15,7 @@
 // Escape hatch: set NEDB_NO_EXIT_FLUSH=1 to leave signal handling entirely to
 // the host app (it can still call `db.flush()` itself).
 //
-// © INTERCHAINED LLC × Claude Opus 4.8
-
+// © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
 const native = require('./native.js');
 
 const Native = native.NedbCore;

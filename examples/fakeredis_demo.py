@@ -13,8 +13,7 @@ Demonstrates the three-step migration:
     2. Backfill  — import all existing Redis data into NEDB in one pass
     3. Shadow    — all future surface-1 writes auto-chain into NEDB
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import json
 import sys
 

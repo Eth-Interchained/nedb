@@ -8,8 +8,7 @@ Run on the production server against a running nedbd instance:
 This introspects the live database and writes the _studio/schema document
 that the Studio query console requires.
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import argparse, json, sys, urllib.request, urllib.error
 
 def req(url, method="GET", body=None, token=None):

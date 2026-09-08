@@ -10,8 +10,7 @@ Exercises the full feature:
   * verify() still passes after causal writes
   * backward compat: existing databases without provenance still verify
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 from __future__ import annotations
 import os, sys, json, tempfile, shutil
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))

@@ -19,8 +19,7 @@ The last question — "what did the system believe, at a specific past moment,
 about a specific past state of reality?" — is the gold standard for audit,
 compliance, and AI agent reasoning. No other embedded database has it.
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 from __future__ import annotations
 import os, sys, json, tempfile, shutil
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))

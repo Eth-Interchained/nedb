@@ -952,8 +952,7 @@ def main() -> None:
 
   a versioned, time-traveling, encrypted database
   ─────────────────────────────────────────────────
-  INTERCHAINED, LLC    ×    Claude Sonnet 4.6
-  interchained.org       hyperagent.com/refer/J2G6TCD7
+  INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)interchained.org       hyperagent.com/refer/J2G6TCD7
 """
     print(BANNER)
     level_label = {0: "errors-only", 1: "requests", 2: "deploy", 3: "verbose"}.get(_log_level, str(_log_level))

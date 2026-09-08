@@ -13,8 +13,7 @@ On startup NEDB replays the stream to rebuild its in-memory MVCC store.
 On every write a new entry is XADD'd. One Redis connection, zero impact on
 the user's existing keys.
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 from __future__ import annotations
 
 import json

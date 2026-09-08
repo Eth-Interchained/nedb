@@ -14,8 +14,7 @@ This script is the proof. Run it:
 
 No redis-cli. No redis-py. Just sockets and NEDB.
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 from __future__ import annotations
 
 import json

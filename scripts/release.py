@@ -38,7 +38,7 @@ Requires env GITHUB_TOKEN (repo + workflow scope). Honors https_proxy if set.
 Intended to be run through the `nedb-release` skill so the token is injected:
     RunWithCredentials("nedb-release", 'python3 scripts/release.py "v2.4.68" "v2.4.468"')
 
-(c) Interchained LLC x Claude
+(c) Interchained LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
 """
 import os, sys, re, json, time, subprocess, urllib.request, urllib.error
 
@@ -189,7 +189,7 @@ def release_fork(repo, distro, frm, to, vto):
     if changed == 0 and git(d, "status", "--porcelain").stdout.strip() == "":
         print("  already at %s -- no PR needed" % to); return
     commit_push_branch(d, repo, "release/%s" % vto,
-        "release: %s %s -- version align\n\nBump %s -> %s across npm/PyPI/crates manifests.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>" % (distro, to, frm, to))
+        "release: %s %s -- version align\n\nBump %s -> %s across npm/PyPI/crates manifests.\n\nCo-Authored-By: Vex (Interchained AI fleet) <vex@interchained.org>" % (distro, to, frm, to))
     open_and_merge_pr(repo, "release/%s" % vto, "release: %s %s (version align)" % (distro, to),
         "Bump to **%s** across npm/PyPI/crates manifests. Built centrally by nedb." % to)
 
@@ -215,7 +215,7 @@ def release_flagship(frm, to, vto):
         print("  flagship already at %s and submodules current -- no PR needed" % to); return
     print(scrub(git(d, "diff", "--stat", "HEAD").stdout))
     commit_push_branch(d, FLAGSHIP, "release/%s-flagship" % vto,
-        "release: NEDB %s -- flagship bump + submodule repoint\n\nFlagship to %s; submodules repointed to the %s fork masters so all three\nproducts ship aligned on %s.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>" % (to, to, to, vto))
+        "release: NEDB %s -- flagship bump + submodule repoint\n\nFlagship to %s; submodules repointed to the %s fork masters so all three\nproducts ship aligned on %s.\n\nCo-Authored-By: Vex (Interchained AI fleet) <vex@interchained.org>" % (to, to, to, vto))
     open_and_merge_pr(FLAGSHIP, "release/%s-flagship" % vto, "release: NEDB %s tri-distribution" % vto,
         "Flagship to **%s**; submodules repointed to the %s fork masters. Ships nedb-engine + crypto-database + aof-db aligned on **%s**." % (to, to, vto), method="merge")
 
@@ -225,7 +225,7 @@ def tag_flagship(vto, to):
         print("\n== tag %s already exists -- leaving it (CI not re-fired) ==" % vto); return
     s, ref = api("GET", "/repos/%s/git/ref/heads/master" % FLAGSHIP)
     sha = ref.get("object", {}).get("sha", "")
-    msg = "NEDB %s -- aligned tri-distribution: nedb-engine + crypto-database + aof-db at one version across npm/PyPI/crates + macOS wheels. (c) Interchained LLC x Claude" % to
+    msg = "NEDB %s -- aligned tri-distribution: nedb-engine + crypto-database + aof-db at one version across npm/PyPI/crates + macOS wheels. (c) Interchained LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)" % to
     s, to_obj = api("POST", "/repos/%s/git/tags" % FLAGSHIP, {"tag": vto, "message": msg, "object": sha, "type": "commit", "tagger": {"name": "Vex", "email": "vex@interchained.org"}})
     if s not in (200, 201): sys.exit("!! tag object failed HTTP %d %s" % (s, str(to_obj)[:160]))
     s, rf = api("POST", "/repos/%s/git/refs" % FLAGSHIP, {"ref": "refs/tags/%s" % vto, "sha": to_obj.get("sha", "")})

@@ -9,8 +9,7 @@ identically to in-process mode.
     pip install fakeredis
     python3 tests/test_wrap_redis_nedbd.py
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import os, sys, json, time, socket, tempfile, subprocess, threading
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 

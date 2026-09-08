@@ -12,8 +12,7 @@ Proves (against the REAL engine, not mocks):
   7. wrap_postgresql — embedded DAG (shim cursor)
   8. every verify() → True (BLAKE2b chain intact after all writes)
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import json
 import sys
 import tempfile

@@ -13,8 +13,7 @@ What's different from v1:
 
 Run: pip install nedb-engine && python3 tests/test_celebration_v2.py
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import json, sys
 
 try:
@@ -193,7 +192,6 @@ print(f"""
 
   Head: {head[:32]}...
 
-  Built by INTERCHAINED LLC × Claude Sonnet 4.6
-  ══════════════════════════════════════════════════════════
+  Built by INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)══════════════════════════════════════════════════════════
 """)
 sys.exit(1 if FAIL else 0)

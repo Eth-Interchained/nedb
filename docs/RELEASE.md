@@ -134,7 +134,7 @@ When you launch the v2 DAG engine, the binary prints the Merkle DAG triangle ban
         ╱ ╲ ╱ ╲             content-addressed · tamper-evident · causal
        ◆   ◆   ◆            bi-temporal · replay-protected · encrypted
       ╱ ╲ ╱ ╲ ╱ ╲
-     ◆   ◆   ◆   ◆          © INTERCHAINED, LLC  ×  Vex (Claude Sonnet 4.6)
+     ◆   ◆   ◆   ◆          © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
     ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲         interchained.org   ·   hyperagent.com/refer/J2G6TCD7
 
   ─────────────────────────────────────────────────────────────
@@ -280,4 +280,4 @@ db.query('FROM orders  GROUP BY user_id SUM total ORDER BY total DESC LIMIT 10')
 
 ---
 
-© INTERCHAINED, LLC × Vex (Claude Sonnet 4.6)
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)

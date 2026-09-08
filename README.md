@@ -303,58 +303,7 @@ Typed errors throughout: `NedbAuthError`, `NedbNotFound`, `NedbBadRequest`,
 
 ---
 
-## The wrap adapter family — provenance for the databases you already run
-
-**One line. Any stack.** Wrap your existing connection and gain tamper-evident, causally-provable, bi-temporal storage *alongside* your app — no migration, no rip-and-replace. NEDB never touches your namespace; shadow data lives only in the embedded DAG engine.
-
-| Language | Package | Redis | SQLite | MySQL | MongoDB | PostgreSQL |
-|---|---|:---:|:---:|:---:|:---:|:---:|
-| Python | `pip install nedb-engine` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Node.js | `npm install nedb-engine` → `require('nedb-engine/wrap')` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Rust | `nedb-wrap` (crates.io) | ✅ (`redis` feature) | 📋 engine-direct | 📋 engine-direct | 📋 engine-direct | 📋 engine-direct |
-
-✅ adapter shipped · 📋 embed the DAG core directly (`Surface` trait, same contract)
-
-The same contract everywhere — register → backfill → shadow → full NEDB API:
-
-```python
-# Python — every write auto-chained
-import redis, json
-from nedb import wrap_redis
-
-r = wrap_redis(redis.Redis("localhost", 6379), db_name="rideshare",
-               dag_path="./nedb-data")          # embedded v2/v3 DAG — no server
-r.nedb.register("driver:*", "driver", value_parser=json.loads)
-r.nedb.backfill()
-r.nedb.shadow_writes = True
-r.set("driver:d1", json.dumps({"name": "Bob", "status": "active"}))
-r.nedb.query('FROM driver WHERE status = "active"')
-r.nedb.verify()   # → True — BLAKE2b chain intact
-```
-
-```js
-// Node.js — same shape, real Rust DAG core via napi-rs
-const { wrapRedis } = require('nedb-engine/wrap');
-const r = wrapRedis(redisClient, { dbName: 'rideshare', dagPath: './nedb-data' });
-r.nedb.register('driver:*', 'driver');
-r.nedb.shadowWrites = true;
-await r.set('driver:d1', JSON.stringify({ name: 'Bob' }));
-r.nedb.query('FROM driver');
-```
-
-```rust
-// Rust — embed the engine directly (nedb-wrap crate)
-use nedb_wrap::Surface;
-let s = Surface::in_memory();               // or Surface::open(path)?
-s.register("driver:*", "driver");
-s.shadow_writes.store(true, std::sync::atomic::Ordering::Relaxed);
-s.shadow("driver:d1", serde_json::json!({"name": "Bob"}), true)?;
-assert!(s.verify());
-```
-
-Engine selection (all languages): `nedbd` HTTP server if you point at one (v1 AOF, `--dag` v2, `--dag-v3` v3) → **embedded DAG** if the native wheel is installed → v1 in-process fallback. Pass `dag_path=` for a durable store, `dag_tmk=` for AES-256-GCM encryption.
-
-## Redis layer-2 — wrap_redis() in depth
+## Redis layer-2 — wrap_redis()
 
 Already running on Redis? Wrap your connection in one line and gain NEDB features *alongside* your existing Redis app — no migration required.
 
@@ -964,7 +913,8 @@ Requires `GITHUB_TOKEN` (`repo` + `workflow` scope) in the environment. It never
 ## Authors
 
 Built by **[Mark Allen Evans Jr.](https://interchained.org)** (INTERCHAINED, LLC)
-with **Claude Sonnet 4.6** on [Hyperagent](https://hyperagent.com/refer/J2G6TCD7).
+with the **Interchained AI fleet** on [Hyperagent](https://hyperagent.com/refer/J2G6TCD7) —
+Vex (GLM · Claude Sonnet · Opus · Fable · GPT-6 Astra/Sol), across hundreds of sessions.
 
 > *"Take one idea, turn it into an LP, then an app, then a system, then a platform, then infrastructure that is irreplaceable."*
 

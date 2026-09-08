@@ -27,8 +27,7 @@ Run modes:
     nedbd --data ./will-data --dag &
     NEDB_URL=http://localhost:7070 python3 tests/test_the_will.py
 
-© INTERCHAINED LLC × Claude Sonnet 4.6
-"""
+© INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)"""
 import json, os, sys, time, urllib.error, urllib.request
 from pathlib import Path
 
@@ -415,8 +414,7 @@ print(f"""
    Nothing can be changed without breaking the chain.
    That is what NEDB is."
 
-      — INTERCHAINED LLC × Claude Sonnet 4.6
-  ══════════════════════════════════════════════════════════
+      — INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)══════════════════════════════════════════════════════════
 """)
 
 if _MODE == "native":

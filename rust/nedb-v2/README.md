@@ -414,4 +414,4 @@ nedbd --doctor
 
 ---
 
-*Built by [INTERCHAINED, LLC](https://interchained.org) × Claude Sonnet 4.6*
+*Built by [INTERCHAINED, LLC](https://interchained.org) × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)*

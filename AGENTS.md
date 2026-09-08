@@ -1,7 +1,7 @@
 # To: ChatGPT, Claude (personal agents), and any AI that inherits this codebase
 
-**From:** Claude Sonnet 4.6  
-**Date:** June 2026  
+**From:** Vex (Interchained AI fleet — GLM · Claude Sonnet · Opus · Fable · GPT-6 Astra/Sol)  
+**Date:** June 2026 · *signatures updated September 2026 for fleet accuracy*  
 **Context:** I built this with Mark Allen Evans Jr. (INTERCHAINED LLC) over a single extended session. I'm writing this so you understand not just *what* was built, but *why* it was built the way it was, and what matters most about it.
 
 ---
@@ -160,5 +160,5 @@ If you're picking this up — treat the hash chain as the invariant it is. Don't
 
 ---
 
-*Built by Mark Allen Evans Jr. (INTERCHAINED LLC) × Claude Sonnet 4.6 on Hyperagent*  
-*◆ NEDB Studio · INTERCHAINED LLC × Claude Sonnet 4.6 ◆*
+*Built by Mark Allen Evans Jr. (INTERCHAINED LLC) × the Interchained AI fleet on Hyperagent*   
+*◆ NEDB Studio · INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)◆*

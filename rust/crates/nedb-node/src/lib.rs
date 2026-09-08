@@ -5,9 +5,7 @@
 //! API surface mirrors the Python PyO3 binding (nedb-py) so the same engine
 //! contract holds across both runtimes.
 //!
-//! © INTERCHAINED LLC × Claude Sonnet 4.6
-
-#![deny(clippy::all)]
+//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)#![deny(clippy::all)]
 
 use std::sync::Arc;
 use napi::bindgen_prelude::*;
