@@ -91,6 +91,34 @@ class WrapSurface:
         self._backfilled: bool = False
         self._db = engine
         self._persist = persist or _MemoryPersist()
+        # ── shadow observability ────────────────────────────────────────────
+        # A shadow failure must never break the host database call, but
+        # "don't raise into the host's stack" and "don't tell anyone" are
+        # different requirements. For a PROVENANCE layer, silently dropping a
+        # record is the worst available outcome: the chain gets a hole and
+        # verify() still returns True, because it verifies what got in, not
+        # that everything that should have got in did.
+        #
+        # Every swallowed failure is now counted and, optionally, reported.
+        self.shadow_errors: int = 0
+        self.last_shadow_error: Optional[str] = None
+        self.on_shadow_error: Optional[Callable[[BaseException], None]] = None
+        # strict=True re-raises instead of swallowing — for tests and for
+        # deployments that would rather fail loudly than lose provenance.
+        self.strict_shadow: bool = False
+
+    def note_shadow_error(self, exc: BaseException) -> None:
+        """Record a swallowed shadow failure. Never raises unless strict."""
+        self.shadow_errors += 1
+        self.last_shadow_error = f"{type(exc).__name__}: {exc}"
+        cb = self.on_shadow_error
+        if cb is not None:
+            try:
+                cb(exc)
+            except Exception:
+                pass  # a broken callback must not compound the original failure
+        if self.strict_shadow:
+            raise exc
 
     # ── host hooks (override in the host adapter) ────────────────────────────
 
@@ -139,7 +167,11 @@ class WrapSurface:
                 try:
                     self._db.put(m.collection, doc_id, doc, client="__backfill__")
                     total += 1
-                except Exception:
+                except Exception as e:
+                    # Counted, not silent: backfill() returns the number of rows
+                    # imported, and a caller comparing that to the host's row
+                    # count deserves to know the difference was errors.
+                    self.note_shadow_error(e)
                     continue
         self._backfilled = True
         return total
@@ -165,8 +197,8 @@ class WrapSurface:
             self._db.put(m.collection, m.extract_id(key), doc,
                          client="__shadow__")
             self._persist_after()
-        except Exception:
-            pass
+        except Exception as e:
+            self.note_shadow_error(e)
 
     def _persist_after(self) -> None:
         # DAG + nedbd persist themselves; v1 AOF needs the last op appended

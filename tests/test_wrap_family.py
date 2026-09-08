@@ -184,8 +184,19 @@ docs = ws.nedb.query('FROM driver WHERE status = "active"')
 check("backfilled rows NQL-queryable", len(docs) == 2, f"{len(docs)} docs")
 
 ws.nedb.shadow_writes = True
-cur = sq.execute("INSERT INTO drivers (name, status) VALUES ('Zoe', 'active')")
-sq.commit()
+# Write through the WRAPPER. This used to call sq.execute() -- the RAW
+# connection -- which bypasses the shadow seam entirely, and then asserted
+# only verify(). verify() passes on an empty chain (it proves what got in is
+# intact, not that everything that should have got in did), so three real
+# defects in automatic SQLite shadowing sat green here. Assert the row is
+# actually RETRIEVABLE, in the registered collection.
+ws.execute("INSERT INTO drivers (name, status) VALUES ('Zoe', 'active')")
+ws.commit()
+_zoe = ws.nedb.query('FROM driver WHERE name = "Zoe"')
+check("sqlite shadow is retrievable in the registered collection",
+      len(_zoe) == 1, f"{len(_zoe)} docs")
+check("no shadow failure was swallowed", ws.nedb.shadow_errors == 0,
+      str(ws.nedb.last_shadow_error))
 check("DAG verify() after sqlite writes", ws.nedb.verify() is True)
 
 # ═══ 4. wrap_mysql — embedded DAG (DB-API shim) ════════════════════════════
