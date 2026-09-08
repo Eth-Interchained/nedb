@@ -215,7 +215,7 @@ chk("algo='nearest_driver_v1' confirmed — rating filter was disabled",
 banner("SCENE 6 — Tamper-evident proof: the chain is clean")
 # ─────────────────────────────────────────────────────────────────────────────
 verified = r.nedb.verify()
-head     = r.nedb.head()
+head     = r.nedb.head
 seq_now  = r.nedb.seq
 
 chk("verify() — every op in the chain is intact", verified)
@@ -226,11 +226,11 @@ print(f"  Total ops sealed: {seq_now + 1}")
 # ─────────────────────────────────────────────────────────────────────────────
 banner("SCENE 7 — Persist + restart (Redis stream survives)")
 # ─────────────────────────────────────────────────────────────────────────────
-head_before = r.nedb.head()
+head_before = r.nedb.head
 seq_before  = r.nedb.seq
 
 r2 = wrap_redis(raw, db_name="rideflow")   # replay from Redis Stream
-chk("head survives restart",   r2.nedb.head() == head_before)
+chk("head survives restart",   r2.nedb.head == head_before)
 chk("seq survives restart",    r2.nedb.seq    == seq_before)
 chk("verify() after restart",  r2.nedb.verify())
 chk("dispatch decision intact after restart",

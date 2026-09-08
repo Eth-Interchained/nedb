@@ -302,6 +302,10 @@ class NEDBSurface:
         self._mappings: List[CollectionMapping] = []
         self.shadow_writes: bool = False
         self._backfilled: bool = False
+        self.shadow_errors: int = 0
+        self.last_shadow_error: Optional[str] = None
+        self.on_shadow_error = None
+        self.strict_shadow: bool = False
         # Set BEFORE any branching. _reload() reads this, and the
         # DagBackend-ImportError fallback below reaches _reload() without
         # passing through a branch that assigns it — which made wrap_redis()
@@ -586,8 +590,9 @@ class NEDBSurface:
                              evidence="redis_write",
                              confidence=1.0)
                 self._persist_last_op()
-            except Exception:
-                pass  # shadow failures must never break the Redis surface call
+            except Exception as e:
+                # Never breaks the Redis call, never invisible either.
+                self.note_shadow_error(e)
         else:
             # No mapping — raw tamper-evidence chain entry only
             # (not NQL-queryable, but proves the write happened)
@@ -602,8 +607,21 @@ class NEDBSurface:
                              client="__shadow__",
                              evidence="redis_write")
                 self._persist_last_op()
+            except Exception as e:
+                self.note_shadow_error(e)
+
+    def note_shadow_error(self, exc: BaseException) -> None:
+        """Record a swallowed shadow failure. Mirrors WrapSurface."""
+        self.shadow_errors = getattr(self, "shadow_errors", 0) + 1
+        self.last_shadow_error = f"{type(exc).__name__}: {exc}"
+        cb = getattr(self, "on_shadow_error", None)
+        if cb is not None:
+            try:
+                cb(exc)
             except Exception:
                 pass
+        if getattr(self, "strict_shadow", False):
+            raise exc
 
     # ── Full NEDB API ─────────────────────────────────────────────────────────
 
@@ -653,6 +671,11 @@ class NEDBSurface:
     def verify(self) -> bool:
         return self._db.verify()
 
+    # NOTE: @property. Without it `wrap_redis(...).nedb.head` handed back a
+    # bound method instead of the Merkle head string -- while `.seq` three
+    # lines below, and `.head` on every other wrapper, returned the value.
+    # Silent, because a bound method is truthy: `if surface.head:` passed.
+    @property
     def head(self) -> str:
         return self._db.head
 

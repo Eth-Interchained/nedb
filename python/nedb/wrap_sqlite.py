@@ -158,56 +158,157 @@ class WrappedSqlite:
         return _passthrough
 
     def _execute(self, sql: str, params: tuple = ()):
-        """execute() with post-commit shadowing of registered-table writes."""
+        """execute() with post-write shadowing of registered-table writes.
+
+        UPDATE and DELETE need the affected rowids captured BEFORE the
+        statement runs -- see _affected_rowids for why cursor.lastrowid
+        cannot be used for them.
+        """
         conn = object.__getattribute__(self, "_conn")
         nedb = object.__getattribute__(self, "nedb")
+
+        head = sql.lstrip().upper()
+        shadowing = head.startswith(self._WRITE_PREFIXES) and nedb.shadow_writes
+
+        pre_rowids = None
+        if shadowing and not head.startswith("INSERT"):
+            try:
+                pre_rowids = self._affected_rowids(nedb, sql, params)
+            except Exception as e:
+                nedb.note_shadow_error(e)
+                pre_rowids = None
+
         cur = conn.execute(sql, params)
 
         try:
-            head = sql.lstrip().upper()
-            if head.startswith(self._WRITE_PREFIXES) and nedb.shadow_writes:
-                self._shadow_sql(nedb, sql, cur)
-        except Exception:
-            pass  # shadow failures must never break the host call
+            if shadowing:
+                self._shadow_sql(nedb, sql, cur, pre_rowids)
+        except Exception as e:
+            # Must never break the host call — but must never be invisible
+            # either. Counted on nedb.shadow_errors, reported through
+            # nedb.on_shadow_error, and re-raised when strict_shadow is set.
+            nedb.note_shadow_error(e)
         return cur
 
-    def _shadow_sql(self, nedb: SqliteSurface, sql: str, cur: sqlite3.Cursor) -> None:
-        conn = object.__getattribute__(self, "_conn")
-        table = None
-        for m in nedb._mappings:
-            t = m.pattern
-            if t.lower() in sql.lower():
-                table = t
-                break
-        if table is None:
-            return
+    def _affected_rowids(self, nedb, sql: str, params: tuple):
+        """Rowids an UPDATE/DELETE is about to touch, resolved before it runs.
 
-        op = ("DELETE" if sql.upper().startswith("DELETE")
-              else "UPDATE" if sql.upper().startswith("UPDATE")
+        `cursor.lastrowid` is ONLY meaningful after an INSERT. After an UPDATE
+        or DELETE it still holds the id of the last row *inserted* on that
+        connection, so shadowing off it recorded a completely unrelated row --
+        a FALSE provenance record, which is worse than none at all.
+
+        The affected set is therefore resolved up front with
+        `SELECT rowid FROM <table> WHERE <same predicate>`.
+
+        Placeholders: for UPDATE, some `?` may live in the SET clause, so the
+        leading params belonging to SET are skipped and only the remainder is
+        bound to the WHERE. Anything that cannot be parsed with confidence
+        raises, and the caller records a COUNTED shadow error rather than
+        inventing a row.
+        """
+        import re
+        mapping = self._mapping_for_sql(nedb, sql)
+        if mapping is None:
+            return None
+        conn = object.__getattribute__(self, "_conn")
+        table = mapping.pattern
+
+        m = re.search(r"\bWHERE\b(.*)$", sql, re.IGNORECASE | re.DOTALL)
+        if not m:
+            # No predicate: an unqualified UPDATE/DELETE touches every row.
+            return [r[0] for r in conn.execute(f'SELECT rowid FROM "{table}"')]
+
+        where = m.group(1)
+        where_params = params or ()
+        if sql.lstrip().upper().startswith("UPDATE") and where_params:
+            set_part = sql[:m.start()]
+            n_set = set_part.count("?")
+            if n_set > len(where_params):
+                raise ValueError(
+                    "cannot attribute placeholders between SET and WHERE; "
+                    "refusing to shadow a row that may be the wrong one")
+            where_params = tuple(where_params)[n_set:]
+
+        rows = conn.execute(
+            f'SELECT rowid FROM "{table}" WHERE {where}', where_params)
+        return [r[0] for r in rows]
+
+    @staticmethod
+    def _mapping_for_sql(nedb, sql: str):
+        for m in nedb._mappings:
+            if m.pattern.lower() in sql.lower():
+                return m
+        return None
+
+    def _shadow_sql(self, nedb: SqliteSurface, sql: str, cur: sqlite3.Cursor,
+                    pre_rowids=None) -> None:
+        """Mirror a write into the SAME collection backfill() writes to.
+
+        Two defects lived here, and the second hid the first.
+
+        1. ``cols = [d[0] for d in cur.description] or [...]`` -- sqlite3 sets
+           ``cursor.description`` to **None** after an INSERT (it is only
+           populated for SELECT). The list comprehension therefore raised
+           ``TypeError`` before ``or`` could ever evaluate its fallback, and
+           ``_execute`` swallowed it. Every automatic INSERT shadow silently
+           recorded nothing while ``verify()`` kept returning True.
+
+        2. Rows were written to ``__sql_shadow__`` while ``backfill()`` writes
+           to the registered collection. Even with (1) fixed, a user who ran
+           ``register("rides", collection="ride")`` and queried ``FROM ride``
+           got the historical rows and none of the live ones -- a partial
+           answer, silently.
+
+        Both are fixed: the description is guarded, and every op lands in
+        ``mapping.collection`` under the same id ``_host_scan`` yields
+        (``str(rowid)``), so an UPDATE supersedes the backfilled document
+        instead of accumulating beside it.
+        """
+        conn = object.__getattribute__(self, "_conn")
+        mapping = self._mapping_for_sql(nedb, sql)
+        if mapping is None:
+            return
+        table = mapping.pattern
+
+        up = sql.lstrip().upper()
+        op = ("DELETE" if up.startswith("DELETE")
+              else "UPDATE" if up.startswith("UPDATE")
               else "INSERT")
-        rowid = cur.lastrowid
+
+        if op == "INSERT":
+            rowids = [cur.lastrowid]
+        else:
+            if pre_rowids is None:
+                raise ValueError(
+                    f"{op} on {table!r}: affected rows could not be resolved, "
+                    "nothing shadowed (see nedb.last_shadow_error)")
+            rowids = pre_rowids
 
         if op == "DELETE":
-            # Tombstone: put a deletion marker (NEDB delete would remove history;
-            # a marker keeps the causal chain and is NQL-queryable)
-            nedb.put("__sql_shadow__", f"{table}:del:{rowid}",
-                     {"table": table, "rowid": str(rowid), "_op": "DELETE"},
-                     client="__shadow__")
+            # Tombstone rather than a NEDB delete: deleting would drop history,
+            # and surviving history is the entire point. Written into the mapped
+            # collection so `FROM ride` shows the row as deleted rather than
+            # appearing to still exist.
+            for rid in rowids:
+                nedb.put(mapping.collection, str(rid),
+                         {"_table": table, "_op": "DELETE", "_deleted": True,
+                          "_rowid": str(rid)},
+                         client="__shadow__")
             return
 
-        # Read the row back post-write (works inside the open transaction)
-        try:
+        # Read each affected row back post-write (inside the open transaction).
+        desc = conn.execute(f'SELECT * FROM "{table}" LIMIT 0').description
+        cols = [d[0] for d in desc]
+        for rid in rowids:
             row = conn.execute(
-                f'SELECT * FROM "{table}" WHERE rowid = ?', (rowid,)).fetchone()
+                f'SELECT * FROM "{table}" WHERE rowid = ?', (rid,)).fetchone()
             if row is None:
-                return
-            cols = [d[0] for d in cur.description] or \
-                [d[0] for d in conn.execute(f'SELECT * FROM "{table}" LIMIT 0').description]
+                continue
             doc = dict(zip(cols, row))
-        except sqlite3.Error:
-            return
-        nedb.put("__sql_shadow__", f"{table}:{rowid}",
-                 {**doc, "_table": table, "_op": op}, client="__shadow__")
+            nedb.put(mapping.collection, str(rid),
+                     {**doc, "_table": table, "_op": op, "_source": "shadow"},
+                     client="__shadow__")
 
     def __repr__(self):
         conn = object.__getattribute__(self, "_conn")

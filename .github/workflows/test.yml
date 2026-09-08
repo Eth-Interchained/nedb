@@ -71,7 +71,7 @@ jobs:
           fail=0
           for t in test_nedb test_bitemporal test_causal test_concurrent \
                    test_crypto test_deploy test_proof test_v050 \
-                   test_wrap_redis test_adapters; do
+                   test_wrap_redis test_adapters test_wrap_sqlite_shadow; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then
               echo "PASS $t"

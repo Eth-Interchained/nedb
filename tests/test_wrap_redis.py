@@ -181,27 +181,44 @@ r7 = fresh()
 for i in range(10):
     r7.nedb.put("item", f"i{i}", {"v": i})
 check("verify() on 10 writes",    r7.nedb.verify())
-check("head() is 64-char hex",    len(r7.nedb.head()) == 64)
+# `.head` is a PROPERTY returning the Merkle head string, matching `.seq`
+# below and every other wrapper. It was missing its @property decorator, so
+# this line used to call the bound method it handed back -- the test had
+# codified the bug. A bound method is truthy, which is why nothing noticed.
+check("head is a 64-char hex string", len(r7.nedb.head) == 64)
+check("head is a str, not a bound method", isinstance(r7.nedb.head, str))
 check("seq == 9",                  r7.nedb.seq == 9)
 
 # ─────────────────────────────────────────────────────────────────────────────
 section("Redis persistence: stream survives restart")
 # ─────────────────────────────────────────────────────────────────────────────
 fake_r = fakeredis.FakeRedis()  # shared underlying store
-r8a = wrap_redis(fake_r, db_name="persist_test")
+# backend="aof" is EXPLICIT here, and the reason matters.
+#
+# This section tests the v1 AOF engine's Redis-Stream persistence: state is
+# replayed from the host Redis on reopen. Since backend="auto" was introduced
+# it resolves to the embedded DAG whenever a platform wheel is installed — and
+# an embedded DAG with no dag_path is IN-MEMORY, so nothing survives. The same
+# wrap_redis(conn) call therefore persists or does not persist depending only
+# on whether a native wheel happens to be present.
+#
+# Pinned to "aof" so this suite tests the engine it is actually about. The
+# auto-selection surprise is asserted separately, below.
+r8a = wrap_redis(fake_r, db_name="persist_test", backend="aof")
 r8a.nedb.put("users", "alice", {"name": "Alice", "status": "active"})
 r8a.nedb.put("users", "bob",   {"name": "Bob",   "status": "active"})
-head_before = r8a.nedb.head()
+head_before = r8a.nedb.head
 seq_before  = r8a.nedb.seq
 
 # Simulate "restart" — new WrappedRedis on the SAME fakeredis instance
-r8b = wrap_redis(fake_r, db_name="persist_test")  # replays from stream
-check("head survives restart",    r8b.nedb.head() == head_before)
+r8b = wrap_redis(fake_r, db_name="persist_test", backend="aof")  # replays from stream
+check("head survives restart",    r8b.nedb.head == head_before)
 check("seq survives restart",     r8b.nedb.seq == seq_before)
 check("data survives restart",    r8b.nedb.get("users", "alice")["name"] == "Alice")
 check("verify after restart",     r8b.nedb.verify())
 rows = r8b.nedb.query('FROM users')
 check("all rows survive restart", len(rows) == 2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 section("Mixed usage: Redis + NEDB on same connection")

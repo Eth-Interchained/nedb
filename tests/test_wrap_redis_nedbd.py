@@ -133,7 +133,7 @@ check("TRACE via nedbd",              len(trace) >= 1)
 section("nedbd mode: hash chain verify + seq/head")
 # ─────────────────────────────────────────────────────────────────────────────
 check("verify() via nedbd",           r.nedb.verify())
-check("head() is 64-char hex",        len(r.nedb.head()) == 64)
+check("head() is 64-char hex",        len(r.nedb.head) == 64)
 check("seq > 0",                      r.nedb.seq > 0)
 
 # ─────────────────────────────────────────────────────────────────────────────
