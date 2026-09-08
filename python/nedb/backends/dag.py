@@ -32,10 +32,17 @@ from typing import Any, Dict, List, Optional
 
 
 def has_dag_native() -> bool:
-    """True when the embedded Rust v2/v3 DAG core is importable."""
+    """True when the embedded Rust v2/v3 DAG core is actually LOADED.
+
+    This used to be `from .. import __has_native__; return True` — which tests
+    whether the NAME imports, never what it holds. `__has_native__` is always
+    defined (it is False on the universal pure-Python wheel), so this returned
+    True unconditionally and `backend="auto"` chose the DAG on machines that
+    had no compiled core at all.
+    """
     try:
-        from .. import __has_native__  # noqa: F401
-        return True
+        from .. import __has_native__
+        return bool(__has_native__)
     except Exception:
         return False
 

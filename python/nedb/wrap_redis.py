@@ -306,6 +306,9 @@ class NEDBSurface:
         self.last_shadow_error: Optional[str] = None
         self.on_shadow_error = None
         self.strict_shadow: bool = False
+        # True when the chain outlives the process. Introspectable rather than
+        # inferred: durability should never be something you have to guess.
+        self.durable: bool = True
         # Set BEFORE any branching. _reload() reads this, and the
         # DagBackend-ImportError fallback below reaches _reload() without
         # passing through a branch that assigns it — which made wrap_redis()
@@ -319,13 +322,26 @@ class NEDBSurface:
             self._nedbd_mode = True
             self._db      = NedBdProxy(nedbd_url, db_name, token=nedbd_token)  # type: ignore[assignment]
             self._backend = None
-        elif backend in ("dag", "auto"):
+        elif backend == "dag" or (backend == "auto" and dag_path is not None):
+            # NOTE the `dag_path is not None`. Previously `auto` alone chose the
+            # embedded DAG the moment a platform wheel existed -- and an embedded
+            # DAG with no dag_path is IN-MEMORY. So wrap_redis(conn), which
+            # persisted through Redis Streams on the v1 AOF engine, silently
+            # stopped persisting as soon as pip installed a native wheel: same
+            # call site, different durability, no warning, discovered during an
+            # audit rather than a deploy.
+            #
+            # `auto` must never pick an engine LESS durable than the call site
+            # already had. Ask for the DAG explicitly (backend="dag") or give it
+            # somewhere to live (dag_path=) and you get it; stay on defaults and
+            # you keep Redis-Stream persistence.
             # Embedded v2/v3 DAG (Rust native core). Falls back to v1 AOF
             # when the platform wheel is absent (universal wheel).
             try:
                 from .backends.dag import DagBackend
                 self._db = DagBackend(path=dag_path, tmk=dag_tmk)  # type: ignore[assignment]
                 self._nedbd_mode = False
+                self.durable = dag_path is not None
                 self._backend = None      # DAG persists itself; no Redis streams
             except ImportError:
                 if backend == "dag":

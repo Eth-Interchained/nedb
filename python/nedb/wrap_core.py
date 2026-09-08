@@ -64,14 +64,40 @@ def open_engine(
         return NedBdProxy(nedbd_url, db_name, token=nedbd_token), None
 
     if backend == "dag" or (backend == "auto" and has_dag_native()):
-        core = DagBackend(path=dag_path, tmk=dag_tmk)
-        return core, None
+        try:
+            return _open_dag(dag_path, dag_tmk), None
+        except ImportError:
+            if backend == "dag":
+                raise   # an explicit request must never silently downgrade
+            # auto: no compiled core after all — fall through to v1 AOF, the
+            # universal fallback. wrap_redis has always done this; open_engine
+            # did not, so wrap_sqlite / wrap_mysql / wrap_mongo /
+            # wrap_postgresql raised ImportError out of the constructor on
+            # every install without a platform wheel.
 
     if backend in ("aof", "auto"):
         return _NEDB(), None
 
     raise ValueError(f"unknown backend {backend!r} "
                      "(expected 'auto' | 'aof' | 'dag' | 'nedbd')")
+
+
+def _open_dag(dag_path, dag_tmk):
+    """Construct the embedded DAG backend, warning when it is not durable."""
+    if dag_path is None:
+        # An embedded DAG with no path is IN-MEMORY: the chain dies with the
+        # process. These adapters have no durable in-host fallback the way
+        # wrap_redis has Redis Streams, so the choice stands -- but silently
+        # handing someone a provenance log that evaporates is exactly the
+        # failure this engine exists to prevent. Say so, once.
+        import warnings
+        warnings.warn(
+            "NEDB: embedded DAG opened with no dag_path= — this chain is "
+            "IN-MEMORY and will not survive the process. Pass "
+            'dag_path="./audit" for a durable store, or nedbd_url= to use '
+            "a server.",
+            RuntimeWarning, stacklevel=4)
+    return DagBackend(path=dag_path, tmk=dag_tmk)
 
 
 # ── The shared surface ───────────────────────────────────────────────────────
@@ -103,6 +129,8 @@ class WrapSurface:
         self.shadow_errors: int = 0
         self.last_shadow_error: Optional[str] = None
         self.on_shadow_error: Optional[Callable[[BaseException], None]] = None
+        # True when the chain outlives the process — set by the adapter.
+        self.durable: bool = True
         # strict=True re-raises instead of swallowing — for tests and for
         # deployments that would rather fail loudly than lose provenance.
         self.strict_shadow: bool = False
