@@ -1,65 +1,21 @@
-Business Source License 1.1
+MIT License
 
-Licensor: Interchained LLC, VibeCode 101, and/or the applicable copyright holders of NEDB
+Copyright (c) 2026 Interchained LLC and VibeCode 101
 
-Licensed Work: NEDB, including all source code, documentation, examples, tests, build scripts, specifications, APIs, SDKs, packages, binaries, and derivative works distributed from or based on the NEDB repository.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-Copyright: Copyright (c) 2026 Interchained LLC, VibeCode 101, and contributors. All rights reserved.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-Change Date: Four years after the first publicly available distribution of each specific version of the Licensed Work under this License.
-
-Change License: GNU Affero General Public License v3.0 or later.
-
-Additional Use Grant:
-
-You may use the Licensed Work only for non-production purposes, including evaluation, development, testing, research, local experimentation, security review, benchmarking, and personal learning.
-
-No production use is granted automatically.
-
-For clarity, the following uses are not permitted unless you have prior written permission from the Licensor:
-
-1. Using the Licensed Work in production.
-2. Using the Licensed Work to store, process, serve, index, replicate, query, or manage production data.
-3. Offering the Licensed Work, or any derivative work, as a hosted, managed, embedded, bundled, white-labeled, commercial, paid, revenue-generating, or customer-facing product or service.
-4. Offering database-as-a-service, storage-as-a-service, cache-as-a-service, search-as-a-service, analytics-as-a-service, AI-memory-as-a-service, agent-memory-as-a-service, blockchain-indexing-as-a-service, or any substantially similar service using the Licensed Work.
-5. Using the Licensed Work to compete with NEDB, Interchained LLC, VibeCode 101, AiAssist Secure, or any affiliated product, service, infrastructure platform, database engine, AI runtime, agent platform, or hosted developer infrastructure.
-6. Embedding the Licensed Work into commercial software, SaaS products, internal business systems, enterprise systems, hosted infrastructure, blockchain infrastructure, AI-agent infrastructure, or customer deliverables.
-7. Removing, hiding, modifying, or misrepresenting this License, copyright notices, attribution notices, authorship notices, repository references, or licensing notices.
-8. Circumventing license checks, access controls, paid licensing requirements, commercial-use restrictions, attribution requirements, or technical protections included with the Licensed Work.
-9. Using the Licensed Work in a way that implies endorsement, partnership, sponsorship, certification, or approval by the Licensor without written permission.
-10. Reselling, relicensing, sublicensing, renting, leasing, or otherwise commercially exploiting the Licensed Work except as expressly authorized in writing.
-
-Additional production, commercial, hosted, enterprise, embedded, OEM, resale, white-label, managed-service, competitive, or otherwise restricted use grants are available only by separate written permission from the Licensor.
-
-Written permission must be obtained from at least one of the following authorized licensing contacts:
-
-[founders@vibecode-101.com](mailto:founders@vibecode-101.com)
-[dev@interchained.org](mailto:dev@interchained.org)
-
-Permission is valid only if it is expressly granted in writing by an authorized representative of the Licensor and specifically identifies the permitted use, scope, duration, parties, and any applicable commercial terms.
-
-A general email conversation, informal message, pull request, issue comment, social media message, verbal discussion, repository access, package download, or contribution acceptance does not create a production, commercial, hosted, enterprise, resale, or competitive use license.
-
-Terms:
-
-The Licensor hereby grants you the right to copy, modify, create derivative works, redistribute, and make non-production use of the Licensed Work. The Licensor may make an Additional Use Grant, above, permitting limited production use.
-
-Effective on the Change Date, or the fourth anniversary of the first publicly available distribution of a specific version of the Licensed Work under this License, whichever comes first, the Licensor hereby grants you rights under the terms of the Change License, and the rights granted in the paragraph above terminate.
-
-If your use of the Licensed Work does not comply with the requirements currently in effect as described in this License, you must purchase or obtain a separate commercial license from the Licensor, its affiliated entities, or authorized resellers, or you must refrain from using the Licensed Work.
-
-All copies of the original and modified Licensed Work, and derivative works of the Licensed Work, are subject to this License. This License applies separately for each version of the Licensed Work, and the Change Date may vary for each version of the Licensed Work released by Licensor.
-
-You must conspicuously display this License on each original or modified copy of the Licensed Work. If you receive the Licensed Work in original or modified form from a third party, the terms and conditions set forth in this License apply to your use of that work.
-
-Any use of the Licensed Work in violation of this License will automatically terminate your rights under this License for the current and all other versions of the Licensed Work.
-
-This License does not grant you any right in any trademark, service mark, trade name, logo, domain name, brand identity, product name, project name, or other identifier of Licensor or its affiliates, except as expressly required to preserve legally required notices.
-
-TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON AN “AS IS” BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, TITLE, SECURITY, ACCURACY, AVAILABILITY, DATA INTEGRITY, PERFORMANCE, AND FITNESS FOR PRODUCTION USE.
-
-TO THE EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, LOSSES, COSTS, EXPENSES, BUSINESS INTERRUPTION, LOST PROFITS, LOST REVENUE, LOST DATA, SECURITY INCIDENTS, SERVICE OUTAGES, OR OTHER LIABILITY ARISING FROM OR RELATED TO THE LICENSED WORK OR YOUR USE OF THE LICENSED WORK.
-
-Notice:
-
-The Business Source License is not an Open Source license. However, each version of the Licensed Work will become available under the Change License on the applicable Change Date, or on the fourth anniversary of the first publicly available distribution of that version under this License, whichever comes first.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

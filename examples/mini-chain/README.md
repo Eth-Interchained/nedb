@@ -36,4 +36,4 @@ One document per block in a `blocks` collection, keyed by height, each carrying
 extra tables, no external indexer. That is the same model itcd uses for the ITC
 chain.
 
-*© Interchained LLC — GPL-3.0-or-later*
+*© Interchained LLC — MIT License*

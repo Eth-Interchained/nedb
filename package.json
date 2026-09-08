@@ -23,7 +23,7 @@
     "README.md",
     "LICENSE"
   ],
-  "license": "GPL-3.0-or-later",
+  "license": "MIT",
   "homepage": "https://github.com/aiassistsecure/nedb#readme",
   "repository": {
     "type": "git",

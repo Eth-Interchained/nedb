@@ -13,8 +13,14 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 [![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/release.yml?label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?logo=opensourceinitiative&logoColor=white)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
 
 **[Studio → studio.interchained.org](https://studio.interchained.org)**  ·  **[nedb.aiassist.net](https://nedb.aiassist.net)**
+
+> ## 🟢 MIT Licensed — free for any use, including commercial & production
+> NEDB is licensed under the **MIT License** — use it in production, embed it in commercial
+> products, ship it in closed-source software, fork it, sell it. No restrictions, no royalties,
+> no copyleft. See [`LICENSE`](LICENSE). The database is free; the moat is what you build on it.
 
 </div>
 
@@ -899,7 +905,8 @@ Requires `GITHUB_TOKEN` (`repo` + `workflow` scope) in the environment. It never
 
 ## License
 
-See `LICENSE` file. · © INTERCHAINED, LLC — [interchained.org](https://interchained.org)
+**MIT License** — free for any use, including commercial and production. See [`LICENSE`](LICENSE).
+© 2026 INTERCHAINED LLC — [interchained.org](https://interchained.org)
 
 ---
 

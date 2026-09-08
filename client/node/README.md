@@ -3,7 +3,7 @@
 > TypeScript/JavaScript client for [nedbd](https://github.com/Eth-Interchained/nedb) — the NEDB server daemon.
 
 [![npm](https://img.shields.io/npm/v/nedb-engine-client?color=00d4ff)](https://www.npmjs.com/package/nedb-engine-client)
-[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-818cf8)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
 
 Connect to any running `nedbd` instance from Node.js or the browser. No engine embedded, no native dependencies. Just fetch.
 
@@ -273,4 +273,4 @@ One HTTP request, multiple ops — best throughput for bulk ingestion.
 
 ---
 
-© [INTERCHAINED, LLC](https://interchained.org) · GPL-3.0-or-later · Built with [Hyperagent](https://hyperagent.com/refer/J2G6TCD7)
+© [INTERCHAINED, LLC](https://interchained.org) · MIT License · Built with [Hyperagent](https://hyperagent.com/refer/J2G6TCD7)

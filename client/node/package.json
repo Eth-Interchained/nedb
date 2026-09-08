@@ -20,7 +20,7 @@
   },
   "keywords": ["nedb", "nedb-engine", "client", "database", "dag", "bi-temporal", "causal", "nedbd"],
   "author": "Eth-Interchained",
-  "license": "GPL-3.0-or-later",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Eth-Interchained/nedb.git"
