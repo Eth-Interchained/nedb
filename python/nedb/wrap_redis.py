@@ -293,20 +293,40 @@ class NEDBSurface:
 
     def __init__(self, r: Any, db_name: str,
                  nedbd_url: Optional[str] = None,
-                 nedbd_token: Optional[str] = None):
+                 nedbd_token: Optional[str] = None,
+                 backend: str = "auto",
+                 dag_path: Optional[str] = None,
+                 dag_tmk: Optional[str] = None):
         self._r        = r
         self._db_name  = db_name
         self._mappings: List[CollectionMapping] = []
         self.shadow_writes: bool = False
         self._backfilled: bool = False
-        self._nedbd_mode: bool = nedbd_url is not None
 
-        if self._nedbd_mode:
+        if nedbd_url:
             # Route all NEDB operations to a running nedbd server
+            # (v1 AOF: plain nedbd · v2 DAG: nedbd --dag · v3: nedbd --dag-v3)
+            self._nedbd_mode = True
             self._db      = NedBdProxy(nedbd_url, db_name, token=nedbd_token)  # type: ignore[assignment]
             self._backend = None
+        elif backend in ("dag", "auto"):
+            # Embedded v2/v3 DAG (Rust native core). Falls back to v1 AOF
+            # when the platform wheel is absent (universal wheel).
+            try:
+                from .backends.dag import DagBackend
+                self._db = DagBackend(path=dag_path, tmk=dag_tmk)  # type: ignore[assignment]
+                self._nedbd_mode = False
+                self._backend = None      # DAG persists itself; no Redis streams
+            except ImportError:
+                if backend == "dag":
+                    raise  # explicit dag request must not silently downgrade
+                self._backend = RedisBackend(r, db_name)
+                self._db = _NEDB()
+                self._db._backend = self._backend
+                self._reload()
         else:
-            # In-process engine with Redis Stream persistence
+            # In-process v1 AOF engine with Redis Stream persistence
+            self._nedbd_mode = False
             self._backend = RedisBackend(r, db_name)
             self._db = _NEDB()
             self._db._backend = self._backend
@@ -337,6 +357,8 @@ class NEDBSurface:
     def _persist_last_op(self) -> None:
         if self._nedbd_mode:
             return  # nedbd persists atomically on each HTTP call
+        if not hasattr(self._db, "log"):
+            return  # DAG backend persists itself (WAL + MANIFEST, atexit flush)
         if self._db.log.ops:
             last = self._db.log.ops[-1]
             self._backend.append(json.dumps(last.to_dict()))
@@ -579,6 +601,14 @@ class NEDBSurface:
 
     # ── Full NEDB API ─────────────────────────────────────────────────────────
 
+    @property
+    def engine_kind(self) -> str:
+        if self._nedbd_mode:
+            return "nedbd-http"
+        if not hasattr(self._db, "log"):
+            return "dag-embedded"
+        return "aof-embedded"
+
     def create_index(self, coll: str, field: str, kind: str = "eq") -> None:
         self._db.create_index(coll, field, kind)
 
@@ -627,6 +657,34 @@ class NEDBSurface:
     def checkpoint(self) -> str:
         return self._db.checkpoint()
 
+    # ── DAG-native passthroughs (None/raise on non-DAG backends) ────────────
+
+    def tip(self):
+        if hasattr(self._db, "tip"):
+            return self._db.tip()
+        return None
+
+    def tip_collection(self, coll):
+        if hasattr(self._db, "tip_collection"):
+            return self._db.tip_collection(coll)
+        return None
+
+    def since(self, after_seq: int, limit: int = 0):
+        if hasattr(self._db, "since"):
+            return self._db.since(after_seq, limit)
+        raise RuntimeError("changefeed requires the DAG backend "
+                           "(embedded native or nedbd --dag)")
+
+    def scan_status(self):
+        if hasattr(self._db, "scan_status"):
+            return self._db.scan_status()
+        raise RuntimeError("scan_status requires the DAG backend")
+
+
+# Alias: the surface is now backend-pluggable (v1 AOF / embedded DAG / nedbd HTTP);
+# _WrapRedisSurface is the wrap_core-era name used by WrappedRedis.
+_WrapRedisSurface = NEDBSurface
+
 
 # ── WrappedRedis ──────────────────────────────────────────────────────────────
 
@@ -646,13 +704,19 @@ class WrappedRedis:
 
     def __init__(self, r: Any, db_name: str,
                  nedbd_url: Optional[str] = None,
-                 nedbd_token: Optional[str] = None):
+                 nedbd_token: Optional[str] = None,
+                 backend: str = "auto",
+                 dag_path: Optional[str] = None,
+                 dag_tmk: Optional[str] = None):
         object.__setattr__(self, "_r",       r)
         object.__setattr__(self, "_db_name", db_name)
         object.__setattr__(self, "nedb",
-                           NEDBSurface(r, db_name,
-                                       nedbd_url=nedbd_url,
-                                       nedbd_token=nedbd_token))
+                           _WrapRedisSurface(r, db_name,
+                                             nedbd_url=nedbd_url,
+                                             nedbd_token=nedbd_token,
+                                             backend=backend,
+                                             dag_path=dag_path,
+                                             dag_tmk=dag_tmk))
 
     def __getattr__(self, name: str) -> Any:
         r    = object.__getattribute__(self, "_r")
@@ -676,7 +740,10 @@ class WrappedRedis:
 
 def wrap_redis(r: Any, db_name: str = "default",
                nedbd_url: Optional[str] = None,
-               nedbd_token: Optional[str] = None) -> WrappedRedis:
+               nedbd_token: Optional[str] = None,
+               backend: str = "auto",
+               dag_path: Optional[str] = None,
+               dag_tmk: Optional[str] = None) -> WrappedRedis:
     """
     Wrap an existing Redis connection with NEDB's layer-2 features.
 
@@ -697,6 +764,18 @@ def wrap_redis(r: Any, db_name: str = "default",
 
     Returns:
         A ``WrappedRedis`` with ``.nedb`` for the full NEDB API.
+
+    Engine selection (backend=):
+        "auto" (default) — nedbd_url wins if given, else embedded v2/v3 DAG
+                           when the Rust native wheel is installed, else the
+                           v1 in-process AOF engine (works everywhere).
+        "dag"            — force embedded DAG (raises if native core missing).
+        "aof"            — force the v1 in-process engine.
+        nedbd_url given  — HTTP mode: v1 AOF, v2 DAG (nedbd --dag), or
+                           v3 substrate (nedbd --dag-v3), selected server-side.
+
+    dag_path:  durable DAG store directory (embedded DAG mode only).
+    dag_tmk:   64-hex TMK for AES-256-GCM at-rest encryption (embedded DAG).
 
     Quick-start::
 
@@ -722,4 +801,5 @@ def wrap_redis(r: Any, db_name: str = "default",
         r.nedb.query('FROM driver WHERE status = "active" ORDER BY name ASC')
         r.nedb.verify()   # → True
     """
-    return WrappedRedis(r, db_name, nedbd_url=nedbd_url, nedbd_token=nedbd_token)
+    return WrappedRedis(r, db_name, nedbd_url=nedbd_url, nedbd_token=nedbd_token,
+                        backend=backend, dag_path=dag_path, dag_tmk=dag_tmk)

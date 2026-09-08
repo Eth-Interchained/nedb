@@ -35,6 +35,10 @@ from .autoindex import AutoIndexDB
 from .concurrent import Sequencer
 from .wrap_redis import wrap_redis, WrappedRedis
 from .proof import verify_proof, fold_head
+from .wrap_sqlite import wrap_sqlite, WrappedSqlite
+from .wrap_mysql import wrap_mysql, WrappedMysql
+from .wrap_mongo import wrap_mongo, WrappedMongoClient
+from .wrap_postgresql import wrap_postgresql, WrappedPostgres
 
 try:  # compiled Rust core, present in platform wheels (PyO3 via maturin)
     from . import _native  # type: ignore
@@ -91,6 +95,10 @@ __all__ = [
     "MongoCompat", "MongoClient", "MongoError", "MongoUnsupportedError", "ObjectId",
     "AutoIndexDB", "Sequencer",
     "wrap_redis", "WrappedRedis",
+    "wrap_sqlite", "WrappedSqlite",
+    "wrap_mysql", "WrappedMysql",
+    "wrap_mongo", "WrappedMongoClient",
+    "wrap_postgresql", "WrappedPostgres",
     "verify_proof", "fold_head",
     "_native", "__has_native__",
 ]
