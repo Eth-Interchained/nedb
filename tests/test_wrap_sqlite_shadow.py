@@ -31,7 +31,6 @@ Run: python3 tests/test_wrap_sqlite_shadow.py
 """
 import sqlite3
 import sys
-import tempfile
 
 sys.path.insert(0, "python")
 
@@ -52,7 +51,11 @@ def fresh(rows=3):
     for i in range(1, rows + 1):
         conn.execute("INSERT INTO rides VALUES (?,?,?)", (i, f"d{i}", "complete"))
     conn.commit()
-    ws = wrap_sqlite(conn, db_name="shadowtest", dag_path=tempfile.mkdtemp())
+    # No dag_path / backend pin on purpose. The three defects live in
+    # _shadow_sql, which is engine-agnostic, so this suite runs identically on
+    # the v1 AOF engine and the embedded DAG -- and therefore in every CI tier,
+    # not only the one with a platform wheel.
+    ws = wrap_sqlite(conn, db_name="shadowtest")
     ws.nedb.register("rides", collection="ride")
     ws.nedb.backfill()
     ws.nedb.shadow_writes = True
