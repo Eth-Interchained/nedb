@@ -830,6 +830,104 @@ fn a_second_join_still_sees_every_row_from_the_first() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Predicate pushdown is invisible in the answers
+//
+// A conjunct reading exactly one relation is COPIED to pre-filter that
+// relation before the join — but only when the relation is never
+// NULL-synthesised. These cases pin both halves of that rule.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The case that disproved the first version of the pushdown safety argument.
+///
+/// The original reasoning was that copying a predicate (rather than moving it)
+/// made pre-filtering safe for any join type, because newly-unmatched rows
+/// would be NULL-extended and then dropped by the retained `WHERE`. But a
+/// predicate can be SATISFIED by a synthesised NULL: no `dept` row has a NULL
+/// `dname`, so pre-filtering `dept` empties it, every `emp` row becomes
+/// unmatched, and `IS NULL` is then TRUE for all five.
+///
+/// The answer below is 1 row. It went to 5. That is why the rule is about NULL
+/// synthesis rather than about retention.
+#[test]
+fn a_predicate_satisfied_by_a_synthesised_null_is_not_pushed() {
+    expect(
+        "SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept_id = d.id \
+         WHERE d.dname IS NULL ORDER BY 1",
+        json!([{"name": "ken"}]),
+    );
+    // The same shape with NOT, which is equally satisfied by a NULL becoming
+    // UNKNOWN under negation... except it is NOT: `NOT UNKNOWN` is UNKNOWN, so
+    // this one drops the outer rows. Both directions pinned.
+    expect(
+        "SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept_id = d.id \
+         WHERE NOT (d.dname = 'eng') ORDER BY 1",
+        json!([{"name": "linus"}, {"name": "rob"}]),
+    );
+}
+
+/// A `RIGHT`/`FULL` join synthesises NULLs across the whole LEFT side, so a
+/// predicate on the driving relation cannot be pushed either.
+#[test]
+fn a_right_join_protects_the_left_relation_from_pushdown() {
+    expect(
+        "SELECT e.name, d.dname FROM emp e RIGHT JOIN dept d ON e.dept_id = d.id \
+         WHERE e.name IS NULL ORDER BY 2",
+        json!([
+            {"name": null, "dname": "ghost"},
+            {"name": null, "dname": "limbo"},
+        ]),
+    );
+}
+
+/// The non-nullable side is pushed, and the answer is unchanged — which is the
+/// case that actually matters for performance.
+#[test]
+fn the_non_nullable_side_is_pushed_without_changing_the_answer() {
+    expect(
+        "SELECT e.name, d.dname FROM emp e LEFT JOIN dept d ON e.dept_id = d.id \
+         WHERE e.salary > 140 ORDER BY 1",
+        json!([
+            {"name": "grace", "dname": "eng"},
+            {"name": "ken",   "dname": null},
+            {"name": "linus", "dname": "ops"},
+        ]),
+    );
+    // An inner join can push both sides.
+    expect(
+        "SELECT e.name, d.dname FROM emp e JOIN dept d ON e.dept_id = d.id \
+         WHERE e.salary > 110 AND d.dname <> 'ops' ORDER BY 1",
+        json!([
+            {"name": "grace", "dname": "eng"},
+            {"name": "rob",   "dname": "legal"},
+        ]),
+    );
+}
+
+/// A predicate reading two relations is never pushed, because neither
+/// relation can evaluate it alone.
+#[test]
+fn a_predicate_spanning_two_relations_is_left_above_the_join() {
+    expect(
+        "SELECT e.name FROM emp e JOIN dept d ON e.dept_id = d.id \
+         WHERE e.salary > d.id ORDER BY 1",
+        json!([
+            {"name": "ada"}, {"name": "grace"}, {"name": "linus"}, {"name": "rob"},
+        ]),
+    );
+}
+
+/// An `OR` is never split, so a predicate whose halves read different
+/// relations stays whole.
+#[test]
+fn an_or_across_relations_is_not_split_for_pushdown() {
+    expect(
+        "SELECT e.name FROM emp e JOIN dept d ON e.dept_id = d.id \
+         WHERE e.salary > 190 OR d.dname = 'legal' ORDER BY 1",
+        json!([{"name": "grace"}, {"name": "rob"}]),
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Known divergences from PostgreSQL
 //
 // These are NOT part of the contract above. They are recorded because writing

@@ -40,6 +40,7 @@
 
 use crate::sqljoin::{self, JoinExec, Strategy};
 use crate::sqlplan::{Plan, Stage};
+use crate::sqlpush::Pushdown;
 
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
@@ -1724,6 +1725,21 @@ pub fn execute_explain(
     resolve: &Resolver,
     exec: JoinExec,
 ) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
+    execute_with(sel, resolve, exec, true)
+}
+
+/// As [`execute_explain`], with predicate pushdown switchable.
+///
+/// The switch exists so differential tests can run the SAME query with and
+/// without the rewrite and compare. Without it, a test believing it exercised
+/// pushdown could be measuring the unoptimised path, and the equivalence suite
+/// would prove nothing — the same reason `JoinExec` can force a strategy.
+pub fn execute_with(
+    sel: &Select,
+    resolve: &Resolver,
+    exec: JoinExec,
+    pushdown: bool,
+) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
     let mut plan = Plan::default();
 
     // ── 0a. semantic validation, before any work ────────────────────────────
@@ -1764,6 +1780,25 @@ pub fn execute_explain(
     };
     plan.budget = budget;
 
+    // ── 0b. predicate pushdown ──────────────────────────────────────────────
+    // Conjuncts of the WHERE clause that read exactly one relation are COPIED
+    // to pre-filter that relation before the join. The WHERE clause below is
+    // untouched and still runs afterwards — a copy, never a move, which is
+    // what keeps this safe for outer joins. See `sqlpush` for the argument.
+    let all_bindings: Vec<String> = sel
+        .from
+        .iter()
+        .map(|t| t.binding())
+        .chain(sel.joins.iter().map(|j| j.table.binding()))
+        .collect();
+    let nullable = crate::sqlpush::nullable_bindings(sel);
+    let push = if pushdown {
+        crate::sqlpush::plan(sel.where_.as_ref(), &all_bindings, &nullable)
+    } else {
+        Pushdown::default()
+    };
+    plan.refusals = push.refusals.clone();
+
     // ── 1. source rows, and the join ────────────────────────────────────────
     let mut rows: Vec<JoinedRow> = match &sel.from {
         None => {
@@ -1778,6 +1813,7 @@ pub fn execute_explain(
                 binding: t.binding(),
                 rows: src.len(),
             });
+            let src = prefilter(src, &t.binding(), &push, &mut plan)?;
             src.into_iter()
                 .map(|r| vec![(t.binding(), Some(r))])
                 .collect()
@@ -1801,6 +1837,7 @@ pub fn execute_explain(
             binding: rb.clone(),
             rows: right_rows.len(),
         });
+        let right_rows = prefilter(right_rows, &rb, &push, &mut plan)?;
 
         // The planner proposes; sizes decide. A join with no provable equality
         // key has nothing to hash on and stays on the reference path.
@@ -2221,6 +2258,55 @@ fn join_hash(
         emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
     }
     Ok(out)
+}
+
+/// Apply the pushed conjuncts for one relation, before it reaches the join.
+///
+/// Evaluated against the relation's own binding alone, which is exactly what
+/// the planner proved is sufficient: a pushed conjunct references only this
+/// relation, so binding it alone gives the same answer the post-join `WHERE`
+/// will give for the same row.
+fn prefilter(
+    rows: Vec<Value>,
+    binding: &str,
+    push: &Pushdown,
+    plan: &mut Plan,
+) -> Result<Vec<Value>> {
+    let Some(preds) = push.for_binding(binding) else { return Ok(rows) };
+    if preds.is_empty() {
+        return Ok(rows);
+    }
+    let in_rows = rows.len();
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let one: JoinedRow = vec![(binding.to_string(), Some(row))];
+        let b = bind(&one);
+        let mut keep = true;
+        for p in preds {
+            // Only TRUE keeps a row, exactly as in `WHERE`. Treating UNKNOWN
+            // as a keep would make the pre-filter weaker than the filter it
+            // duplicates, which is harmless; treating it as a drop when the
+            // real filter would keep it would not be — so the two must agree,
+            // and they do because this is the same evaluator call.
+            if truthy(&eval(p, &b)?) != Some(true) {
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            // Unwrap the row back out of the single-binding wrapper.
+            if let Some((_, Some(v))) = one.into_iter().next() {
+                kept.push(v);
+            }
+        }
+    }
+    plan.push(Stage::Prefilter {
+        binding: binding.to_string(),
+        predicates: preds.len(),
+        in_rows,
+        out_rows: kept.len(),
+    });
+    Ok(kept)
 }
 
 fn fetch(name: &str, resolve: &Resolver) -> Result<Vec<Value>> {

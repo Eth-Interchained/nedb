@@ -83,6 +83,16 @@ pub enum Stage {
     Distinct { in_rows: usize, out_rows: usize },
     /// `ORDER BY` sorted the rows.
     Sort { keys: usize, rows: usize },
+    /// A `WHERE` conjunct was pre-applied to a base relation before the join.
+    ///
+    /// The original `WHERE` still runs afterwards — this is a copy, not a
+    /// move, which is what makes it safe for every join type.
+    Prefilter {
+        binding: String,
+        predicates: usize,
+        in_rows: usize,
+        out_rows: usize,
+    },
     /// `LIMIT` / `OFFSET` were applied.
     Limit {
         limit: Option<usize>,
@@ -153,6 +163,10 @@ pub struct Plan {
     pub stages: Vec<Stage>,
     /// Set when the row budget let a stage stop before consuming its input.
     pub budget: Option<usize>,
+    /// Why the optimiser declined to push a predicate. Recorded rather than
+    /// silent: you cannot tell "correctly refused" from "forgot to look" if
+    /// the decision leaves no trace.
+    pub refusals: Vec<String>,
 }
 
 impl Plan {
@@ -209,15 +223,34 @@ impl Plan {
         let rest: Vec<&Stage> = it.collect();
         let mut i = 0usize;
         while i < rest.len() {
-            let is_join_pair = matches!(rest.get(i), Some(Stage::Scan { .. }))
-                && matches!(rest.get(i + 1), Some(Stage::Join { .. }));
-            if is_join_pair {
+            // A right-hand input is a Scan, optionally wrapped in the
+            // Prefilter that was pushed into it. The join therefore sits one
+            // or two stages after the scan, and the pair detection has to look
+            // past the prefilter or it would mistake the join for a unary
+            // stage and flatten the tree.
+            let right_len = match (rest.get(i), rest.get(i + 1), rest.get(i + 2)) {
+                (Some(Stage::Scan { .. }), Some(Stage::Join { .. }), _) => Some(1),
+                (
+                    Some(Stage::Scan { .. }),
+                    Some(Stage::Prefilter { .. }),
+                    Some(Stage::Join { .. }),
+                ) => Some(2),
+                _ => None,
+            };
+            if let Some(n) = right_len {
+                let mut right = PlanTree::Leaf(rest[i].clone());
+                if n == 2 {
+                    right = PlanTree::Unary {
+                        stage: rest[i + 1].clone(),
+                        input: Box::new(right),
+                    };
+                }
                 node = PlanTree::Binary {
-                    stage: rest[i + 1].clone(),
+                    stage: rest[i + n].clone(),
                     left: Box::new(node),
-                    right: Box::new(PlanTree::Leaf(rest[i].clone())),
+                    right: Box::new(right),
                 };
-                i += 2;
+                i += n + 1;
             } else {
                 node = PlanTree::Unary {
                     stage: rest[i].clone(),
@@ -241,6 +274,9 @@ impl Plan {
             render_node(&t, 0, &mut out);
         }
 
+        for r in &self.refusals {
+            out.push(r.clone());
+        }
         if let Some(b) = self.budget {
             out.push(format!(
                 "Row budget: {b} — the join was allowed to stop once this many \
@@ -310,6 +346,11 @@ fn render_node(n: &PlanTree, depth: usize, out: &mut Vec<String>) {
         Stage::Sort { keys, rows } => {
             format!("{arrow}Sort  ({keys} key(s)) (actual rows={rows})")
         }
+        Stage::Prefilter { binding, predicates, in_rows, out_rows } => format!(
+            "{arrow}Prefilter on {binding}  ({predicates} pushed, removed {}) \
+             (actual rows={out_rows})",
+            in_rows.saturating_sub(*out_rows)
+        ),
         Stage::Limit { limit, offset, in_rows, out_rows } => {
             let l = limit.map(|n| n.to_string()).unwrap_or_else(|| "ALL".into());
             let o = offset.map(|n| format!(", offset {n}")).unwrap_or_default();
