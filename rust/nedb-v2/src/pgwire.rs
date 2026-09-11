@@ -2477,7 +2477,7 @@ fn try_catalog_select(
         }
     };
 
-    let (names, rows, plan) = crate::sqlselect::execute_explain(
+    let (cols, rows, plan) = crate::sqlselect::execute_explain(
         &sel,
         &resolve,
         crate::sqljoin::JoinExec::Auto,
@@ -2487,7 +2487,13 @@ fn try_catalog_select(
     Ok(Some((
         Executed {
             rows,
-            project: names.iter().map(|n| Col::same(n)).collect(),
+            // The KEY is what the row is stored under; the NAME is what the
+            // client sees. They differ when a select list has duplicate output
+            // names, which PostgreSQL permits and generated SQL relies on.
+            project: cols
+                .iter()
+                .map(|c| Col::renamed(&c.key, &c.name))
+                .collect(),
             has_rows: true,
             tag: "SELECT".into(),
             tag_counts_rows: true,

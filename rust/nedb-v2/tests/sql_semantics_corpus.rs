@@ -95,7 +95,10 @@ fn run_all_strategies(sql: &str) -> (Vec<String>, Vec<Value>) {
              strategy changed the answer"
         );
     }
-    (base_names.clone(), base_rows.clone())
+    (
+        base_names.iter().map(|c| c.name.clone()).collect(),
+        base_rows.clone(),
+    )
 }
 
 /// Assert the exact, ordered answer.
@@ -508,6 +511,108 @@ fn duplicate_output_names_are_not_silently_renamed() {
     // break generated SQL that asks for the name it wrote.
     expect_cols("SELECT e.name, d.dname AS name FROM emp e JOIN dept d ON e.dept_id = d.id",
         &["name", "name"]);
+}
+
+#[test]
+fn duplicate_output_names_still_carry_DIFFERENT_values() {
+    // The version of the test above checked only the NAMES, and passed for
+    // months while the VALUES were broken: rows are JSON objects, so two
+    // columns sharing a name shared a key, and the second write silently
+    // overwrote the first. `SELECT e.name, e2.name` reported two columns and
+    // returned one value twice.
+    //
+    // Checking names without checking values is exactly the decorative-test
+    // failure mode. Asserting both is what makes this evidence.
+    let (names, rows) = run_all_strategies(
+        "SELECT e.name, d.dname AS name FROM emp e JOIN dept d ON e.dept_id = d.id \
+         WHERE e.name = 'ada'",
+    );
+    assert_eq!(names, ["name", "name"]);
+    assert_eq!(rows.len(), 1);
+    let vals: Vec<&Value> = rows[0].as_object().expect("an object").values().collect();
+    assert_eq!(vals.len(), 2, "two columns must occupy two slots, not one");
+    assert_eq!(vals[0], &json!("ada"));
+    assert_eq!(vals[1], &json!("eng"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ambiguous relation bindings are REFUSED, not answered
+//
+// Closing a wrong-answer surface takes priority over any optimisation: a
+// silently empty result is indistinguishable from "there is no such data".
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_relation_used_twice_without_aliases_is_refused() {
+    // This used to return NOTHING. A qualified reference scans the bindings in
+    // order and takes the first match, so `emp.dept_id = emp.id` compared
+    // every row to ITSELF. PostgreSQL says "table name emp specified more than
+    // once"; answering it at all was the bug.
+    expect_refused(
+        "SELECT emp.name FROM emp JOIN emp ON emp.dept_id = emp.id",
+        "ambiguous relation binding",
+    );
+    // The message has to name the relation and point at the fix.
+    expect_refused(
+        "SELECT emp.name FROM emp JOIN emp ON emp.dept_id = emp.id",
+        "use aliases",
+    );
+}
+
+#[test]
+fn two_aliases_that_collide_are_refused_too() {
+    // Different tables, same binding: equally ambiguous.
+    expect_refused(
+        "SELECT x.name FROM emp x JOIN dept x ON x.dept_id = x.id",
+        "ambiguous relation binding",
+    );
+    // And a bare name colliding with an alias.
+    expect_refused(
+        "SELECT dept.id FROM emp dept JOIN dept ON dept.id = dept.id",
+        "ambiguous relation binding",
+    );
+}
+
+#[test]
+fn aliasing_the_second_use_is_the_supported_spelling() {
+    // `emp.dept_id` points at `dept.id` for ada/grace/linus/rob. Self-joining
+    // emp to emp on id needs the alias, and with it the query means what it
+    // says.
+    expect(
+        "SELECT e.name, e2.name AS other FROM emp e JOIN emp e2 ON e.dept_id = e2.dept_id \
+         WHERE e.id = 1 ORDER BY 2",
+        json!([
+            {"name": "ada", "other": "ada"},
+            {"name": "ada", "other": "grace"},
+        ]),
+    );
+}
+
+#[test]
+fn a_relation_used_once_is_never_affected() {
+    // The guard must not fire on ordinary queries — including three distinct
+    // relations and a case-different alias.
+    expect(
+        "SELECT e.name, p.pname FROM emp e \
+         JOIN dept d ON e.dept_id = d.id \
+         JOIN proj p ON d.id = p.dept_id ORDER BY 1",
+        json!([
+            {"name": "ada",   "pname": "apollo"},
+            {"name": "grace", "pname": "apollo"},
+            {"name": "linus", "pname": "gemini"},
+        ]),
+    );
+}
+
+#[test]
+fn binding_collision_is_case_insensitive_because_resolution_is() {
+    // `Bound::column` matches bindings with `eq_ignore_ascii_case`, so `E` and
+    // `e` are the SAME binding. The guard has to agree with the resolver, or
+    // it would let through exactly the ambiguity it exists to stop.
+    expect_refused(
+        "SELECT e.name FROM emp e JOIN emp E ON e.dept_id = E.id",
+        "ambiguous relation binding",
+    );
 }
 
 #[test]

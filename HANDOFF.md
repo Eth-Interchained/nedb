@@ -34,6 +34,7 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #115 | **a real SQL evaluator** (`sqlselect.rs`) | `psql \dt` works — 11/14 backslash commands |
 | #116 | **hash join + the frozen semantic corpus** | the evaluator became a subsystem with a contract |
 | #117 | **execution plan + `EXPLAIN` + the row budget** | the engine can say why it ran a query that way; `LIMIT` stopped materialising whole joins |
+| #118 | **ambiguous bindings refused; duplicate output names fixed** | two wrong-answer surfaces closed before any further optimiser work |
 
 ### The two engines, and which one to trust
 
@@ -89,6 +90,22 @@ Corollary: **a self-skipping test is indistinguishable from a passing one.**
 `NEDB_REQUIRE_PG=1`. Do the same for any suite whose dependency might silently
 go missing in CI.
 
+### The two failure modes that keep recurring
+
+Both were caught again this session, and both are cheap to check for:
+
+1. **A test that cannot fail.** `duplicate_output_names_are_not_silently_renamed`
+   asserted the column NAMES and never the VALUES, so it passed while
+   `SELECT e.name, e2.name` returned one value twice. The multi-join budget
+   guard passed under the mutation that removed the guard. **Mutate the
+   implementation and confirm the suite screams** — if it does not, the test is
+   decorative.
+2. **Asserting content instead of structure.** No test caught the `EXPLAIN`
+   tree printing a join's two scans at different depths, because every
+   assertion checked which relation and how many rows — and those were right.
+   `Plan::tree()` now exists so tests assert TOPOLOGY (`children().len() == 2`,
+   `depth()`), and five of them fail if the shape regresses.
+
 ### Test surface (all green at v4.0.0)
 
 | Tier | Count | Notes |
@@ -98,6 +115,8 @@ go missing in CI.
 | **semantic corpus** | 44 | frozen SQL meaning, run under **every** join strategy |
 | **join differential** | 11 | hash vs nested loop, incl. 640 generated cases |
 | `EXPLAIN` over libpq | 15 | inside the `pg_catalog` suite, real psycopg2 |
+| bindings + duplicate names | 6 | same suite; duplicate names verified positionally |
+| plan topology | 6 | structural, not rendered text |
 | psql introspection | 44 | drives the **real `psql` binary** |
 | `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
@@ -217,17 +236,50 @@ is performance.
   `WHERE` clause, or more than one join. `OFFSET` is *added* to the budget
   rather than disqualifying it.
 
+**Done in #118** — wrong-answer surfaces, closed before continuing:
+
+* Ambiguous relation bindings refused by name (see §4).
+* **Duplicate output names carried the same value.** PostgreSQL permits
+  `SELECT e.name, e2.name`, and generated SQL relies on it — but rows here are
+  JSON objects, so two columns sharing a name shared a KEY and the second write
+  silently overwrote the first. Output columns are now `OutCol { key, name }`:
+  the key is disambiguated, the display name is untouched. Renaming the column
+  instead would be worse, because generated SQL asks for the name it wrote.
+* A latent index drift in projection: a single counter walked both the
+  name-building and projection stages, and a `*` that skipped an already-named
+  column left it pointing at the wrong name. Each select item now owns an
+  explicit span of output columns.
+
 **The next item.** Correct result first, faster execution second; never invert
 that.
 
-* **Predicate pushdown, conservatively.** A predicate may move below a join
-  only when that provably preserves meaning. `LEFT JOIN ... WHERE right.x = 5`
-  is **not** equivalent to filtering the right relation first — in `WHERE` it
-  discards the outer rows, in `ON` it keeps them. Both spellings are already
-  pinned in the corpus. If equivalence cannot be proven, do not transform.
-* The natural next win after that is **fusing `Filter` into the join**, which
-  would let the row budget apply to filtered joins too — currently a `WHERE`
-  disqualifies it entirely, because filtering happens after the join.
+* **Predicate pushdown, conservatively.** Narrower than the phrase sounds: NOT
+  a generic `Filter(Join(A,B)) -> Join(Filter(A),B)` rewrite based on column
+  ownership. For each candidate predicate, prove all three: (1) which bindings
+  does it reference, (2) what join type sits above that binding, (3) does
+  moving it change NULL-synthesis semantics. `INNER JOIN` allows much more
+  freedom; for `LEFT JOIN`, left-only predicates are the interesting safe case
+  and right-side predicates are where outer-row preservation dies. The trap is
+  already pinned in the corpus. **The optimiser should record a refusal REASON
+  when it declines** (`predicate references nullable side of LEFT JOIN`) —
+  inspectable in tests before it is ever user-facing.
+* **Physical `Filter`-in-`Join` execution** — but do NOT erase the logical
+  distinction between an `ON` predicate and a post-join `WHERE` predicate, even
+  when one loop evaluates both. That distinction is semantic law. The physical
+  join carries `join_predicate`, `post_join_filter` and `row_budget`, and
+  evaluates: candidate pair -> `ON` -> NULL synthesis if the outer join
+  requires it -> post-join filter -> count toward budget. That yields the
+  performance win without turning `WHERE` into `ON`. The 27ms / 64-row case is
+  where it pays off.
+* **A streaming `Resolver`.** At 6.7ms the join is no longer the bottleneck —
+  an owned `Vec<Value>` forces full materialisation before early termination
+  can exploit anything. Do not reach for a large async abstraction: the
+  smallest iterator-shaped interface that permits *next row* and *stop early*.
+  Then prove `LIMIT 20` does not load 8000 source rows to return 20.
+* **Skew benchmark, then derive the hash crossover from it.** `AUTO_HASH_MIN_PAIRS
+  = 64` is currently a guess. Measure uniform-unique, moderate duplicates, a
+  single hot key, all-same-key, and coercion-heavy numeric/string keys — the
+  threshold must come from the ugly shapes, not just the friendly ones.
 
 Then **subqueries**, one semantic class at a time, each with its own
 regression corpus: scalar uncorrelated, `IN (SELECT ...)`, `EXISTS`,
@@ -293,11 +345,12 @@ An evaluator who finds an unstated limitation stops trusting everything else.
   #116 — it used to answer `1.0`, which clients read as the text "1.0").
   `SELECT 1.0` therefore also renders as `1`. Unrepresentable either way;
   stated rather than hidden.
-* **A self-join with the same binding twice** (`FROM a JOIN a ON ...`) resolves
-  qualified columns to the *first* matching binding instead of erroring the way
-  PostgreSQL does. Write `FROM a JOIN a AS a2` and it behaves correctly. The
-  hash planner refuses to key on an ambiguous binding, so this is a wrong
-  *answer* rather than a wrong *strategy* — worth fixing with a named refusal.
+* **A relation used twice without aliases is now REFUSED** (#118), with
+  `ambiguous relation binding: "a" appears more than once; use aliases`. It
+  used to return silently NOTHING, because a qualified reference takes the
+  first matching binding and so `emp.mgr = emp.id` compared every row to
+  itself. The check is case-insensitive, because binding resolution is.
+  `FROM a JOIN a AS a2` is the supported spelling.
 
 * **`Db::compact()` discards history.** It rewrites the object segments keeping
   only each document's *current* version, so it prunes superseded versions and
