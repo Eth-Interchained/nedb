@@ -352,6 +352,23 @@ jobs:
       - name: Postgres endpoint — pg_catalog / information_schema
         run: python3 tests/test_pgcatalog.py
 
+      # psql's backslash commands, driven by the REAL psql binary.
+      #
+      # An assertion written against a query I typed proves only that I can
+      # type the query I implemented. psql's actual SQL is the specification —
+      # it changes between versions and is full of constructs nobody writes by
+      # hand (OPERATOR(pg_catalog.~), COLLATE pg_catalog."C", E'\n'). So the
+      # binary runs and its exit status is the verdict.
+      #
+      # NEDB_REQUIRE_PSQL=1: a missing psql FAILS here rather than skipping,
+      # because a self-skipping test is indistinguishable from a passing one.
+      - name: Postgres endpoint — psql \dn and \dt (real psql binary)
+        env:
+          NEDB_REQUIRE_PSQL: "1"
+        run: |
+          pip install pgserver
+          python3 tests/test_psql_introspection.py
+
       # The EXTENDED query protocol, driven by the drivers that only speak it.
       #
       # psycopg2 interpolates parameters client-side, so the suite above only

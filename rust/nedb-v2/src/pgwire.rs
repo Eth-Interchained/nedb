@@ -853,6 +853,11 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
 
 const SERVER_VERSION: &str = "15.0";
 
+/// The `version()` string, for the SQL engine's `version()` function.
+pub fn version_string() -> String {
+    full_version_string()
+}
+
 fn full_version_string() -> String {
     format!(
         "PostgreSQL {} (NEDB {}) — tamper-evident, append-only, permanent \
@@ -2389,6 +2394,141 @@ fn no_db(db_name: &str) -> Vec<u8> {
          (POST /v1/databases), or connect with -d <name>", db_name))
 }
 
+/// Run a `SELECT` through the full SQL engine when it touches the catalogue.
+///
+/// The gate is deliberately narrow: a statement goes to `sqlselect` only when
+/// one of its tables is a catalogue relation. Everything else keeps the
+/// SQL→NQL path, which has the index pushdown, `AS OF`, `TRACE` and the
+/// bounded scans — and whose join story is a real planning question rather
+/// than a nested loop. Routing a large collection through a nested-loop join
+/// would be a promise this engine cannot keep.
+///
+/// `None` means "not mine": the caller falls through to the ordinary path, so
+/// the error the client sees is the ordinary path's error rather than a
+/// confusing one from a parser that was never meant to handle the statement.
+fn try_catalog_select(
+    sql: &str,
+    db: Option<&Arc<Db>>,
+) -> Result<Option<Executed>, Vec<u8>> {
+    let sel = match crate::sqlselect::parse(sql) {
+        Ok(sel) => sel,
+        Err(why) => {
+            // A statement that plainly reads the catalogue but that this
+            // engine cannot parse gets the PARSE error, not the NQL path's.
+            //
+            // Falling through unconditionally produced an actively false
+            // message: `\d` and `\dp` were told "JOIN is not supported",
+            // which stopped being true the moment joins started working — and
+            // a wrong explanation is worse than a blunt one, because it sends
+            // the reader to fix the wrong thing.
+            if mentions_catalog(sql) {
+                return Err(err_msg("0A000", &format!(
+                    "this catalogue query uses SQL this endpoint does not \
+                     implement: {}", why)));
+            }
+            return Ok(None);
+        }
+    };
+
+    // Which relations does it read?
+    let mut touched: Vec<String> = vec![];
+    if let Some(f) = &sel.from {
+        touched.push(f.name.clone());
+    }
+    for j in &sel.joins {
+        touched.push(j.table.name.clone());
+    }
+    let catalog_name = |n: &str| -> String {
+        // `pg_catalog.pg_class` → `pg_class`, but `information_schema.tables`
+        // keeps its qualifier, because `tables` is a plausible collection
+        // name and the catalogue must never shadow a user's own data.
+        let joined: Vec<&str> = n.split('.').collect();
+        if joined.len() >= 2 && joined[joined.len() - 2] == "information_schema" {
+            format!("information_schema.{}", joined[joined.len() - 1])
+        } else {
+            joined[joined.len() - 1].to_string()
+        }
+    };
+    if !touched.iter().any(|t| crate::pgcatalog::is_catalog(&catalog_name(t))) {
+        return Ok(None);
+    }
+
+    // An aggregate over the catalogue falls through on purpose, so the caller
+    // produces the one clear "a catalogue has nothing to aggregate" message
+    // rather than a generic "unknown function" from this engine.
+    if select_has_aggregate(&sel) {
+        return Ok(None);
+    }
+
+    let resolve = |name: &str| -> anyhow::Result<Option<Vec<Value>>> {
+        let cname = catalog_name(name);
+        if let Some(rows) = crate::pgcatalog::rows(&cname, db) {
+            return Ok(Some(rows));
+        }
+        // A join between a catalogue relation and a real collection is
+        // legitimate, so a user table still resolves — read whole, because a
+        // join has no predicate to push down.
+        match db {
+            Some(db) => match crate::nql::query(db, &format!("FROM {}", cname)) {
+                Ok((rows, _)) => Ok(Some(rows)),
+                Err(_) => Ok(None),
+            },
+            None => Ok(None),
+        }
+    };
+
+    let (names, rows) = crate::sqlselect::execute(&sel, &resolve)
+        .map_err(|e| err_msg("42601", &e.to_string()))?;
+
+    Ok(Some(Executed {
+        rows,
+        project: names.iter().map(|n| Col::same(n)).collect(),
+        has_rows: true,
+        tag: "SELECT".into(),
+        tag_counts_rows: true,
+    }))
+}
+
+/// Does the raw SQL plainly read a catalogue relation?
+///
+/// A cheap text check, used only to decide WHICH error to report when the
+/// statement cannot be parsed — never to decide what a parsable statement
+/// means. `pg_` is the giveaway: every catalogue relation is prefixed, and so
+/// is the `pg_catalog` schema qualifier.
+fn mentions_catalog(sql: &str) -> bool {
+    let low = sql.to_lowercase();
+    low.contains("pg_catalog.")
+        || low.contains("information_schema.")
+        || low.contains("from pg_")
+        || low.contains("join pg_")
+}
+
+/// Does any select item call an aggregate?
+fn select_has_aggregate(sel: &crate::sqlselect::Select) -> bool {
+    fn walk(e: &crate::sqlselect::Expr) -> bool {
+        use crate::sqlselect::Expr as E;
+        match e {
+            E::Func { name, args } => {
+                matches!(name.as_str(),
+                         "count" | "sum" | "avg" | "min" | "max" | "array_agg"
+                         | "string_agg" | "bool_and" | "bool_or")
+                    || args.iter().any(walk)
+            }
+            E::Binary { left, right, .. } => walk(left) || walk(right),
+            E::Unary { expr, .. } | E::Cast { expr, .. } => walk(expr),
+            E::IsNull { expr, .. } => walk(expr),
+            E::InList { expr, list, .. } => walk(expr) || list.iter().any(walk),
+            E::Case { operand, whens, else_ } => {
+                operand.as_deref().map(walk).unwrap_or(false)
+                    || whens.iter().any(|(c, t)| walk(c) || walk(t))
+                    || else_.as_deref().map(walk).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    sel.items.iter().any(|i| walk(&i.expr))
+}
+
 /// The catalogue relation a translated query reads from, if any.
 ///
 /// Reads the collection straight off the parsed NQL rather than re-parsing the
@@ -2465,6 +2605,14 @@ fn execute_stmt(
     db: Option<&Arc<Db>>,
     read_only: bool,
 ) -> Result<Executed, Vec<u8>> {
+    // The full SQL engine gets first refusal, but ONLY for statements that
+    // touch the catalogue — see `try_catalog_select`. It has to run before
+    // `translate`, because `translate` targets NQL and NQL cannot express a
+    // join, a CASE or a scalar function at all.
+    if let Some(done) = try_catalog_select(stmt_sql, db)? {
+        return Ok(done);
+    }
+
     let stmt = translate(stmt_sql).map_err(|why| err_msg("0A000", &why))?;
 
     // Every arm below that touches storage needs a database; resolve the
