@@ -13,14 +13,19 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 [![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/release.yml?label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
-[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?logo=opensourceinitiative&logoColor=white)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-f59e0b)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE) [![Free under $1M revenue](https://img.shields.io/badge/free%20under%20%241M%20revenue-22c55e)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
 
 **[Studio → studio.interchained.org](https://studio.interchained.org)**  ·  **[nedb.aiassist.net](https://nedb.aiassist.net)**
 
-> ## 🟢 MIT Licensed — free for any use, including commercial & production
-> NEDB is licensed under the **MIT License** — use it in production, embed it in commercial
-> products, ship it in closed-source software, fork it, sell it. No restrictions, no royalties,
-> no copyleft. See [`LICENSE`](LICENSE). The database is free; the moat is what you build on it.
+> ## 🟢 Free in production under $1M revenue
+> NEDB 4.0.0 is licensed under the **Business Source License 1.1**. If your organisation's annual
+> revenue is **under USD $1,000,000**, you may use it in production — commercially, embedded, in
+> closed-source software — with **no permission needed and no royalty**. At **$1M or more**, you
+> need an additional use grant from Interchained LLC: **licensing@interchained.org**.
+>
+> Non-production use is unrestricted for everyone, at any revenue: development, testing, CI,
+> evaluation, research, teaching. On **2030-09-11** this version converts to **Apache 2.0**
+> automatically and permanently. See [`LICENSE`](LICENSE).
 
 </div>
 
@@ -328,10 +333,31 @@ Three backends behind the same surface, selected by `backend="auto"`: **nedbd ov
 `dag_tmk=` for AES-256-GCM at rest), or the **v1 in-process AOF** engine as a universal fallback. On the
 DAG backend you also get `tip()`, `tip_collection()`, `since()` (changefeed) and `scan_status()`.
 
-### 🟢 MIT licensed since 3.0.0
+### Licensing — BUSL-1.1 as of 4.0.0
 
-No production restriction, no copyleft, no Change Date. Use it in production, embed it commercially,
-ship it closed-source, fork it, sell it. License review is a wall, not a speed bump — that wall is gone.
+| Your annual revenue | Production use |
+|---|---|
+| **under USD $1,000,000** | **free.** No permission, no royalty, no registration. Commercial, embedded and closed-source all included. |
+| **USD $1,000,000 or more** | needs an additional use grant — **licensing@interchained.org** |
+
+Measured on your whole organisation, not on revenue attributable to NEDB. Non-production use —
+development, testing, CI, evaluation, research, teaching — is unrestricted for **everyone**, at any
+revenue. Offering NEDB itself as a hosted database service needs a separate commercial license
+regardless of revenue.
+
+**Change Date 2030-09-11**: this version becomes **Apache 2.0** on that date, automatically. The
+grant is in the license text, not a promise — nobody has to be asked, and it cannot be withdrawn.
+The full Apache text ships as [`COPYING-APACHE-2.0.txt`](COPYING-APACHE-2.0.txt) so that is
+verifiable from the source tree alone.
+
+Every source file carries `SPDX-License-Identifier: BUSL-1.1`, so license scanners read the terms
+out of the code rather than guessing. Dependencies keep their own licenses — the Change License
+never relicenses them — and they are inventoried in [`THIRD_PARTY.md`](THIRD_PARTY.md). There is
+**no GPL, AGPL, SSPL or BUSL third-party dependency** in the tree; all 206 third-party crates are
+permissive, and the two Python runtime dependencies are BSD and Apache.
+
+**Versions 3.0.0 – 3.3.1 stay MIT, irrevocably.** If you already have NEDB at 3.3.1 or earlier, your
+rights in that copy are untouched. This applies to 4.0.0 and later only.
 
 ### Also in 3.2.0
 
