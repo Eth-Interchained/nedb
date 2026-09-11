@@ -325,10 +325,28 @@ jobs:
       # prefix desynchronises the stream and the client HANGS, which no unit
       # test would notice. psycopg2 is libpq, so if this passes then psql,
       # DBeaver, Metabase and Grafana can read a NEDB store too.
-      - name: Postgres read endpoint (psycopg2 / libpq)
+      - name: Postgres endpoint — simple protocol (psycopg2 / libpq)
         run: |
           pip install psycopg2-binary
           python3 tests/test_pgwire.py
+
+      # The EXTENDED query protocol, driven by the drivers that only speak it.
+      #
+      # psycopg2 interpolates parameters client-side, so the suite above only
+      # ever exercises the simple protocol. psycopg3, asyncpg and JDBC send
+      # Parse/Bind/Describe/Execute for every parameterised statement — before
+      # that was implemented, none of them could run a single query. Both
+      # drivers are installed here rather than skipped, because "it would work
+      # if you had the driver" is not a test result.
+      #
+      # asyncpg is the strict one: it declares no parameter types, asks the
+      # server, and REFUSES the call client-side if the answer is wrong. So this
+      # tier also covers the schemaless type inference, which cannot be checked
+      # from a unit test.
+      - name: Postgres endpoint — extended protocol (psycopg3 + asyncpg)
+        run: |
+          pip install 'psycopg[binary]' asyncpg
+          python3 tests/test_pgwire_extended.py
 
       - name: Run daemon-backed suites
         env:

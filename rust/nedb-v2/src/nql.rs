@@ -870,11 +870,19 @@ fn aggregate_rows(rows: &[Node], spec: &Aggregate) -> Vec<Value> {
     const WHOLE: &str = "";
 
     for node in rows {
+        // Resolved through `field_value`, not `node.data`, so the `_`-prefixed
+        // metadata fields work here too. Reading the payload directly made
+        // `SELECT MAX(_seq)` return NULL — with a 200 and a plausible-looking
+        // single-row answer — even though `SELECT _seq` listed the values and
+        // `WHERE _seq > 5` filtered on them. "What is the newest sequence?" is
+        // the question replication and time travel are built on, so a silent
+        // null there was the worst shape of wrong.
         let key = match spec.group_field {
             None => WHOLE.to_string(),
-            Some(ref gf) => node.data.get(gf)
-                .map(as_text)
-                .unwrap_or_else(|| "null".to_string()),
+            Some(ref gf) => match field_value(node, gf) {
+                Value::Null => "null".to_string(),
+                v => as_text(&v),
+            },
         };
         let entry = groups.entry(key.clone()).or_insert_with(|| {
             order.push(key.clone());
@@ -884,17 +892,14 @@ fn aggregate_rows(rows: &[Node], spec: &Aggregate) -> Vec<Value> {
         if let Some(ref af) = spec.agg_field {
             // A JSON bool is not a number here, matching Python's
             // `isinstance(x, (int, float)) and not isinstance(x, bool)`.
-            match node.data.get(af) {
-                Some(Value::Number(n)) => {
-                    if let Some(i) = n.as_i64() {
-                        entry.ints.push(i);
-                        entry.nums.push(i as f64);
-                    } else if let Some(f) = n.as_f64() {
-                        entry.all_int = false;
-                        entry.nums.push(f);
-                    }
+            if let Value::Number(n) = field_value(node, af) {
+                if let Some(i) = n.as_i64() {
+                    entry.ints.push(i);
+                    entry.nums.push(i as f64);
+                } else if let Some(f) = n.as_f64() {
+                    entry.all_int = false;
+                    entry.nums.push(f);
                 }
-                _ => {}
             }
         }
     }
@@ -2745,6 +2750,39 @@ mod tests {
         let (avgs, _) = query(&db, "FROM items GROUP BY cat AVG price").unwrap();
         assert_eq!(group(&avgs, "cat", "x")["avg_price"], json!(5.0));
         assert_eq!(group(&avgs, "cat", "y")["avg_price"], json!(20.0));
+    }
+
+    /// An aggregate over a `_`-prefixed metadata field must see it.
+    ///
+    /// `_seq` lives on the node, not in its data payload, and the aggregator
+    /// read the payload directly — so `MAX _seq` answered NULL while
+    /// `SELECT _seq` listed the values and `WHERE _seq > 5` filtered on them.
+    /// It was also a live divergence: the Python engine builds its groups from
+    /// projected dicts that already carry `_seq`, and answers correctly.
+    ///
+    /// "What is the newest sequence?" is the question replication and time
+    /// travel are built on, so a confident null there is the worst shape of
+    /// wrong answer this engine can give.
+    #[test]
+    fn aggregates_see_node_metadata_not_only_the_payload() {
+        let (_tmp, db) = setup_items();
+        let (all, _) = query(&db, "FROM items").unwrap();
+        let want = all.iter().filter_map(|r| r.get("_seq")?.as_i64()).max().unwrap();
+
+        let (rows, _) = query(&db, "FROM items MAX _seq").unwrap();
+        assert_eq!(rows[0]["max__seq"], json!(want),
+                   "MAX _seq must equal the highest sequence in the result");
+        assert_ne!(rows[0]["max__seq"], Value::Null, "a null here is a silent wrong answer");
+
+        let (rows, _) = query(&db, "FROM items MIN _seq").unwrap();
+        assert_eq!(rows[0]["min__seq"], json!(
+            all.iter().filter_map(|r| r.get("_seq")?.as_i64()).min().unwrap()));
+
+        // Grouping by a metadata field works through the same resolver.
+        let (rows, _) = query(&db, "FROM items GROUP BY _seq COUNT").unwrap();
+        assert_eq!(rows.len(), all.len(), "one group per distinct sequence");
+        assert!(rows.iter().all(|r| r["_seq"] != Value::Null),
+                "the group key must be the sequence, not null");
     }
 
     /// Output key parity: Python's engine.py emits `<agg>_<field>` and a

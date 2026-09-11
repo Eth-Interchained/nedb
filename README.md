@@ -133,7 +133,7 @@ this door must never mutate anything.
 
 ```console
 $ nedbd --data ./data --pg-port 5433
-  pgwire   postgres READ endpoint on 127.0.0.1:5433 — psql / DBeaver / psycopg (SELECT only)
+  pgwire   postgres endpoint on 127.0.0.1:5433 — psql / DBeaver / psycopg (SELECT + INSERT/UPDATE/DELETE)
 
 $ psql -h 127.0.0.1 -p 5433 -d shop
 shop=> SELECT status, total FROM orders WHERE status IN ('paid','open') ORDER BY total DESC;
@@ -192,12 +192,56 @@ there is no declared column order to infer. Values must be literals — a number
 a quoted string, `TRUE`/`FALSE`/`NULL` — since storing an unevaluated
 expression as text would be worse than refusing it.
 
-Two limits worth stating plainly: the **simple query protocol** is implemented
-(what `psql` and libpq's `PQexec` use), while the extended protocol
-(`Parse`/`Bind`/`Execute`) returns a clear error rather than hanging — so
-psycopg3's default mode is not yet supported. And the connection is
-**cleartext**, which is why the endpoint is off unless you pass `--pg-port` and
-binds to loopback by default. Put it behind a tunnel to go further.
+### Your driver, not just `psql`
+
+**Both wire protocols are implemented**, which is the difference between "psql
+works" and "your application framework works":
+
+| Protocol | Used by | Status |
+| --- | --- | --- |
+| simple (`Q`) | `psql`, libpq/`PQexec`, **psycopg2** | ✅ |
+| extended (`Parse`/`Bind`/`Describe`/`Execute`) | **psycopg3**, **asyncpg**, **JDBC** | ✅ |
+
+Those last three send `Parse`/`Bind` for every parameterised statement, so
+until the extended protocol landed they could not run a *single* query — not
+slower, not degraded: psycopg3 hung and asyncpg refused outright.
+
+```python
+# psycopg3 — parameters are bound server-side
+cur.execute("SELECT _id, total FROM orders WHERE status = %s AND total > %s",
+            ("paid", 100))
+
+# asyncpg — same statement, same endpoint
+await conn.fetch("SELECT _id, total FROM orders WHERE status = $1 AND total > $2",
+                 "paid", 100)
+```
+
+Parameters arrive in text **and binary** format (psycopg3 sends a small `int`
+as binary int2, a float as binary float8), and a row-capped `Execute` suspends
+its portal, so a JDBC `setFetchSize` pages a large result instead of stalling.
+
+**Typing parameters in a store with no schema** is the interesting part. A
+relational server reads `$1`'s type out of its catalogue; NEDB has no
+catalogue, so the type is sampled from the documents already stored — the
+stored data *is* the schema. Where a placeholder sits in a clause rather than
+beside a column (`AS OF SYSTEM TIME $1`, `LIMIT $1`) the grammar supplies the
+type, and an aggregate is typed from what it means: a `COUNT` is an integer, an
+`AVG` fractional, a `MAX` whatever the field it ranges over is.
+
+A driver that declares its own parameter types is believed, and only its
+unspecified slots are inferred.
+
+### Limits, stated plainly
+
+SQL-level cursors (`DECLARE`/`FETCH`) and `pg_catalog` introspection are not
+implemented, so `\dt` and DBeaver's schema browser come back empty — both are
+refused by name rather than hanging. A column whose stored values disagree
+about their type across documents is advertised as `text`, and cannot be sent
+in binary format.
+
+And the connection is **cleartext**, which is why the endpoint is off unless
+you pass `--pg-port` and binds to loopback by default. Put it behind a tunnel
+to go further.
 
 Verified in CI by `tests/test_pgwire.py` — **64 checks driven through psycopg2,
 which is libpq**. Unit tests can prove the translation; only a real client
