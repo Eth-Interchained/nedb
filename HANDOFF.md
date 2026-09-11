@@ -339,8 +339,19 @@ Non-production use is unrestricted for everyone.
 copies already distributed, and the LICENSE says so explicitly. 4.0.0 and later
 only.
 
-Every source file carries `SPDX-FileCopyrightText: 2026 INTERCHAINED LLC` and
-`SPDX-License-Identifier: BUSL-1.1` — 120 of 120 tracked first-party sources.
+Every source file carries a three-line header — **120 of 120** tracked
+first-party sources:
+
+```
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+```
+
+**120, not 141.** A raw `find` reports 141 because it double-counts the
+gitignored maturin staging copy of `python/nedb` (29 files, recreated on every
+build) and omits the 8 tracked `.js`/`.ts` files. 141 − 29 + 8 = 120. Use
+`git ls-files`, excluding `rust/crates/nedb-py/python/` and `.d.ts`.
 That matters more than it looks: scanners (`reuse lint`, `cargo-deny`,
 `pip-licenses`, FOSSA, Snyk) read the identifier out of the FILE. A repo whose
 LICENSE says BUSL-1.1 while its sources say nothing reads as **UNKNOWN**, and

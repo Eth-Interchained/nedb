@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
 // SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
 
 // test/wrap_family.test.mjs — live proof for the JS wrap adapter family.
 //

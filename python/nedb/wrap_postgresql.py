@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
 # SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
 
 """
 nedb.wrap_postgresql — wrap an existing psycopg/DB-API connection with NEDB's layer-2.
