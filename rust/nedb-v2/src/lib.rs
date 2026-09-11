@@ -27,6 +27,7 @@ pub mod db;
 pub mod exit;
 pub mod nql;
 pub mod pgwire;
+pub mod pgcatalog;
 #[cfg(feature = "cast")]
 pub mod cast;
 pub mod server;

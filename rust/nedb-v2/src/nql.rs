@@ -1570,6 +1570,64 @@ pub fn query(db: &Db, nql: &str) -> Result<(Vec<Value>, usize)> {
     Ok((rows, count))
 }
 
+/// Run a query's WHERE / ORDER BY / OFFSET / LIMIT against rows ALREADY IN
+/// HAND, rather than against stored documents.
+///
+/// This is what makes `pg_catalog` and `information_schema` real queryable
+/// tables instead of pattern-matched query strings. A catalogue row is
+/// synthesised from the live database, never stored — but `psql` filters and
+/// orders it with ordinary SQL, so it needs the ordinary predicate surface.
+///
+/// The alternative was to recognise psql's exact query text and answer it from
+/// a fixed table. That breaks SILENTLY the moment psql changes its query, and
+/// an empty table list is indistinguishable from "this database has no
+/// tables" — the same class of confidently-wrong answer as everything else
+/// this engine has had to fix. So the predicate engine is REUSED here rather
+/// than a second, poorer copy being written: one `eval_pred_with`, one
+/// `sort_by_keys`, one `paginate`, already tested.
+///
+/// Clauses that only mean something against the log — `AS OF`, `VALID AS OF`,
+/// `TRACE`, `TRAVERSE`, `SEARCH`, and aggregates — are REFUSED by name. A
+/// catalogue has no history and no causal edges; silently ignoring the clause
+/// would answer a time-travel question with present-day rows.
+pub fn query_rows(rows: Vec<Value>, nql: &str) -> Result<Vec<Value>> {
+    let q = parse(nql)?;
+
+    for (unsupported, clause) in [
+        (q.as_of.is_some(), "AS OF"),
+        (q.valid_as_of.is_some(), "VALID AS OF"),
+        (q.trace.is_some(), "TRACE"),
+        (q.traverse.is_some(), "TRAVERSE"),
+        (q.search.is_some(), "SEARCH"),
+        (q.aggregate.is_some(), "an aggregate"),
+        (q.having.is_some(), "HAVING"),
+    ] {
+        if unsupported {
+            bail!("{} is not supported on the catalogue table {:?} — a catalogue \
+                   is synthesised from the current database, so it has no history, \
+                   no causal edges and nothing to aggregate. Query the collection \
+                   itself for those", clause, q.coll);
+        }
+    }
+
+    let get = |row: &Value, field: &str| -> Value {
+        row.get(field).cloned().unwrap_or(Value::Null)
+    };
+
+    let mut kept: Vec<Value> = match &q.where_ {
+        None => rows,
+        Some(pred) => rows
+            .into_iter()
+            .filter(|r| eval_pred_with(&|f| get(r, f), pred))
+            .collect(),
+    };
+
+    if !q.order_by.is_empty() {
+        sort_by_keys(&mut kept, &q.order_by, get);
+    }
+    Ok(paginate(kept, q.offset, q.limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
