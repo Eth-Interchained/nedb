@@ -63,16 +63,29 @@ jobs:
       - name: Install optional extras the suites exercise
         # pycryptodome: encryption-at-rest (test_crypto).
         # fakeredis: lets test_wrap_redis run for real instead of self-skipping.
-        run: pip install pycryptodome fakeredis
+        #
+        # pgserver + psycopg2: a REAL PostgreSQL server for the automatic
+        # shadowing suite. `wrap_postgresql` is an audit layer FOR Postgres —
+        # verifying it only against a mock is not verifying it. Without these
+        # the suite self-skips its Postgres half, and a self-skipping test is
+        # indistinguishable from a passing one, which is the whole failure
+        # mode that suite exists to catch.
+        run: pip install pycryptodome fakeredis pgserver psycopg2-binary
       - name: Run dependency-free suites
         env:
           PYTHONPATH: ${{ github.workspace }}/python
+          # test_wrap_autoshadow must FAIL rather than skip if the real
+          # PostgreSQL server is missing here — the extras above install it, so
+          # a skip means the install broke, and a silent skip would report
+          # green on an untested audit layer.
+          NEDB_REQUIRE_PG: "1"
         run: |
           set -uo pipefail
           fail=0
           for t in test_nedb test_bitemporal test_causal test_concurrent \
                    test_crypto test_deploy test_proof test_v050 \
                    test_wrap_redis test_adapters test_wrap_sqlite_shadow \
+                   test_wrap_autoshadow \
                    test_nql_predicates test_nql_shaping \
                    test_backcompat test_dag_preserved; do
             echo "::group::$t"
