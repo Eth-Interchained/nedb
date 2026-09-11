@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 nedb.wrap_mongo — wrap an existing PyMongo connection/collection with NEDB's layer-2.
 

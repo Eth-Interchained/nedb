@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """v0.5.0 feature tests: snapshots, TTL, GROUP BY"""
 import os, sys, shutil, tempfile, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))

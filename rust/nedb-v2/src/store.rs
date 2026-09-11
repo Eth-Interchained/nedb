@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Content-addressed object store — the foundation of NEDB v2.
 //!
 //! Every document version is stored as an immutable, encrypted, BLAKE2b-hashed

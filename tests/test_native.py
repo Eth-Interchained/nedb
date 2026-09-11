@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 NEDB native core test suite.
 Tests nedb._native (the Rust/PyO3 NedbCore binding) directly, then verifies

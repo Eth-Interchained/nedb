@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 nedb.index — secondary indexes: equality (hash), ordered (bisect), full-text (inverted).
 

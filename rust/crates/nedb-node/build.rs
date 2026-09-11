@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 fn main() {
     // napi-rs supports MSVC only on Windows. Its setup() calls
     // windows::setup_gnu() whenever CARGO_CFG_TARGET_ENV == "gnu", and that

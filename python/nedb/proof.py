@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 nedb.proof — Merkle inclusion proofs for the hash-chained op log.
 

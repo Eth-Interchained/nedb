@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Automatic v1 → v2 DAG migration.
 //!
 //! When a database directory contains `log.aof` (v1 format), this module

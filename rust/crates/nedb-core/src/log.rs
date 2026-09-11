@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The append-only, hash-chained, nonce-enforced, idempotent operation log.
 //!
 //! This is the single source of truth. Replay protection (strictly-monotonic

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 nedb.wrap_sqlite — wrap an existing SQLite database with NEDB's layer-2.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Natural-language query planning — the `cast` feature.
 //!
 //! Turns a short English prompt into NQL using `nedb-cast-slm`, a 3.34M-parameter

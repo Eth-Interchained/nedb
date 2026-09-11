@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // nedb-inspector — test suite. Run: node --test test/inspector.test.mjs
 //
 // Exercises the deterministic analyzer: durable-open detection, flush-on-exit

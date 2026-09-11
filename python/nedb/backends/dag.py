@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 nedb.backends.dag — embedded v2/v3 DAG backend for the wrap_* surface.
 

@@ -339,6 +339,23 @@ Non-production use is unrestricted for everyone.
 copies already distributed, and the LICENSE says so explicitly. 4.0.0 and later
 only.
 
+Every source file carries `SPDX-FileCopyrightText: 2026 INTERCHAINED LLC` and
+`SPDX-License-Identifier: BUSL-1.1` — 120 of 120 tracked first-party sources.
+That matters more than it looks: scanners (`reuse lint`, `cargo-deny`,
+`pip-licenses`, FOSSA, Snyk) read the identifier out of the FILE. A repo whose
+LICENSE says BUSL-1.1 while its sources say nothing reads as **UNKNOWN**, and
+in a procurement review "unknown" is worse than "restrictive" — a restrictive
+license can be approved by exception, an unknown one cannot be approved at all.
+
+The Change License text ships as `COPYING-APACHE-2.0.txt` so the 2030 grant is
+verifiable from the source tree. Dependencies are inventoried in
+`THIRD_PARTY.md`, generated from real `cargo metadata` and installed-package
+metadata rather than by hand — **the Change License never relicenses
+dependencies**, so that inventory is a permanent obligation, not a snapshot.
+Regenerate it whenever the dependency graph moves; the command is in the file.
+Current state: 206 third-party crates, **zero copyleft obligations**, no GPL /
+AGPL / SSPL / BUSL inbound.
+
 For context when this comes up: CockroachDB's free tier is gated at **$10M**
 revenue *and* requires telemetry. Our $1M threshold with no telemetry is a
 deliberate choice of Mark's, taken knowing that comparison. **This is a

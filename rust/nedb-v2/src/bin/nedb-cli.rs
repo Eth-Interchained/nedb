@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! `nedb-cli` — the engine's companion CLI/sidecar for a NEDB v2 store on disk.
 //!
 //! `nedbd` *serves* a store over HTTP; `nedb-cli` operates on a store directory

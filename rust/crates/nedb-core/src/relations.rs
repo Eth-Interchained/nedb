@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // nedb-core — first-class, time-travel-aware relations (the graph layer).
 //
 // Relations are stored as adjacency lists for O(1) traversal. Each edge records

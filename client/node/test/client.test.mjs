@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 /**
  * The PUBLISHED npm client — `nedb-engine-client` — against a real nedbd.
  *

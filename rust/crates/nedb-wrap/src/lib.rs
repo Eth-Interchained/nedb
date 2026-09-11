@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! nedb-wrap — embed NEDB causal provenance into the databases you already run (Rust).
 //!
 //! The Rust leg of the wrap adapter family. Where the Python and JS wrappers

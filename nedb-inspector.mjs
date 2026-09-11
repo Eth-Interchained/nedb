@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // nedb-inspector — deterministic embedder-code checker for NEDB durability.
 //
 //   nedb-inspector.mjs <pathToTarget.(rs|js|mjs|ts|py)> [more paths...]

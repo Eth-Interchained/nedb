@@ -51,6 +51,14 @@ Additional Use Grant: You may make production use of the Licensed Work,
 Change Date:          2030-09-11
 
 Change License:       Apache License, Version 2.0
+                      The full text ships in this repository as
+                      COPYING-APACHE-2.0.txt, so the grant is verifiable from
+                      the source tree alone.
+
+                      The Change License relicenses the Licensed Work's OWN
+                      source. It does not relicense third-party dependencies,
+                      which keep their own terms — inventoried in
+                      THIRD_PARTY.md.
 
 -----------------------------------------------------------------------------
 

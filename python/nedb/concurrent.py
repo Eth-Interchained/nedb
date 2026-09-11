@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 nedb.concurrent — make a NEDB database safe AND fast under many concurrent clients,
 without a global lock.

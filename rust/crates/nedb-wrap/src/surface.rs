@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The layer-2 surface — register → backfill → shadow → full NEDB API.
 //!
 //! Embeds a `nedb_engine::Db` (the v2/v3 DAG core) and mirrors the Python/JS

@@ -347,6 +347,14 @@ regardless of revenue.
 
 **Change Date 2030-09-11**: this version becomes **Apache 2.0** on that date, automatically. The
 grant is in the license text, not a promise — nobody has to be asked, and it cannot be withdrawn.
+The full Apache text ships as [`COPYING-APACHE-2.0.txt`](COPYING-APACHE-2.0.txt) so that is
+verifiable from the source tree alone.
+
+Every source file carries `SPDX-License-Identifier: BUSL-1.1`, so license scanners read the terms
+out of the code rather than guessing. Dependencies keep their own licenses — the Change License
+never relicenses them — and they are inventoried in [`THIRD_PARTY.md`](THIRD_PARTY.md). There is
+**no GPL, AGPL, SSPL or BUSL third-party dependency** in the tree; all 206 third-party crates are
+permissive, and the two Python runtime dependencies are BSD and Apache.
 
 **Versions 3.0.0 – 3.3.1 stay MIT, irrevocably.** If you already have NEDB at 3.3.1 or earlier, your
 rights in that copy are untouched. This applies to 4.0.0 and later only.

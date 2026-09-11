@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! DAG edge store — typed directed edges between node hashes.
 //!
 //! Layout: `graph/{from_hash}/{edge_type}/{to_hash}`

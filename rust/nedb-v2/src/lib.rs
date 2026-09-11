@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! NEDB v2 — Content-addressed DAG storage engine.
 //!
 //! Architecture:

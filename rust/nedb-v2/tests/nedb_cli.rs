@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Integration tests for the `nedb-cli` binary. Builds a real store via the lib,
 //! then drives the compiled CLI as a subprocess and checks its behavior.
 //!

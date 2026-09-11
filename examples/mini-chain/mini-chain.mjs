@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // NEDB Mini-Chain — a runnable micro case-study for nedb-engine.
 //
 //   node mini-chain.mjs [blockCount]

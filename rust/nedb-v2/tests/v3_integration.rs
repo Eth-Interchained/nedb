@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! NEDB v3 integration tests — Db-level behavior of the segment substrate.
 //!
 //! These exercise the public `Db` API end to end: v3 write/read/reopen,

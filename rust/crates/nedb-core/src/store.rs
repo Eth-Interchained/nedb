@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! MVCC versioned store with time-travel. Each key holds an ascending vector of
 //! `(seq, Option<Value>)` versions (`None` is a tombstone). Reads at HEAD take the
 //! last version; `as_of` reads take the newest version with `seq <= as_of`.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+
 """
 test_wrap_redis_nedbd.py — Integration tests for wrap_redis() in nedbd mode.
 

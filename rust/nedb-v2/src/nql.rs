@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! NQL (NEDB Query Language) parser and executor for v2 DAG storage.
 //!
 //! Grammar:

@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // nedbd-v2 — thin platform shim that locates and spawns the right
 // pre-built native binary for the current platform/arch.
 //

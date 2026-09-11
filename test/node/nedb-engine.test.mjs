@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // nedb-engine — Node/napi binding test suite
 // Run: node --test nedb-engine.test.mjs
 //

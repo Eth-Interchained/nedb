@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! A PostgreSQL wire-protocol endpoint for NEDB — reads **and** writes.
 //!
 //! # What this is

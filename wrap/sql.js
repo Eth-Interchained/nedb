@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 'use strict';
 // nedb/wrap/sql.js — wrapSqlite / wrapMysql / wrapPg: causal provenance for
 // SQL databases (JS).

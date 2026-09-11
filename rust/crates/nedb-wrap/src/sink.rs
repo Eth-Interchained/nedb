@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! [`WrapSink`] — the redis-feature adapter: record pipelined write commands
 //! into the DAG after they succeed.
 //!

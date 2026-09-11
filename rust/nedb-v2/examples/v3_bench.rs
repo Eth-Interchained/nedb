@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 //! NEDB v3 benchmark — v2 loose objects vs v3 segment packs, head to head.
 //!
 //! Run it:

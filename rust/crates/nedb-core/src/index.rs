@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+
 // nedb-core — secondary indexes: equality, ordered, sorted, and full-text search.
 //
 // - Eq:      HashMap<field_value_as_string, HashSet<key>> — O(1) equality lookup.
