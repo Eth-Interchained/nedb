@@ -562,9 +562,52 @@ Filterable metadata fields: `_id`, `_coll`, `_hash`, `_seq`.
 genuine conjunct. Under an `OR` it cannot constrain the result set, so the
 planner correctly declines the fast path there.
 
-> **Predicates over NULL follow SQL's three-valued logic.** `LIKE` on a
-> missing or null field is false in *both* polarities, so a null row appears in
-> neither `LIKE` nor `NOT LIKE`. Use `IS NULL` to select those rows explicitly.
+### Indexes
+
+`=`, `IN (...)`, `BETWEEN` and the one-sided inequalities are served from a
+sorted index when one covers the field, turning a full collection scan into a
+bounded range walk:
+
+```python
+db.create_index("blocks", "height", "sorted")
+db.query("FROM blocks WHERE height BETWEEN 600000 AND 600100")
+```
+
+Measured on 20,000 rows with `scripts/bench_index_range.py` — two identical
+databases, one indexed, one not:
+
+| Query | Scan | Indexed | Speedup |
+| --- | --- | --- | --- |
+| `WHERE fee = 10000` | 137 ms | 0.01 ms | 17,000× |
+| `WHERE fee IN (a, b, c)` | 185 ms | 0.02 ms | 9,700× |
+| `WHERE fee BETWEEN …` (1% of rows) | 186 ms | 1.1 ms | 170× |
+| `WHERE fee BETWEEN …` (10% of rows) | 188 ms | 13 ms | 14× |
+| unindexed field (control) | 188 ms | 187 ms | 1.0× |
+
+The planner asks the index how many rows each candidate range covers and takes
+the narrowest, so `WHERE region = "eu" AND height BETWEEN 600000 AND 600001`
+uses the height index rather than whichever field it saw first. Same-field
+bounds are merged, so `height > 100 AND height < 200` is one walk.
+
+An index is only ever used to NARROW candidates — the full predicate is
+re-evaluated on whatever comes back, so the answer never depends on whether an
+index exists. Three cases deliberately decline it:
+
+- **`IS NULL`.** A document whose field is absent is not in that field's
+  index, so an index scan would return the exact complement of the answer.
+- **Anything under `OR` or `NOT`.** A disjunct does not constrain the result
+  set; narrowing on one arm would silently drop the rows the other arm matched.
+- **`AS OF`.** The sorted index holds current versions only (a superseded hash
+  is dropped on overwrite), so it cannot answer a historical query.
+
+> **Predicates over NULL follow SQL's three-valued logic.** An ordering
+> comparison (`<` `<=` `>` `>=`, and therefore `BETWEEN`) against a missing or
+> null field is never true — `WHERE fee < 5` will not return a row that has no
+> `fee` at all. `LIKE` is false in *both* polarities, so a null row appears in
+> neither `LIKE` nor `NOT LIKE`. `=` and `!=` do operate on null, so
+> `WHERE fee = NULL` selects rows where the field is absent or null, and
+> `WHERE fee != 5` includes them. Use `IS NULL` / `IS NOT NULL` to test
+> presence explicitly.
 
 ### Unknown clauses are errors
 

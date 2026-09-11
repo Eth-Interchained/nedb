@@ -369,7 +369,8 @@ if nedb.__has_native__:
         for rows, valid, nql in CASES:
             a = norm(py_mk(rows, valid=valid)(nql))
             b = norm(rust_mk(rows, valid=valid)(nql))
-            check(f"parity: {nql}", a == b, f"\n      python {a}\n      rust   {b}")
+            check(f"parity: {nql}", a == b,
+                  "" if a == b else f"\n      python {a}\n      rust   {b}")
 
         native = True
     finally:

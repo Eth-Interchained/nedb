@@ -72,6 +72,14 @@ CORPUS = [
     # provenance
     "FROM effects TRACE caused_by",
     "FROM causes TRACE caused_by REVERSE",
+    # ordering comparisons against a SPARSE column — `miner` is absent on doc 4
+    # and explicitly null on doc 5.
+    'FROM jobs WHERE miner < "zzz"',
+    'FROM jobs WHERE miner <= "zzz"',
+    'FROM jobs WHERE miner > "A"',
+    'FROM jobs WHERE miner >= "A"',
+    'FROM jobs WHERE miner != "Zenith"',
+    "FROM jobs WHERE fee < 100",
 ]
 
 def wait(port, tries=30):

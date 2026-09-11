@@ -76,6 +76,16 @@ LEGACY_IDS = [
     ('FROM jobs WHERE status = "nope"',                    []),
     ("FROM jobs WHERE fee > 9999",                         []),
     ('FROM jobs WHERE _coll = "jobs"',                     ["1", "2", "3", "4", "5"]),
+    # Ordering comparisons against a SPARSE column. `miner` is absent on doc 4
+    # and explicitly null on doc 5; neither may satisfy an ordering test. See
+    # INTENTIONAL_CHANGES #3 — v3.2.2's Rust engine returned all five here for
+    # `<` and `<=` while returning three for `>` and `>=`.
+    ('FROM jobs WHERE miner < "zzz"',                      ["1", "2", "3"]),
+    ('FROM jobs WHERE miner <= "zzz"',                     ["1", "2", "3"]),
+    ('FROM jobs WHERE miner > "A"',                        ["1", "2", "3"]),
+    ('FROM jobs WHERE miner >= "A"',                       ["1", "2", "3"]),
+    # = and != still operate on null, unchanged from v3.2.2.
+    ('FROM jobs WHERE miner != "Zenith"',                  ["1", "2", "4", "5"]),
 ]
 
 # (query, expected fee ordering) — ORDER BY / LIMIT semantics.
@@ -104,6 +114,23 @@ INTENTIONAL_CHANGES = """
    field the engine itself emits should never silently answer "nothing", so
    this is a fix — but it does turn an empty answer into a populated one, and
    that is worth stating plainly.
+
+3. ORDERING COMPARISONS AGAINST A MISSING FIELD, in the Rust engine only.
+   Its OrderedValue sorts Null below every number, so `<` and `<=` reported
+   that a document with NO `fee` field satisfied `WHERE fee < 5`, while `>`
+   and `>=` excluded it. The asymmetry was the tell. The Python reference has
+   always excluded it in all four (query.py places its `if a is None: return
+   False` guard deliberately after the = and != arms), so this was a live
+   cross-engine divergence as well as a wrong answer — asking for cheap jobs
+   should not return jobs with no price.
+
+   It also had to be fixed for the indexed range scan to be correct at all: a
+   document whose field is absent is not in that field's sorted index, so the
+   scan path and the index path would otherwise answer the same query
+   differently depending on whether an index happened to exist.
+
+   Verified against v3.2.2: only `<` and `<=` changed. `>`, `>=`, `=`, `!=`
+   and BETWEEN are byte-identical.
 """
 
 

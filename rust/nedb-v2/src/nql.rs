@@ -663,6 +663,29 @@ fn field_value(node: &Node, field: &str) -> Value {
 }
 
 fn cmp_op(a: &Value, op: &str, b: &Value) -> bool {
+    // An ORDERING comparison against a null/missing field is never true.
+    //
+    // OrderedValue sorts Null below every number, so `<` and `<=` used to
+    // report that a document with NO `fee` field at all satisfied
+    // `WHERE fee < 5`. `>` and `>=` excluded it — the asymmetry was the tell.
+    //
+    // The Python reference has always excluded it (query.py: `if a is None:
+    // return False`, placed deliberately AFTER the = / != arms), so this was
+    // a live divergence between the two engines as well as a wrong answer:
+    // asking for cheap jobs should not return jobs with no price.
+    //
+    // `=` and `!=` keep operating on null, exactly as Python does, so
+    // `WHERE x != 5` still matches a row where x is absent and `WHERE x = NULL`
+    // still works. `BETWEEN` is built from `>=` and `<=` and so inherits this.
+    //
+    // This also makes the scan path and the sorted-index path agree. A
+    // document whose field is absent is not in that field's index, so an index
+    // range scan could never have returned it — without this fix the two paths
+    // answered the same query differently depending on whether an index
+    // happened to exist.
+    if matches!(op, "<" | "<=" | ">" | ">=") && a.is_null() {
+        return false;
+    }
     let a = OrderedValue::from(a);
     let b = OrderedValue::from(b);
     match op {
@@ -937,6 +960,186 @@ fn aggregate_rows(rows: &[Node], spec: &Aggregate) -> Vec<Value> {
 /// the height matches — so treating it as a point lookup would silently drop
 /// rows. That is precisely the bug the pre-existing `where_order_limit` test
 /// guards against in the ORDER BY path, one level up.
+/// What an indexed field can be narrowed to, derived from the predicate.
+#[derive(Debug, Clone)]
+enum IndexPlan {
+    /// A bounded (or half-bounded) range walk over the sorted index.
+    Range {
+        field: String,
+        low: Option<Value>,
+        high: Option<Value>,
+        low_incl: bool,
+        high_incl: bool,
+    },
+    /// A set of point lookups — `=` or `IN (...)`.
+    Values { field: String, values: Vec<Value> },
+}
+
+impl IndexPlan {
+    fn field(&self) -> &str {
+        match self {
+            IndexPlan::Range { field, .. } => field,
+            IndexPlan::Values { field, .. } => field,
+        }
+    }
+}
+
+/// Collect every constraint an AND-reachable conjunct places on a field.
+///
+/// SAFETY PROPERTY that makes this whole path sound: the returned plan only
+/// ever needs to describe a SUPERSET of the matching rows. The full predicate
+/// is re-evaluated on whatever candidates come back, so an imprecise plan
+/// costs time, never correctness. That is why it is fine to ignore constraints
+/// this planner does not understand.
+///
+/// Only descends through `And`. A constraint under an `Or` does not restrict
+/// the result set — `WHERE fee > 100 OR status = "open"` must still return the
+/// status matches — so narrowing on one arm would silently drop rows. `Not` is
+/// likewise never entered: a negated range is not a range.
+fn collect_index_constraints(pred: &Pred, out: &mut Vec<IndexPlan>) {
+    match pred {
+        Pred::And(terms) => {
+            for t in terms {
+                collect_index_constraints(t, out);
+            }
+        }
+
+        Pred::Cmp { field, op, value } => {
+            // `_id` has its own O(1) path and is not in the sorted index.
+            if field == "_id" {
+                return;
+            }
+            match op.as_str() {
+                "=" => out.push(IndexPlan::Values {
+                    field: field.clone(),
+                    values: vec![value.clone()],
+                }),
+                ">" | ">=" => out.push(IndexPlan::Range {
+                    field: field.clone(),
+                    low: Some(value.clone()),
+                    high: None,
+                    low_incl: op == ">=",
+                    high_incl: true,
+                }),
+                "<" | "<=" => out.push(IndexPlan::Range {
+                    field: field.clone(),
+                    low: None,
+                    high: Some(value.clone()),
+                    low_incl: true,
+                    high_incl: op == "<=",
+                }),
+                // `!=` matches almost everything; a range walk would be
+                // slower than the scan it replaces.
+                _ => {}
+            }
+        }
+
+        Pred::Between { field, low, high, negated: false } => {
+            out.push(IndexPlan::Range {
+                field: field.clone(),
+                low: Some(low.clone()),
+                high: Some(high.clone()),
+                low_incl: true,   // SQL BETWEEN is inclusive on both ends
+                high_incl: true,
+            });
+        }
+
+        Pred::In { field, values, negated: false } => {
+            out.push(IndexPlan::Values {
+                field: field.clone(),
+                values: values.clone(),
+            });
+        }
+
+        // NOT IN / NOT BETWEEN / LIKE / IS NULL cannot be served by a range
+        // walk: they either match the complement of a range, or they are not
+        // an ordering predicate at all. IS NULL specifically can NEVER use
+        // this index — a document whose field is absent is not in the index,
+        // so an index scan would return the exact opposite of the answer.
+        _ => {}
+    }
+}
+
+/// Merge same-field constraints and choose the most selective indexed plan.
+///
+/// `fee > 10 AND fee < 100` becomes ONE bounded walk rather than a half-open
+/// one, and when several fields are indexed the planner asks the index how
+/// many rows each range covers and takes the narrowest — rather than
+/// committing to whichever field it happened to see first.
+fn choose_index_plan(db: &Db, coll: &str, pred: &Pred) -> Option<IndexPlan> {
+    let mut raw = vec![];
+    collect_index_constraints(pred, &mut raw);
+    raw.retain(|p| db.has_sorted_index(coll, p.field()));
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Merge per field.
+    let mut merged: Vec<IndexPlan> = vec![];
+    for plan in raw {
+        let field = plan.field().to_string();
+        let existing = merged.iter().position(|m| m.field() == field);
+        match (existing, plan) {
+            (None, p) => merged.push(p),
+
+            // Two ranges on the same field: intersect the bounds.
+            (Some(i), IndexPlan::Range { low, high, low_incl, high_incl, .. }) => {
+                if let IndexPlan::Range {
+                    low: ref mut elow, high: ref mut ehigh,
+                    low_incl: ref mut eli, high_incl: ref mut ehi, ..
+                } = merged[i] {
+                    if let Some(l) = low {
+                        let tighter = match elow {
+                            None => true,
+                            Some(cur) => OrderedValue::from(&l) > OrderedValue::from(&*cur),
+                        };
+                        if tighter { *elow = Some(l); *eli = low_incl; }
+                    }
+                    if let Some(h) = high {
+                        let tighter = match ehigh {
+                            None => true,
+                            Some(cur) => OrderedValue::from(&h) < OrderedValue::from(&*cur),
+                        };
+                        if tighter { *ehigh = Some(h); *ehi = high_incl; }
+                    }
+                }
+                // A Range arriving where a Values plan already sits is
+                // ignored: the point lookups are already at least as
+                // selective, and the predicate re-runs regardless.
+            }
+
+            // An equality/IN beats a range on the same field.
+            (Some(i), p @ IndexPlan::Values { .. }) => {
+                if matches!(merged[i], IndexPlan::Range { .. }) {
+                    merged[i] = p;
+                }
+            }
+        }
+    }
+
+    // Pick the narrowest, measured against the index rather than guessed.
+    // A Values plan costs one point lookup per arm, so its cardinality is
+    // the sum of those buckets.
+    let mut best: Option<(usize, IndexPlan)> = None;
+    for plan in merged {
+        let card = match &plan {
+            IndexPlan::Range { field, low, high, low_incl, high_incl } => db
+                .range_cardinality(coll, field, low.as_ref(), high.as_ref(),
+                                   *low_incl, *high_incl)
+                .unwrap_or(usize::MAX),
+            IndexPlan::Values { field, values } => values
+                .iter()
+                .map(|v| db.range_cardinality(coll, field, Some(v), Some(v), true, true)
+                          .unwrap_or(usize::MAX))
+                .fold(0usize, |a, b| a.saturating_add(b)),
+        };
+        if best.as_ref().map(|(c, _)| card < *c).unwrap_or(true) {
+            best = Some((card, plan));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 fn id_point_lookup(pred: &Pred) -> Option<String> {
     match pred {
         Pred::Cmp { field, op, value } if field == "_id" && op == "=" => {
@@ -1023,6 +1226,31 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
         db.id_index.list_ids(&q.coll).into_iter()
             .filter_map(|id| db.get_as_of(&q.coll, &id, seq_target))
             .collect()
+    } else if let Some(plan) = q.where_.as_ref()
+        // An indexed range or point-set scan, when a sorted index covers a
+        // field the predicate constrains.
+        //
+        // Deliberately NOT attempted for AS OF: the sorted index holds current
+        // versions only (a superseded hash is dropped on overwrite), so an
+        // index scan would answer a historical query with present-day rows.
+        // AS OF is handled by the branch above, which walks the id index and
+        // resolves each document at the target seq.
+        .filter(|_| q.as_of.is_none())
+        .and_then(|p| choose_index_plan(db, &q.coll, p))
+    {
+        // The full predicate re-runs on these candidates below, so the plan
+        // only has to be a superset — it can never make the answer wrong.
+        let got = match &plan {
+            IndexPlan::Range { field, low, high, low_incl, high_incl } => db.range_scan(
+                &q.coll, field, low.as_ref(), high.as_ref(), *low_incl, *high_incl),
+            IndexPlan::Values { field, values } => db.index_lookup(&q.coll, field, values),
+        };
+        match got {
+            Some(nodes) => nodes,
+            // The index vanished between planning and execution. Fall back
+            // rather than answering from nothing.
+            None => db.list(&q.coll),
+        }
     } else if q.order_by.len() == 1 && q.aggregate.is_none() {
         // ORDER BY with optional sorted index — get candidates in order.
         //
@@ -1620,6 +1848,407 @@ mod tests {
         let (_tmp, db) = setup();
         let (rows, _) = query(&db, "FROM blocks GROUP BY n_tx COUNT").unwrap();
         assert_eq!(rows.len(), 5); // all unique n_tx values
+    }
+
+    // ── Indexed range / point scans (3.3.0) ─────────────────────────────────
+    //
+    // The load-bearing property is EQUIVALENCE: an indexed query and the same
+    // query without an index must return the same rows. The planner is allowed
+    // to be imprecise (it only has to produce a superset — the full predicate
+    // re-runs on the candidates) but it is never allowed to be wrong.
+    //
+    // Every test below therefore runs the same query against two databases
+    // holding identical data, one indexed and one not, and compares.
+
+    /// Build two identical databases, one with sorted indexes on `fields`.
+    fn twin(fields: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, Db, Db) {
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let indexed = Db::open(d1.path(), None).unwrap();
+        let plain = Db::open(d2.path(), None).unwrap();
+        for f in fields {
+            indexed.create_sorted_index("t", f);
+        }
+        // Deliberately messy: duplicate fees, a missing field, a null, a
+        // string column, and an out-of-order insert sequence.
+        let rows: Vec<(String, Value)> = (0..40u64).map(|i| {
+            let mut o = serde_json::Map::new();
+            if i % 7 != 0 {
+                o.insert("fee".into(), json!(i % 13));
+            }
+            if i % 11 == 0 {
+                o.insert("note".into(), Value::Null);
+            } else {
+                o.insert("note".into(), json!(format!("n{}", i % 5)));
+            }
+            o.insert("rank".into(), json!(40 - i));
+            (i.to_string(), Value::Object(o))
+        }).collect();
+        for (id, doc) in &rows {
+            indexed.put("t", id, doc.clone(), vec![], None, None).unwrap();
+            plain.put("t", id, doc.clone(), vec![], None, None).unwrap();
+        }
+        (d1, d2, indexed, plain)
+    }
+
+    fn same(a: &Db, b: &Db, nql: &str) -> (Vec<String>, Vec<String>) {
+        let ga = {
+            let (rows, _) = query(a, nql).unwrap();
+            let mut v: Vec<String> = rows.iter()
+                .filter_map(|r| r["_id"].as_str().map(String::from)).collect();
+            v.sort(); v
+        };
+        let gb = {
+            let (rows, _) = query(b, nql).unwrap();
+            let mut v: Vec<String> = rows.iter()
+                .filter_map(|r| r["_id"].as_str().map(String::from)).collect();
+            v.sort(); v
+        };
+        (ga, gb)
+    }
+
+    #[test]
+    fn indexed_and_unindexed_agree_on_every_predicate_shape() {
+        let (_t1, _t2, idx, plain) = twin(&["fee", "note", "rank"]);
+        for nql in [
+            // ranges — the shapes the index now serves
+            "FROM t WHERE fee > 5",
+            "FROM t WHERE fee >= 5",
+            "FROM t WHERE fee < 5",
+            "FROM t WHERE fee <= 5",
+            "FROM t WHERE fee = 5",
+            "FROM t WHERE fee BETWEEN 3 AND 8",
+            "FROM t WHERE fee NOT BETWEEN 3 AND 8",
+            "FROM t WHERE fee IN (1, 5, 9)",
+            "FROM t WHERE fee NOT IN (1, 5, 9)",
+            "FROM t WHERE fee != 5",
+            // merged bounds on one field
+            "FROM t WHERE fee > 3 AND fee < 9",
+            "FROM t WHERE fee >= 3 AND fee <= 9",
+            "FROM t WHERE fee > 3 AND fee < 9 AND fee != 5",
+            "FROM t WHERE fee BETWEEN 2 AND 10 AND fee > 6",
+            // two indexed fields — the planner must pick one and stay correct
+            "FROM t WHERE fee > 5 AND rank < 20",
+            "FROM t WHERE fee IN (2, 3) AND rank > 10",
+            "FROM t WHERE fee = 4 AND rank = 8",
+            // the absent-field cases, where a naive index scan inverts the answer
+            "FROM t WHERE fee IS NULL",
+            "FROM t WHERE fee IS NOT NULL",
+            "FROM t WHERE note IS NULL",
+            "FROM t WHERE note IS NOT NULL",
+            "FROM t WHERE fee IS NULL AND rank > 20",
+            // predicates the index cannot serve, mixed with ones it can
+            r#"FROM t WHERE note LIKE "n_""#,
+            r#"FROM t WHERE fee > 5 AND note LIKE "n1""#,
+            r#"FROM t WHERE note NOT LIKE "n1" AND fee < 4"#,
+            // disjunction — must NOT be narrowed on one arm
+            "FROM t WHERE fee > 11 OR rank > 38",
+            "FROM t WHERE fee = 1 OR note IS NULL",
+            "FROM t WHERE (fee > 11 OR rank > 38) AND rank < 39",
+            "FROM t WHERE fee IN (1) OR fee IN (2)",
+            // negation
+            "FROM t WHERE NOT (fee > 5)",
+            "FROM t WHERE NOT (fee IN (1, 2))",
+            "FROM t WHERE NOT (fee > 5) AND rank < 30",
+            // with shaping on top
+            "FROM t WHERE fee > 5 ORDER BY rank DESC LIMIT 5",
+            "FROM t WHERE fee BETWEEN 2 AND 8 ORDER BY fee, rank DESC",
+            "FROM t WHERE fee > 5 GROUP BY note COUNT",
+            "FROM t WHERE fee > 5 COUNT",
+            "FROM t WHERE fee > 5 ORDER BY rank LIMIT 3 OFFSET 2",
+            // empty results
+            "FROM t WHERE fee > 9999",
+            "FROM t WHERE fee IN (9999)",
+            "FROM t WHERE fee BETWEEN 100 AND 200",
+        ] {
+            let (a, b) = same(&idx, &plain, nql);
+            assert_eq!(a, b, "indexed and unindexed disagree on `{}`", nql);
+        }
+    }
+
+    /// Ordering, not just membership, must survive the index path — the
+    /// candidates arrive in index order of the PREDICATE field, which is not
+    /// the requested sort order, so the post-filter sort has to still run.
+    #[test]
+    fn index_path_still_honours_order_by() {
+        let (_t1, _t2, idx, plain) = twin(&["fee", "rank"]);
+        for nql in [
+            "FROM t WHERE fee > 4 ORDER BY rank",
+            "FROM t WHERE fee > 4 ORDER BY rank DESC",
+            "FROM t WHERE fee > 4 ORDER BY note, rank DESC",
+            "FROM t WHERE fee BETWEEN 2 AND 9 ORDER BY rank LIMIT 4",
+            "FROM t WHERE fee IN (3, 6) ORDER BY rank DESC LIMIT 2",
+        ] {
+            let ra = query(&idx, nql).unwrap().0;
+            let rb = query(&plain, nql).unwrap().0;
+            let ia: Vec<&str> = ra.iter().filter_map(|r| r["_id"].as_str()).collect();
+            let ib: Vec<&str> = rb.iter().filter_map(|r| r["_id"].as_str()).collect();
+            assert_eq!(ia, ib, "row ORDER differs on `{}`", nql);
+        }
+    }
+
+    /// An ordering comparison against a missing field is never true.
+    ///
+    /// OrderedValue sorts Null below every number, so `<` and `<=` reported
+    /// that a document with NO `fee` field satisfied `WHERE fee < 5` — while
+    /// `>` and `>=` excluded it. That asymmetry was the tell. The Python
+    /// reference has always excluded it, so this was a cross-engine
+    /// divergence as well as a wrong answer, and it meant the scan path and
+    /// the index path disagreed depending on whether an index existed.
+    #[test]
+    fn an_ordering_comparison_against_a_missing_field_is_false() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("t", "has", json!({"fee": 1}), vec![], None, None).unwrap();
+        db.put("t", "none", json!({"other": 1}), vec![], None, None).unwrap();
+        db.put("t", "null", json!({"fee": Value::Null}), vec![], None, None).unwrap();
+
+        for nql in ["FROM t WHERE fee < 5", "FROM t WHERE fee <= 5"] {
+            let (r, _) = query(&db, nql).unwrap();
+            let ids: Vec<&str> = r.iter().filter_map(|x| x["_id"].as_str()).collect();
+            assert_eq!(ids, vec!["has"],
+                       "`{}` must not match a row whose fee is absent or null", nql);
+        }
+        for nql in ["FROM t WHERE fee > 0", "FROM t WHERE fee >= 0"] {
+            let (r, _) = query(&db, nql).unwrap();
+            let ids: Vec<&str> = r.iter().filter_map(|x| x["_id"].as_str()).collect();
+            assert_eq!(ids, vec!["has"], "`{}`", nql);
+        }
+        // BETWEEN is built from >= and <=, so it inherits the rule.
+        let (b, _) = query(&db, "FROM t WHERE fee BETWEEN 0 AND 9").unwrap();
+        assert_eq!(b.len(), 1);
+
+        // = and != keep operating on null, exactly as the Python reference
+        // does — its None guard sits deliberately AFTER those two arms.
+        let (ne, _) = query(&db, "FROM t WHERE fee != 5").unwrap();
+        assert_eq!(ne.len(), 3, "!= still matches absent and null fields");
+        let (isnull, _) = query(&db, "FROM t WHERE fee = NULL").unwrap();
+        assert_eq!(isnull.len(), 2, "absent and explicit-null both equal NULL");
+
+        // And the same answers with an index present — the two paths agreeing
+        // is the reason this fix was required, not merely desirable.
+        let d2 = tempdir().unwrap();
+        let idx = Db::open(d2.path(), None).unwrap();
+        idx.create_sorted_index("t", "fee");
+        idx.put("t", "has", json!({"fee": 1}), vec![], None, None).unwrap();
+        idx.put("t", "none", json!({"other": 1}), vec![], None, None).unwrap();
+        idx.put("t", "null", json!({"fee": Value::Null}), vec![], None, None).unwrap();
+        for nql in ["FROM t WHERE fee < 5", "FROM t WHERE fee <= 5",
+                    "FROM t WHERE fee > 0", "FROM t WHERE fee BETWEEN 0 AND 9"] {
+            let (a, _) = query(&db, nql).unwrap();
+            let (b, _) = query(&idx, nql).unwrap();
+            let ia: Vec<&str> = a.iter().filter_map(|x| x["_id"].as_str()).collect();
+            let ib: Vec<&str> = b.iter().filter_map(|x| x["_id"].as_str()).collect();
+            assert_eq!(ia, ib, "indexed and unindexed disagree on `{}`", nql);
+        }
+    }
+
+    /// `IS NULL` must never touch this index. A document whose field is absent
+    /// is not in the index for that field, so an index scan would return
+    /// exactly the complement of the right answer — the worst possible failure
+    /// for a filter, since it looks like a plausible result set.
+    #[test]
+    fn is_null_never_uses_the_index() {
+        let (_t1, _t2, idx, plain) = twin(&["fee"]);
+        let (a, b) = same(&idx, &plain, "FROM t WHERE fee IS NULL");
+        assert_eq!(a, b);
+        // 40 docs, every 7th missing `fee`: ids 0,7,14,21,28,35.
+        assert_eq!(a, vec!["0", "14", "21", "28", "35", "7"]);
+        assert!(!a.is_empty(), "the fixture must actually contain absent fields");
+    }
+
+    /// A constraint under an OR does not restrict the result set, so the
+    /// planner must not narrow on it. Both arms have to survive.
+    #[test]
+    fn a_disjunct_is_never_used_to_narrow() {
+        let (_t1, _t2, idx, plain) = twin(&["fee", "rank"]);
+        let nql = "FROM t WHERE fee = 1 OR rank = 40";
+        let (a, b) = same(&idx, &plain, nql);
+        assert_eq!(a, b);
+        // rank = 40 is doc 0, which has NO `fee` field at all — so if the
+        // planner had narrowed on the `fee` arm it would have been dropped.
+        assert!(a.contains(&"0".to_string()),
+                "the OR arm matching a doc with no indexed field must survive: {:?}", a);
+        assert!(a.len() > 1, "both arms must contribute: {:?}", a);
+    }
+
+    /// AS OF must not use the index: it holds CURRENT versions only, because a
+    /// superseded hash is removed on overwrite. An index scan would answer a
+    /// historical query with present-day rows.
+    #[test]
+    fn as_of_does_not_use_the_current_version_index() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.create_sorted_index("t", "fee");
+        db.put("t", "a", json!({"fee": 5}), vec![], None, None).unwrap();
+        let snap = db.put("t", "b", json!({"fee": 5}), vec![], None, None).unwrap().seq;
+        // Move both out of the range the query asks for.
+        db.put("t", "a", json!({"fee": 999}), vec![], None, None).unwrap();
+        db.put("t", "b", json!({"fee": 999}), vec![], None, None).unwrap();
+
+        // At HEAD nothing matches fee = 5 any more.
+        let (now, _) = query(&db, "FROM t WHERE fee = 5").unwrap();
+        assert!(now.is_empty(), "current versions have fee 999: {:?}", now);
+
+        // AS OF the snapshot, both still had fee = 5. If the index served
+        // this, it would return nothing.
+        let (then, _) = query(&db, &format!("FROM t AS OF {} WHERE fee = 5", snap)).unwrap();
+        let mut ids: Vec<&str> = then.iter().filter_map(|r| r["_id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"], "AS OF must see the historical values");
+
+        // Same for a range and an IN.
+        let (r, _) = query(&db, &format!("FROM t AS OF {} WHERE fee BETWEEN 1 AND 9", snap)).unwrap();
+        assert_eq!(r.len(), 2);
+        let (i, _) = query(&db, &format!("FROM t AS OF {} WHERE fee IN (5)", snap)).unwrap();
+        assert_eq!(i.len(), 2);
+    }
+
+    /// An overwritten row must not come back from the index.
+    #[test]
+    fn the_index_path_returns_current_versions_only() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.create_sorted_index("t", "fee");
+        for i in 0..5u64 {
+            db.put("t", &i.to_string(), json!({"fee": i}), vec![], None, None).unwrap();
+        }
+        db.put("t", "0", json!({"fee": 100}), vec![], None, None).unwrap();
+
+        let (low, _) = query(&db, "FROM t WHERE fee BETWEEN 0 AND 4").unwrap();
+        let mut ids: Vec<&str> = low.iter().filter_map(|r| r["_id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["1", "2", "3", "4"],
+                   "doc 0 moved to fee 100 and must not appear in 0..4");
+
+        let (high, _) = query(&db, "FROM t WHERE fee = 100").unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0]["_id"], "0");
+        assert_eq!(high[0]["fee"], json!(100), "the CURRENT value, not the old one");
+    }
+
+    /// Duplicate values must not produce duplicate rows, and a value repeated
+    /// across IN arms must be returned once.
+    #[test]
+    fn index_scans_do_not_duplicate_rows() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.create_sorted_index("t", "fee");
+        for i in 0..6u64 {
+            db.put("t", &i.to_string(), json!({"fee": i % 2}), vec![], None, None).unwrap();
+        }
+        let (dup, _) = query(&db, "FROM t WHERE fee IN (0, 0, 1, 1)").unwrap();
+        assert_eq!(dup.len(), 6, "each row once despite repeated IN arms");
+        let (r, _) = query(&db, "FROM t WHERE fee BETWEEN 0 AND 1").unwrap();
+        assert_eq!(r.len(), 6);
+        let mut ids: Vec<&str> = dup.iter().filter_map(|r| r["_id"].as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 6, "no duplicate _ids");
+    }
+
+    /// A range over a string column, to prove the index is not numeric-only.
+    #[test]
+    fn index_ranges_work_on_strings() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.create_sorted_index("t", "name");
+        for (i, n) in ["alpha", "bravo", "charlie", "delta", "echo"].iter().enumerate() {
+            db.put("t", &i.to_string(), json!({"name": n}), vec![], None, None).unwrap();
+        }
+        let (r, _) = query(&db, r#"FROM t WHERE name BETWEEN "bravo" AND "delta""#).unwrap();
+        let mut got: Vec<&str> = r.iter().filter_map(|x| x["name"].as_str()).collect();
+        got.sort();
+        assert_eq!(got, vec!["bravo", "charlie", "delta"]);
+        let (gt, _) = query(&db, r#"FROM t WHERE name > "charlie""#).unwrap();
+        assert_eq!(gt.len(), 2);
+    }
+
+    /// Bounds must be merged into one walk, and the tighter bound must win
+    /// regardless of the order the conjuncts appear in.
+    #[test]
+    fn same_field_bounds_are_merged_tightest_wins() {
+        let (_t1, _t2, idx, plain) = twin(&["fee"]);
+        for (a_nql, b_nql) in [
+            ("FROM t WHERE fee > 2 AND fee > 6", "FROM t WHERE fee > 6"),
+            ("FROM t WHERE fee > 6 AND fee > 2", "FROM t WHERE fee > 6"),
+            ("FROM t WHERE fee < 9 AND fee < 4", "FROM t WHERE fee < 4"),
+            ("FROM t WHERE fee BETWEEN 0 AND 12 AND fee >= 5 AND fee <= 7",
+             "FROM t WHERE fee >= 5 AND fee <= 7"),
+        ] {
+            let (ia, _) = same(&idx, &plain, a_nql);
+            let (ib, _) = same(&idx, &plain, b_nql);
+            assert_eq!(ia, ib, "`{}` should equal `{}`", a_nql, b_nql);
+        }
+    }
+
+    /// The index only helps where it exists; an unindexed field must still
+    /// answer correctly through the scan path.
+    #[test]
+    fn a_predicate_on_an_unindexed_field_still_answers() {
+        let (_t1, _t2, idx, plain) = twin(&["fee"]);   // `rank` is NOT indexed
+        for nql in [
+            "FROM t WHERE rank > 30",
+            "FROM t WHERE rank BETWEEN 10 AND 20",
+            "FROM t WHERE rank IN (40, 39)",
+            "FROM t WHERE rank > 30 AND fee > 2",
+        ] {
+            let (a, b) = same(&idx, &plain, nql);
+            assert_eq!(a, b, "`{}`", nql);
+        }
+    }
+
+    /// Cardinality is reported off the index without reading any rows, which
+    /// is what lets the planner compare two candidate indexes.
+    #[test]
+    fn range_cardinality_counts_without_reading() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.create_sorted_index("t", "fee");
+        for i in 0..20u64 {
+            db.put("t", &i.to_string(), json!({"fee": i}), vec![], None, None).unwrap();
+        }
+        assert_eq!(db.range_cardinality("t", "fee", None, None, true, true), Some(20));
+        assert_eq!(
+            db.range_cardinality("t", "fee", Some(&json!(5)), Some(&json!(9)), true, true),
+            Some(5), "5..=9 inclusive is five values");
+        assert_eq!(
+            db.range_cardinality("t", "fee", Some(&json!(5)), Some(&json!(9)), false, false),
+            Some(3), "exclusive bounds drop both ends");
+        assert_eq!(
+            db.range_cardinality("t", "fee", Some(&json!(18)), None, true, true),
+            Some(2));
+        assert_eq!(
+            db.range_cardinality("t", "fee", Some(&json!(999)), None, true, true),
+            Some(0), "an empty range is 0, not an error");
+        // No index on this field at all.
+        assert_eq!(db.range_cardinality("t", "nope", None, None, true, true), None);
+    }
+
+    /// With two usable indexes the planner should choose the narrower range.
+    /// Asserted through cardinality rather than by inspecting the plan, so the
+    /// test pins the observable behaviour and not the implementation.
+    #[test]
+    fn the_narrower_index_is_preferred() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.create_sorted_index("t", "wide");
+        db.create_sorted_index("t", "narrow");
+        for i in 0..100u64 {
+            db.put("t", &i.to_string(),
+                   json!({"wide": i % 2, "narrow": i}), vec![], None, None).unwrap();
+        }
+        // `wide = 0` covers 50 rows; `narrow = 7` covers 1.
+        let wide = db.range_cardinality("t", "wide", Some(&json!(0)), Some(&json!(0)), true, true);
+        let narrow = db.range_cardinality("t", "narrow", Some(&json!(7)), Some(&json!(7)), true, true);
+        assert_eq!(wide, Some(50));
+        assert_eq!(narrow, Some(1));
+        // The answer must be right whichever index is chosen.
+        let (r, _) = query(&db, "FROM t WHERE wide = 0 AND narrow = 7").unwrap();
+        assert!(r.is_empty(), "narrow 7 has wide 1, so nothing matches");
+        let (r2, _) = query(&db, "FROM t WHERE wide = 0 AND narrow = 8").unwrap();
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0]["_id"], "8");
     }
 
     // ── Result shaping (3.3.0): OFFSET, multi-key ORDER BY, HAVING, ─────────
