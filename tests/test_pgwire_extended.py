@@ -421,24 +421,17 @@ def suite_asyncpg(pg_port):
         gone = await conn.fetch("SELECT _id FROM orders WHERE _id = $1", "a1")
         check("DELETE through the extended protocol removes the row", gone == [], f"{gone}")
 
-        # NOTE — a KNOWN ENGINE GAP, not a protocol one, and deliberately not
-        # asserted here. `SELECT … AS OF SYSTEM TIME <earlier seq>` returns
-        # nothing for a DELETED id, so a deleted row's history is unreadable
-        # even at a sequence before the delete.
+        # A DELETE is a tombstone, not an erasure — over SQL, through a driver.
         #
-        # The trigger looks like the delete; the root cause is that the AS OF
-        # branch enumerates ids from the CURRENT id index (`list_ids`), and
-        # `delete()` removes the live pointer — so the id is never considered at
-        # any sequence. The version chain itself survives: the tombstone node
-        # keeps a `prev` link to it, so nothing is lost on disk, only
-        # unreachable. Fixing it means changing what `delete()` leaves in the
-        # index, which touches every `list_ids` consumer (RESP2, the adapters,
-        # verify, the HTTP list endpoint) and so belongs in its own PR with its
-        # own backwards-compatibility matrix.
-        #
-        # Writes over SQL going into history correctly IS asserted, above and in
-        # test_pgwire.py — an UPDATE leaves the prior version readable. This gap
-        # is specific to DELETE.
+        # This used to return nothing: the AS OF branch enumerated ids from the
+        # CURRENT id index, and `delete()` removed the live pointer, so a
+        # deleted id was skipped at every sequence — including sequences before
+        # the delete where the row demonstrably existed. `delete()` now MOVES
+        # the pointer to a graveyard index instead of dropping it.
+        back = await conn.fetch(
+            "SELECT total FROM orders AS OF SYSTEM TIME $1 WHERE _id = $2", seq_now, "a1")
+        check("a deleted row is a tombstone: still readable before the delete",
+              [r["total"] for r in back] == [66], f"{back}")
 
         # An error must not poison the connection.
         try:

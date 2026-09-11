@@ -1230,8 +1230,16 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
         // O(1) direct id-index lookup — skip full collection scan entirely
         db.get(&q.coll, target_id).into_iter().collect()
     } else if let Some(seq_target) = q.as_of {
-        // AS OF: return each doc's version at or before target seq
-        db.id_index.list_ids(&q.coll).into_iter()
+        // AS OF: return each doc's version at or before target seq.
+        //
+        // Over the live ids PLUS the deleted ones. Walking only `id_index`
+        // meant a DELETED document was invisible at every sequence, including
+        // sequences before the delete where it demonstrably existed — so
+        // `AS OF` contradicted the promise that a delete is a tombstone rather
+        // than an erasure. `get_as_of` reaches the chain through the graveyard
+        // pointer, and returns nothing for a sequence at or after the
+        // tombstone, where the document really is gone.
+        db.list_ids_including_deleted(&q.coll).into_iter()
             .filter_map(|id| db.get_as_of(&q.coll, &id, seq_target))
             .collect()
     } else if let Some(plan) = q.where_.as_ref()
