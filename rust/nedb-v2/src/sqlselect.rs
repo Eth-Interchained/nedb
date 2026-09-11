@@ -38,7 +38,7 @@
 //! indistinguishable from a correct one until somebody's data appears to be
 //! missing.
 
-use std::collections::HashMap;
+use crate::sqljoin::{self, JoinChoice, JoinExec, Strategy};
 
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
@@ -70,6 +70,7 @@ impl Tok {
         matches!(self, Tok::Word { upper, .. } if upper == kw)
     }
     /// The identifier text, for a token usable as a name.
+    #[allow(dead_code)] // kept as the counterpart to `is_kw`; used by earlier phases
     fn ident(&self) -> Option<String> {
         match self {
             Tok::Word { raw, .. } => Some(raw.clone()),
@@ -330,7 +331,7 @@ pub struct SelectItem {
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind { Inner, Left, Right, Full, Cross }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -756,9 +757,7 @@ impl Parser {
         }
 
         match self.next() {
-            Tok::Num(n) => Ok(Expr::Literal(
-                serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null),
-            )),
+            Tok::Num(n) => Ok(Expr::Literal(from_f64(n))),
             Tok::Str(s) => Ok(Expr::Literal(Value::String(s))),
             Tok::Op(o) if o == "*" => Ok(Expr::Star),
             Tok::Quoted(name) => self.parse_name_tail(None, name),
@@ -1260,7 +1259,23 @@ fn num(v: &Value) -> Option<f64> {
     }
 }
 
+/// Every number this engine PRODUCES goes through here, so that one rule
+/// decides how numbers render.
+///
+/// An integral value becomes a JSON integer. Without this, the lexer's `f64`
+/// leaked into the output and `SELECT 1` answered `1.0` — which a client reads
+/// as the TEXT "1.0", where PostgreSQL says "1". The liveness probe every
+/// driver opens with was the most visible casualty.
+///
+/// Note what this rule cannot do: PostgreSQL distinguishes `1` (integer) from
+/// `1.0` (numeric with scale 1), and JSON has no numeric-with-scale type at
+/// all, so that distinction is unrepresentable here whatever we choose.
+/// Rendering integral values as integers is the only self-consistent option
+/// available, and it is the one that matches the common case.
 fn from_f64(f: f64) -> Value {
+    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+        return Value::Number((f as i64).into());
+    }
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
 }
 
@@ -1635,6 +1650,21 @@ pub type Resolver<'r> = dyn Fn(&str) -> Result<Option<Vec<Value>>> + 'r;
 /// Rows come back as JSON objects keyed by output column name, which is the
 /// shape the wire encoder already consumes.
 pub fn execute(sel: &Select, resolve: &Resolver) -> Result<(Vec<String>, Vec<Value>)> {
+    let (names, rows, _) = execute_explain(sel, resolve, JoinExec::Auto)?;
+    Ok((names, rows))
+}
+
+/// Run a parsed `SELECT`, also reporting how each join was executed.
+///
+/// `exec` forces a join strategy, which exists so that differential tests can
+/// drive the SAME query down BOTH paths — and so a benchmark can prove it
+/// measured the path it claims to have measured rather than silently timing
+/// the other one twice.
+pub fn execute_explain(
+    sel: &Select,
+    resolve: &Resolver,
+    exec: JoinExec,
+) -> Result<(Vec<String>, Vec<Value>, Vec<JoinChoice>)> {
     // ── 1. source rows, and the join ────────────────────────────────────────
     let mut rows: Vec<JoinedRow> = match &sel.from {
         None => {
@@ -1650,56 +1680,45 @@ pub fn execute(sel: &Select, resolve: &Resolver) -> Result<(Vec<String>, Vec<Val
         }
     };
 
+    // The bindings accumulated so far, tracked explicitly rather than read off
+    // the first row. Reading a row cannot describe the shape when there are no
+    // rows — which is exactly the case a `RIGHT JOIN` onto an EMPTY left
+    // relation produces, and it made those rows come back missing their left
+    // bindings entirely instead of carrying them as NULL.
+    let mut left_bindings: Vec<String> = match &sel.from {
+        None => vec![],
+        Some(t) => vec![t.binding()],
+    };
+    let mut choices: Vec<JoinChoice> = vec![];
+
     for join in &sel.joins {
         let right_rows = fetch(&join.table.name, resolve)?;
         let rb = join.table.binding();
-        let mut out: Vec<JoinedRow> = vec![];
-        // Which right rows found a partner — only needed for RIGHT and FULL.
-        let mut right_matched = vec![false; right_rows.len()];
 
-        for left in &rows {
-            let mut matched = false;
-            for (ri, right) in right_rows.iter().enumerate() {
-                let mut cand: JoinedRow = left.clone();
-                cand.push((rb.clone(), Some(right.clone())));
-                let keep = match &join.on {
-                    // CROSS JOIN has no predicate: every pair survives.
-                    None => true,
-                    // An ON that evaluates to UNKNOWN does NOT join, exactly
-                    // as in SQL. Treating UNKNOWN as a match would invent
-                    // pairings out of missing data.
-                    Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
-                };
-                if keep {
-                    matched = true;
-                    right_matched[ri] = true;
-                    out.push(cand);
-                }
-            }
-            // LEFT/FULL: an unmatched left row survives with a NULL right.
-            if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-                let mut cand: JoinedRow = left.clone();
-                cand.push((rb.clone(), None));
-                out.push(cand);
-            }
-        }
+        // The planner proposes; sizes decide. A join with no provable equality
+        // key has nothing to hash on and stays on the reference path.
+        let keys = sqljoin::hash_keys(join.on.as_ref(), &left_bindings, &rb);
+        let strategy = sqljoin::choose(exec, keys.len(), rows.len(), right_rows.len());
 
-        // RIGHT/FULL: an unmatched right row survives with NULLs on the left.
-        if matches!(join.kind, JoinKind::Right | JoinKind::Full) {
-            for (ri, right) in right_rows.iter().enumerate() {
-                if right_matched[ri] {
-                    continue;
-                }
-                // Every binding accumulated so far becomes NULL for this row.
-                let mut cand: JoinedRow = rows
-                    .first()
-                    .map(|r| r.iter().map(|(b, _)| (b.clone(), None)).collect())
-                    .unwrap_or_default();
-                cand.push((rb.clone(), Some(right.clone())));
-                out.push(cand);
+        let out = match strategy {
+            Strategy::NestedLoop => {
+                join_nested_loop(&rows, &left_bindings, join, &right_rows, &rb)?
             }
-        }
+            Strategy::Hash => {
+                join_hash(&rows, &left_bindings, join, &right_rows, &rb, &keys)?
+            }
+        };
 
+        choices.push(JoinChoice {
+            kind: join.kind,
+            table: join.table.name.clone(),
+            strategy,
+            keys: keys.len(),
+            left_rows: rows.len(),
+            right_rows: right_rows.len(),
+            out_rows: out.len(),
+        });
+        left_bindings.push(rb);
         rows = out;
     }
 
@@ -1887,7 +1906,167 @@ pub fn execute(sel: &Select, resolve: &Resolver) -> Result<(Vec<String>, Vec<Val
         out.truncate(lim);
     }
 
-    Ok((names, out))
+    Ok((names, out, choices))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The two join implementations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `RIGHT`/`FULL`: every right row that found no partner survives, with every
+/// left binding NULL.
+///
+/// Shared by both strategies so the two cannot drift apart on the subtlest
+/// part of outer-join semantics.
+fn emit_unmatched_right(
+    out: &mut Vec<JoinedRow>,
+    kind: JoinKind,
+    left_bindings: &[String],
+    right_rows: &[Value],
+    right_matched: &[bool],
+    rb: &str,
+) {
+    if !matches!(kind, JoinKind::Right | JoinKind::Full) {
+        return;
+    }
+    for (ri, right) in right_rows.iter().enumerate() {
+        if right_matched[ri] {
+            continue;
+        }
+        let mut cand: JoinedRow = left_bindings.iter().map(|b| (b.clone(), None)).collect();
+        cand.push((rb.to_string(), Some(right.clone())));
+        out.push(cand);
+    }
+}
+
+/// The reference strategy: consider every pair.
+///
+/// Quadratic, and kept forever anyway. It is the semantic fallback for
+/// predicates the hash path cannot key on, the implementation of record for
+/// non-equality joins, and the oracle the differential tests compare against.
+fn join_nested_loop(
+    rows: &[JoinedRow],
+    left_bindings: &[String],
+    join: &Join,
+    right_rows: &[Value],
+    rb: &str,
+) -> Result<Vec<JoinedRow>> {
+    let mut out: Vec<JoinedRow> = vec![];
+    // Which right rows found a partner — only needed for RIGHT and FULL.
+    let mut right_matched = vec![false; right_rows.len()];
+
+    for left in rows {
+        let mut matched = false;
+        for (ri, right) in right_rows.iter().enumerate() {
+            let mut cand: JoinedRow = left.clone();
+            cand.push((rb.to_string(), Some(right.clone())));
+            let keep = match &join.on {
+                // CROSS JOIN has no predicate: every pair survives.
+                None => true,
+                // An ON that evaluates to UNKNOWN does NOT join, exactly
+                // as in SQL. Treating UNKNOWN as a match would invent
+                // pairings out of missing data.
+                Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
+            };
+            if keep {
+                matched = true;
+                right_matched[ri] = true;
+                out.push(cand);
+            }
+        }
+        // LEFT/FULL: an unmatched left row survives with a NULL right.
+        if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
+            let mut cand: JoinedRow = left.clone();
+            cand.push((rb.to_string(), None));
+            out.push(cand);
+        }
+    }
+
+    emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+    Ok(out)
+}
+
+/// The fast strategy: bucket the right relation, probe it with the left.
+///
+/// The hash table is used ONLY to narrow the candidate set. Every surviving
+/// pair is then evaluated against the complete, unmodified `ON` expression —
+/// the same call the nested loop makes — so the two strategies answer with the
+/// same expression evaluated on the same rows. See [`crate::sqljoin`] for why
+/// bucketing alone would be unsound here.
+fn join_hash(
+    rows: &[JoinedRow],
+    left_bindings: &[String],
+    join: &Join,
+    right_rows: &[Value],
+    rb: &str,
+    keys: &[(Expr, Expr)],
+) -> Result<Vec<JoinedRow>> {
+    debug_assert!(!keys.is_empty(), "the planner must not choose Hash with no keys");
+
+    // ── build: the right relation, keyed ────────────────────────────────────
+    let side = sqljoin::HashSide::build(right_rows.len(), |i| {
+        // A right key reads only the right binding — that is what the planner
+        // proved — so binding the row alone is sufficient and correct.
+        let one: JoinedRow = vec![(rb.to_string(), Some(right_rows[i].clone()))];
+        let b = bind(&one);
+        let mut k = Vec::with_capacity(keys.len());
+        for (_, right_expr) in keys {
+            match sqljoin::hkey(&eval(right_expr, &b)?) {
+                Some(h) => k.push(h),
+                // A NULL anywhere in the key means this row joins nothing.
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(k))
+    })?;
+
+    // ── probe: the accumulated left rows ────────────────────────────────────
+    let mut out: Vec<JoinedRow> = vec![];
+    let mut right_matched = vec![false; right_rows.len()];
+
+    for left in rows {
+        let lb = bind(left);
+        let mut lk = Vec::with_capacity(keys.len());
+        let mut null_key = false;
+        for (left_expr, _) in keys {
+            match sqljoin::hkey(&eval(left_expr, &lb)?) {
+                Some(h) => lk.push(h),
+                None => {
+                    null_key = true;
+                    break;
+                }
+            }
+        }
+
+        let mut matched = false;
+        // A NULL key matches nothing, so the bucket is not consulted. A
+        // shortcut, not a safeguard: the confirm step below would reject
+        // those pairs anyway, since `NULL = NULL` is UNKNOWN.
+        if !null_key {
+            for &ri in side.probe(&lk) {
+                let mut cand: JoinedRow = left.clone();
+                cand.push((rb.to_string(), Some(right_rows[ri].clone())));
+                // Confirm. The bucket only suggested this pair.
+                let keep = match &join.on {
+                    None => true,
+                    Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
+                };
+                if keep {
+                    matched = true;
+                    right_matched[ri] = true;
+                    out.push(cand);
+                }
+            }
+        }
+        if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
+            let mut cand: JoinedRow = left.clone();
+            cand.push((rb.to_string(), None));
+            out.push(cand);
+        }
+    }
+
+    emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+    Ok(out)
 }
 
 fn fetch(name: &str, resolve: &Resolver) -> Result<Vec<Value>> {
@@ -2396,7 +2575,7 @@ mod eval_tests {
     #[test]
     fn literals_and_columns_resolve() {
         let r = json!({"a": 1, "s": "x", "b": true, "n": null});
-        assert_eq!(v("42", &r), json!(42.0));
+        assert_eq!(v("42", &r), json!(42));
         assert_eq!(v("'hi'", &r), json!("hi"));
         assert_eq!(v("NULL", &r), Value::Null);
         assert_eq!(v("TRUE", &r), json!(true));
@@ -2533,12 +2712,16 @@ mod eval_tests {
     #[test]
     fn arithmetic_and_concatenation_propagate_null_and_refuse_div_by_zero() {
         let r = json!({"a": 7, "b": 2});
-        assert_eq!(v("a + b", &r), json!(9.0));
-        assert_eq!(v("a - b", &r), json!(5.0));
-        assert_eq!(v("a * b", &r), json!(14.0));
+        assert_eq!(v("a + b", &r), json!(9));
+        assert_eq!(v("a - b", &r), json!(5));
+        assert_eq!(v("a * b", &r), json!(14));
         assert_eq!(v("a / b", &r), json!(3.5));
-        assert_eq!(v("a % b", &r), json!(1.0));
-        assert_eq!(v("-a", &r), json!(-7.0));
+        assert_eq!(v("a % b", &r), json!(1));
+        assert_eq!(v("-a", &r), json!(-7));
+        // A non-integral result stays a float — the rule is about how INTEGRAL
+        // values render, not about collapsing every number to an integer.
+        assert_eq!(v("a / b", &r), json!(3.5));
+        assert_eq!(v("b / a", &r), json!(2.0 / 7.0));
         assert_eq!(v("'x' || 'y'", &r), json!("xy"));
         assert_eq!(v("'x' || nosuch", &r), Value::Null);
         assert_eq!(v("a + nosuch", &r), Value::Null);
@@ -2615,7 +2798,7 @@ mod eval_tests {
         let r = json!({"s": "AbC", "n": null});
         assert_eq!(v("lower(s)", &r), json!("abc"));
         assert_eq!(v("upper(s)", &r), json!("ABC"));
-        assert_eq!(v("length(s)", &r), json!(3.0));
+        assert_eq!(v("length(s)", &r), json!(3));
         assert_eq!(v("lower(n)", &r), Value::Null);
         assert_eq!(v("coalesce(n, 'fallback')", &r), json!("fallback"));
         assert_eq!(v("coalesce(s, 'fallback')", &r), json!("AbC"));

@@ -30,6 +30,9 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #107 | **Extended query protocol** | psycopg3, asyncpg and JDBC could not run a *single* query before this |
 | #108 | **A DELETE is a tombstone, not an erasure** | `AS OF` returned nothing for a deleted id, at *every* sequence |
 | #109 | **`shadow_writes = True` is the whole setup** | it used to be a silent no-op |
+| #110–#114 | BUSL relicense, fork relicense, SPDX headers, `~` regex, `pg_catalog` as real tables | the licence actually holds; `\dn` became reachable |
+| #115 | **a real SQL evaluator** (`sqlselect.rs`) | `psql \dt` works — 11/14 backslash commands |
+| #116 | **hash join + the frozen semantic corpus** | the evaluator became a subsystem with a contract |
 
 ### The two engines, and which one to trust
 
@@ -89,8 +92,12 @@ go missing in CI.
 
 | Tier | Count | Notes |
 |---|---|---|
-| `cargo test --lib` | 234 | the Rust core |
+| `cargo test --lib` | 355 | the Rust core |
 | `cargo test --tests` | 15 | integration, incl. v3 segments + compaction |
+| **semantic corpus** | 44 | frozen SQL meaning, run under **every** join strategy |
+| **join differential** | 11 | hash vs nested loop, incl. 640 generated cases |
+| psql introspection | 44 | drives the **real `psql` binary** |
+| `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
 | cross-engine parity | 157 + 182 | Python **and** Rust, same corpus |
 | backwards compatibility | 109 | frozen v3.2.2 answers, 0 regressions |
@@ -154,35 +161,61 @@ Lead with it.
 Work top-down. Each item says *why* so you can re-order with judgement rather
 than just obeying a list.
 
-### 3.1 `pg_catalog` + `information_schema` — **next**
+### 3.1 `pg_catalog` + `information_schema` — **DONE** (#114, #115)
 
-`\dt` and DBeaver's schema browser come back **empty**. That is an evaluator's
-first ten minutes and it currently looks broken.
+Implemented as **real queryable virtual tables** (`pgcatalog.rs`), not as
+pattern matches against known query strings — pattern matching breaks silently
+when psql changes its query, and a silently empty table list looks exactly
+like "you have no tables".
 
-I captured the real queries with `psql -E` against a real server — do not guess
-them, capture them again if the version moves:
+`psql` now runs **11 of 14** backslash commands: `\dn \dt \dv \di \dm \dS
+\l \du \dg \df \dx`. The three that do not are refused **by name**:
+`\dp` needs an ARRAY constructor, `\dT` a subquery, `\d <table>` regex
+capture groups.
 
-* `\dn` needs only `pg_namespace` + `pg_get_userbyid()` + the `!~` operator +
-  `ORDER BY 1`. **No JOIN.** This is the first milestone and it proves the
-  approach.
-* `\dt` additionally needs `LEFT JOIN`, a `CASE` expression, and
-  `pg_table_is_visible()`.
-* `\d <table>` sends **nine** queries across fifteen catalog relations with
-  correlated subqueries, `::` casts and `generate_series`. **Chasing full `\d`
-  fidelity is a trap — do not.**
+Do **not** chase 14/14 for its own sake. If a remaining command needs
+disproportionate catalogue emulation with no benefit to ordinary SQL users,
+leave it explicit and move on. Subqueries are worth building; a
+PostgreSQL-specific catalogue curiosity is not.
 
-Implement the catalog as **real queryable virtual tables**, not as pattern
-matches against known query strings. Pattern matching breaks silently when psql
-changes its query, and a silently empty table list looks exactly like "you have
-no tables" — the same disease as everything in §1.
+### 3.2 JOIN — **DONE** (#115 nested loop, #116 hash)
 
-### 3.2 JOIN (nested loop first)
+Both strategies are permanent and their roles are distinct:
 
-Needed by `\dt`, by every BI tool, and it is the biggest remaining SQL gap. A
-nested-loop join over materialised rows is honest for small results and unlocks
-real tooling; `O(n*m)` is acceptable as a v1 **if documented**. The pieces
-already exist: `eval_pred_with` is generic over a field resolver, and
-`columns_for`/`sort_by_keys`/`paginate` already operate on JSON rows.
+* **nested loop** — the semantic reference, the implementation for
+  non-equality predicates, and the oracle the differential suite compares
+  against. Never delete it.
+* **hash join** — chosen when the planner can *prove* an equality key. The
+  hash table only NARROWS candidates; every surviving pair is re-checked
+  against the complete, unmodified `ON` expression. See `sqljoin.rs`.
+
+The reason that split exists is worth internalising: **equality in this engine
+is not transitive.** `1 = '1'` and `1 = '1.0'` are both TRUE while
+`'1' = '1.0'` is FALSE, because numbers and numeric strings compare
+numerically but two strings compare exactly. Bucketing assumes an equivalence
+relation, so bucketing alone cannot be correct here. `hkey()` needs exactly one
+property — *if `a = b` is TRUE then `hkey(a) == hkey(b)`* — and everything else
+is performance.
+
+**The next two items, in this order.** Correct result first, faster execution
+second; never invert that.
+
+* **Predicate pushdown, conservatively.** A predicate may move below a join
+  only when that provably preserves meaning. `LEFT JOIN ... WHERE right.x = 5`
+  is **not** equivalent to filtering the right relation first — in `WHERE` it
+  discards the outer rows, in `ON` it keeps them. Both spellings are already
+  pinned in the corpus. If equivalence cannot be proven, do not transform.
+* **A logical plan + `EXPLAIN`.** `Scan / Filter / Project / Join / Aggregate
+  / Sort / Limit` is enough. The point is not to build a PostgreSQL planner —
+  it is to stop parsing, semantics, optimisation and execution collapsing into
+  one growing function. `execute_explain` already returns a per-join report
+  (strategy, key count, row counts) which is the seed of it. No cost model yet;
+  deterministic rules are fine.
+
+Then **subqueries**, one semantic class at a time, each with its own
+regression corpus: scalar uncorrelated, `IN (SELECT ...)`, `EXISTS`,
+correlated, derived tables. Prioritise by the captured `psql` queries, not by
+abstract SQL completeness.
 
 ### 3.3 `DECLARE` / `FETCH` cursors
 
@@ -227,6 +260,27 @@ same `ShadowCursor` treatment (its cursor path is identical). Mongo needs
 ## 4. Sharp edges — state these, never hide them
 
 An evaluator who finds an unstated limitation stops trusting everything else.
+
+* **`SELECT *` column order.** Now the document's own order, because
+  `serde_json`'s `preserve_order` feature is enabled. That feature is
+  **workspace-wide** (Cargo unifies features), so the napi and pyo3 bindings
+  get it too. It is safe for the content-addressed store because a node's hash
+  is taken over the **bytes as written** and verification re-hashes those same
+  bytes — `decode()` never re-serialises a parsed node, so key order cannot
+  invalidate an existing hash. Verified, not assumed: backcompat 109/109 and
+  DAG-preservation 62/62 green with it on, including the case that asserts
+  `verify()` still FAILS when it should.
+* **`1` and `1.0` are the same value.** PostgreSQL distinguishes integer from
+  numeric-with-scale; JSON has no numeric-with-scale type, so it cannot be
+  represented. Integral values render as integers (`SELECT 1` → `1`, fixed in
+  #116 — it used to answer `1.0`, which clients read as the text "1.0").
+  `SELECT 1.0` therefore also renders as `1`. Unrepresentable either way;
+  stated rather than hidden.
+* **A self-join with the same binding twice** (`FROM a JOIN a ON ...`) resolves
+  qualified columns to the *first* matching binding instead of erroring the way
+  PostgreSQL does. Write `FROM a JOIN a AS a2` and it behaves correctly. The
+  hash planner refuses to key on an ambiguous binding, so this is a wrong
+  *answer* rather than a wrong *strategy* — worth fixing with a named refusal.
 
 * **`Db::compact()` discards history.** It rewrites the object segments keeping
   only each document's *current* version, so it prunes superseded versions and
@@ -292,6 +346,23 @@ Learned the hard way. Breaking these has cost real time.
 * Build the release binary before running suites that prefer
   `target/release/` — the tests pick that up over `debug/` and will happily
   test yesterday's code.
+* **A masked failure is indistinguishable from a pass.** `cargo check … | grep`
+  printed nothing and looked clean when the truth was `cargo: command not
+  found` (it lives in `~/.cargo/bin`, not on the default PATH here). Check exit
+  codes, not just filtered output. Same disease as `| tail`.
+* **Prove the test can fail.** A differential suite that passes on broken code
+  is worthless. Mutate the implementation deliberately and confirm the suite
+  screams: bucketing numeric strings as text (losing `1 = '1'`) must fail ~7
+  tests; skipping the confirm step must fail loudly. Two of four mutations I
+  tried were *duds* that changed no answer — without running them I would have
+  credited the suite with catching things it never could.
+* **`npm run build` for the node addon, never bare `napi build`.** The package
+  script passes `--js native.js --dts native.d.ts`; without those flags napi
+  OVERWRITES the hand-written `index.js` durable-mode wrapper with a generated
+  loader, and `durability.test.mjs` then fails in a way that looks like a
+  durability regression. It is not. `git checkout -- index.js index.d.ts`.
+* A `git checkout -- a b c` with one **untracked** path in the list fails
+  wholesale and restores *nothing*, silently. Restore tracked paths only.
 
 **Tooling in this repo**
 
