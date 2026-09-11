@@ -473,11 +473,11 @@ mod tests {
     fn equals(a: &Value, b: &Value) -> bool {
         let sel = parse("SELECT l.v = r.v AS eq FROM l JOIN r ON 1 = 1").expect("parses");
         let (la, lb) = (a.clone(), b.clone());
-        let resolve = move |t: &str| -> Result<Option<Vec<Value>>> {
-            Ok(Some(match t {
+        let resolve = move |t: &str| -> Result<Option<Box<dyn crate::sqlselect::Relation>>> {
+            Ok(Some(crate::sqlselect::from_vec(match t {
                 "l" => vec![json!({"v": la})],
                 _ => vec![json!({"v": lb})],
-            }))
+            })))
         };
         let (_, rows) = crate::sqlselect::execute(&sel, &resolve).expect("runs");
         rows.first().and_then(|r| r.get("eq")).and_then(|v| v.as_bool()) == Some(true)

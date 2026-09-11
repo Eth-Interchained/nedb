@@ -1698,12 +1698,67 @@ fn derived_name(e: &Expr) -> String {
     }
 }
 
+/// A relation, delivered one row at a time.
+///
+/// # The smallest interface that permits early termination
+///
+/// The previous contract handed back an owned `Vec<Value>`, which forced the
+/// whole relation to exist before any work could start. That is fine until
+/// execution can stop early — and once `LIMIT` can stop a join, a contract
+/// that insists on materialising 8000 rows to return 20 becomes the
+/// bottleneck. It was measured as exactly that: after the filter fusion in
+/// #120, the hash path's remaining time was dominated by cloning relations
+/// rather than probing them.
+///
+/// So this is deliberately two methods, not an async stream and not a
+/// borrowing iterator with a lifetime parameter threaded through the whole
+/// evaluator. Pull a row; stop whenever you like by dropping it.
+///
+/// [`size_hint`](Relation::size_hint) exists only so the join planner can
+/// keep choosing a strategy from relation sizes. A source that genuinely does
+/// not know returns `None`, and the planner then decides from what it does
+/// know rather than pretending.
+pub trait Relation {
+    /// The next row, or `None` when exhausted.
+    fn next_row(&mut self) -> Result<Option<Value>>;
+
+    /// Exact row count when the source knows it, `None` when it does not.
+    fn size_hint(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// A relation backed by an already-materialised `Vec`.
+///
+/// Every current caller uses this, so the interface change on its own alters
+/// no behaviour — it is what lets the executor become demand-driven ahead of
+/// the storage layer, rather than requiring both to move at once.
+pub struct VecRelation {
+    iter: std::vec::IntoIter<Value>,
+    len: usize,
+}
+
+impl Relation for VecRelation {
+    fn next_row(&mut self) -> Result<Option<Value>> {
+        Ok(self.iter.next())
+    }
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.len)
+    }
+}
+
+/// Wrap a materialised relation.
+pub fn from_vec(rows: Vec<Value>) -> Box<dyn Relation> {
+    let len = rows.len();
+    Box::new(VecRelation { iter: rows.into_iter(), len })
+}
+
 /// Everything one execution needs from the outside world.
 ///
 /// A callback rather than a concrete store, which is what lets this engine
 /// serve synthesised catalogue relations today and stored collections later
 /// without knowing the difference.
-pub type Resolver<'r> = dyn Fn(&str) -> Result<Option<Vec<Value>>> + 'r;
+pub type Resolver<'r> = dyn Fn(&str) -> Result<Option<Box<dyn Relation>>> + 'r;
 
 /// Run a parsed `SELECT`, returning `(column names, rows)`.
 ///
@@ -1842,24 +1897,46 @@ pub fn execute_opts(
     };
     plan.refusals = push.refusals.clone();
 
+    let mut base_scan_at: Option<usize> = None;
+    let mut base_prefilter_at: Option<usize> = None;
+
     // ── 1. source rows, and the join ────────────────────────────────────────
-    let mut rows: Vec<JoinedRow> = match &sel.from {
+    //
+    // The driving relation is STREAMED when there is a join to feed it into,
+    // so a query that stops early never asks the source for the rest. The
+    // inner side of each join is materialised, because it genuinely has to
+    // be: a hash join builds its table before probing, and a nested loop
+    // re-scans it per left row.
+    let mut left_src: Box<dyn LeftSource> = match &sel.from {
         None => {
             // `SELECT 1` with no FROM is one row with no columns — which is
             // how a client's liveness probe is written.
-            vec![vec![]]
+            Box::new(VecLeft { rows: vec![vec![]], at: 0 })
         }
         Some(t) => {
-            let src = fetch(&t.name, resolve)?;
+            let rel = fetch(&t.name, resolve)?;
+            let binding = t.binding();
+            // Placeholder counts, patched once the pull is over. A streamed
+            // relation cannot report its `actual rows` before it is read, and
+            // inventing a number would be exactly the kind of plausible
+            // fiction `EXPLAIN` must never contain.
+            base_scan_at = Some(plan.stages.len());
             plan.push(Stage::Scan {
                 table: t.name.clone(),
-                binding: t.binding(),
-                rows: src.len(),
+                binding: binding.clone(),
+                rows: 0,
             });
-            let src = prefilter(src, &t.binding(), &push, &mut plan)?;
-            src.into_iter()
-                .map(|r| vec![(t.binding(), Some(r))])
-                .collect()
+            let preds = push.for_binding(&binding).cloned().unwrap_or_default();
+            if !preds.is_empty() {
+                base_prefilter_at = Some(plan.stages.len());
+                plan.push(Stage::Prefilter {
+                    binding: binding.clone(),
+                    predicates: preds.len(),
+                    in_rows: 0,
+                    out_rows: 0,
+                });
+            }
+            Box::new(StreamLeft { rel, binding, preds, pulled: 0, kept: 0 })
         }
     };
 
@@ -1873,15 +1950,20 @@ pub fn execute_opts(
         Some(t) => vec![t.binding()],
     };
     let last = sel.joins.len().saturating_sub(1);
+    let mut rows: Vec<JoinedRow> = vec![];
+    let mut base_pulled: Option<usize> = None;
+    let mut base_kept: Option<usize> = None;
+
     for (ji, join) in sel.joins.iter().enumerate() {
-        let right_rows = fetch(&join.table.name, resolve)?;
+        let right_rel = fetch(&join.table.name, resolve)?;
         let rb = join.table.binding();
+        let right_all = drain(right_rel)?;
         plan.push(Stage::Scan {
             table: join.table.name.clone(),
             binding: rb.clone(),
-            rows: right_rows.len(),
+            rows: right_all.len(),
         });
-        let right_rows = prefilter(right_rows, &rb, &push, &mut plan)?;
+        let right_rows = prefilter(right_all, &rb, &push, &mut plan)?;
 
         // The filter can only be evaluated once every binding it reads is
         // bound, so it fuses into the FINAL join and nowhere earlier. The
@@ -1894,14 +1976,17 @@ pub fn execute_opts(
         // The planner proposes; sizes decide. A join with no provable equality
         // key has nothing to hash on and stays on the reference path.
         let keys = sqljoin::hash_keys(join.on.as_ref(), &left_bindings, &rb);
-        let strategy = sqljoin::choose(exec, keys.len(), rows.len(), right_rows.len());
+        let left_hint = left_src.hint().unwrap_or(usize::MAX);
+        let strategy = sqljoin::choose(exec, keys.len(), left_hint, right_rows.len());
 
-        let (out, removed) = match strategy {
+        let (out, removed, consumed) = match strategy {
             Strategy::NestedLoop => join_nested_loop(
-                &rows, &left_bindings, join, &right_rows, &rb, join_budget, post,
+                left_src.as_mut(), &left_bindings, join, &right_rows, &rb,
+                join_budget, post,
             )?,
             Strategy::Hash => join_hash(
-                &rows, &left_bindings, join, &right_rows, &rb, &keys, join_budget, post,
+                left_src.as_mut(), &left_bindings, join, &right_rows, &rb, &keys,
+                join_budget, post,
             )?,
         };
 
@@ -1911,14 +1996,42 @@ pub fn execute_opts(
             binding: rb.clone(),
             strategy,
             keys: keys.len(),
-            left_rows: rows.len(),
+            left_rows: consumed,
             right_rows: right_rows.len(),
             out_rows: out.len(),
             early_stopped: join_budget.is_some_and(|b| out.len() >= b),
             post_filter_removed: post.map(|_| removed),
         });
         left_bindings.push(rb);
+        // Read the streamed base's counts BEFORE the source is replaced.
+        if ji == 0 {
+            if let Some((pulled, kept)) = left_src.stats() {
+                base_pulled = Some(pulled);
+                base_kept = Some(kept);
+            }
+        }
         rows = out;
+        // The next join reads this join's output, which is already whole.
+        left_src = Box::new(VecLeft { rows: std::mem::take(&mut rows), at: 0 });
+    }
+
+    // Recover the rows from the last source, and record what the streamed
+    // base relation actually delivered.
+    rows = left_src.take_rows();
+    if let Some(i) = base_scan_at {
+        if let (Some(pulled), Some(kept)) = (base_pulled, base_kept) {
+            if let Some(Stage::Scan { rows: r, .. }) = plan.stages.get_mut(i) {
+                *r = pulled;
+            }
+            if let Some(j) = base_prefilter_at {
+                if let Some(Stage::Prefilter { in_rows, out_rows, .. }) =
+                    plan.stages.get_mut(j)
+                {
+                    *in_rows = pulled;
+                    *out_rows = kept;
+                }
+            }
+        }
     }
 
     // ── 2. WHERE ────────────────────────────────────────────────────────────
@@ -2217,23 +2330,31 @@ fn emit_unmatched_right(
 /// predicates the hash path cannot key on, the implementation of record for
 /// non-equality joins, and the oracle the differential tests compare against.
 fn join_nested_loop(
-    rows: &[JoinedRow],
+    left_src: &mut dyn LeftSource,
     left_bindings: &[String],
     join: &Join,
     right_rows: &[Value],
     rb: &str,
     budget: Option<usize>,
     post: Option<&Expr>,
-) -> Result<(Vec<JoinedRow>, usize)> {
+) -> Result<(Vec<JoinedRow>, usize, usize)> {
     let mut out: Vec<JoinedRow> = vec![];
     let mut removed = 0usize;
     // Which right rows found a partner — only needed for RIGHT and FULL.
     let mut right_matched = vec![false; right_rows.len()];
 
-    for left in rows {
+    let mut consumed = 0usize;
+    while let Some(left) = {
         if budget.is_some_and(|b| out.len() >= b) {
-            break;
+            // Stop ASKING. With a streaming left side this is what keeps the
+            // source from producing rows nobody will look at.
+            None
+        } else {
+            left_src.next_left()?
         }
+    } {
+        consumed += 1;
+        let left = &left;
         // Decided by the ON clause ALONE. See `keep_row` for why the
         // post-join filter must not touch this.
         let mut matched = false;
@@ -2276,7 +2397,7 @@ fn join_nested_loop(
             &mut removed,
         )?;
     }
-    Ok((out, removed))
+    Ok((out, removed, consumed))
 }
 
 /// The fast strategy: bucket the right relation, probe it with the left.
@@ -2287,7 +2408,7 @@ fn join_nested_loop(
 /// same expression evaluated on the same rows. See [`crate::sqljoin`] for why
 /// bucketing alone would be unsound here.
 fn join_hash(
-    rows: &[JoinedRow],
+    left_src: &mut dyn LeftSource,
     left_bindings: &[String],
     join: &Join,
     right_rows: &[Value],
@@ -2295,7 +2416,7 @@ fn join_hash(
     keys: &[(Expr, Expr)],
     budget: Option<usize>,
     post: Option<&Expr>,
-) -> Result<(Vec<JoinedRow>, usize)> {
+) -> Result<(Vec<JoinedRow>, usize, usize)> {
     debug_assert!(!keys.is_empty(), "the planner must not choose Hash with no keys");
 
     // ── build: the right relation, keyed ────────────────────────────────────
@@ -2320,10 +2441,16 @@ fn join_hash(
     let mut removed = 0usize;
     let mut right_matched = vec![false; right_rows.len()];
 
-    for left in rows {
+    let mut consumed = 0usize;
+    while let Some(left) = {
         if budget.is_some_and(|b| out.len() >= b) {
-            break;
+            None
+        } else {
+            left_src.next_left()?
         }
+    } {
+        consumed += 1;
+        let left = &left;
         let lb = bind(left);
         let mut lk = Vec::with_capacity(keys.len());
         let mut null_key = false;
@@ -2376,7 +2503,7 @@ fn join_hash(
             &mut removed,
         )?;
     }
-    Ok((out, removed))
+    Ok((out, removed, consumed))
 }
 
 /// Apply the pushed conjuncts for one relation, before it reaches the join.
@@ -2428,13 +2555,133 @@ fn prefilter(
     Ok(kept)
 }
 
-fn fetch(name: &str, resolve: &Resolver) -> Result<Vec<Value>> {
+fn fetch(name: &str, resolve: &Resolver) -> Result<Box<dyn Relation>> {
     match resolve(name)? {
-        Some(rows) => Ok(rows),
+        Some(rel) => Ok(rel),
         // Named rather than silently empty: an unknown table that answered
         // with no rows would look exactly like an empty one.
         None => bail!("relation {:?} does not exist", name),
     }
+}
+
+/// Where a join reads its LEFT rows from.
+///
+/// Both strategies consume the left side in a SINGLE forward pass — the
+/// nested loop iterates it once, and the hash join probes with it once — so an
+/// iterator is a natural fit and no rewinding is needed. That is what makes
+/// the driving relation streamable while the inner side stays materialised.
+trait LeftSource {
+    fn next_left(&mut self) -> Result<Option<JoinedRow>>;
+    /// Best guess at the row count, for the strategy planner.
+    fn hint(&self) -> Option<usize>;
+    /// Whatever rows remain, for a query with no join at all.
+    fn take_rows(&mut self) -> Vec<JoinedRow>;
+    /// `(pulled, kept)` when this is a streamed base relation.
+    fn stats(&self) -> Option<(usize, usize)> {
+        None
+    }
+}
+
+/// The driving relation, pulled on demand and pre-filtered inline.
+///
+/// Pulling lazily is the whole point: with a row budget, a `LIMIT 20` over a
+/// join stops asking for rows long before the source is exhausted, so the
+/// source never has to produce the rest.
+struct StreamLeft {
+    rel: Box<dyn Relation>,
+    binding: String,
+    preds: Vec<Expr>,
+    /// Rows actually requested from the source. Reported as the scan's
+    /// `actual rows`, which for a streamed relation is the honest number —
+    /// the total is not merely unknown, it is irrelevant to what happened.
+    pulled: usize,
+    kept: usize,
+}
+
+impl LeftSource for StreamLeft {
+    fn next_left(&mut self) -> Result<Option<JoinedRow>> {
+        while let Some(row) = self.rel.next_row()? {
+            self.pulled += 1;
+            let one: JoinedRow = vec![(self.binding.clone(), Some(row))];
+            if !self.preds.is_empty() {
+                let b = bind(&one);
+                let mut keep = true;
+                for p in &self.preds {
+                    if truthy(&eval(p, &b)?) != Some(true) {
+                        keep = false;
+                        break;
+                    }
+                }
+                if !keep {
+                    continue;
+                }
+            }
+            self.kept += 1;
+            return Ok(Some(one));
+        }
+        Ok(None)
+    }
+    fn hint(&self) -> Option<usize> {
+        // The source's own count, BEFORE the inline pre-filter. An
+        // over-estimate, which only ever biases the planner toward the hash
+        // path — and the two paths are proven equivalent, so a biased choice
+        // costs time at worst and never correctness.
+        self.rel.size_hint()
+    }
+    fn take_rows(&mut self) -> Vec<JoinedRow> {
+        // Only reached when there is no join, and the base is materialised in
+        // that case, so this drains what is left for completeness.
+        let mut out = vec![];
+        while let Ok(Some(r)) = self.next_left() {
+            out.push(r);
+        }
+        out
+    }
+    fn stats(&self) -> Option<(usize, usize)> {
+        Some((self.pulled, self.kept))
+    }
+}
+
+/// An already-materialised left side: the output of a previous join, or a
+/// base relation in a query the streaming path does not cover.
+struct VecLeft {
+    rows: Vec<JoinedRow>,
+    at: usize,
+}
+
+impl LeftSource for VecLeft {
+    fn next_left(&mut self) -> Result<Option<JoinedRow>> {
+        let r = self.rows.get(self.at).cloned();
+        if r.is_some() {
+            self.at += 1;
+        }
+        Ok(r)
+    }
+    fn hint(&self) -> Option<usize> {
+        Some(self.rows.len().saturating_sub(self.at))
+    }
+    fn take_rows(&mut self) -> Vec<JoinedRow> {
+        let mut v = std::mem::take(&mut self.rows);
+        if self.at > 0 {
+            v = v.split_off(self.at);
+        }
+        self.at = 0;
+        v
+    }
+}
+
+/// Pull a relation completely into memory.
+///
+/// Used for the INNER side of a join, which genuinely has to be whole: a hash
+/// join must build its table before probing, and a nested loop re-scans it for
+/// every left row. Streaming it would save nothing, so this says plainly that
+/// it is being materialised on purpose rather than by omission.
+fn drain(mut rel: Box<dyn Relation>) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(rel.size_hint().unwrap_or(0));
+    while let Some(row) = rel.next_row()? {
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// Parse and run in one call.
@@ -3230,7 +3477,7 @@ mod exec_tests {
     use serde_json::json;
 
     /// A resolver over a fixed set of named tables.
-    fn tables(defs: Vec<(&str, Vec<Value>)>) -> impl Fn(&str) -> Result<Option<Vec<Value>>> {
+    fn tables(defs: Vec<(&str, Vec<Value>)>) -> impl Fn(&str) -> Result<Option<Box<dyn Relation>>> {
         let owned: Vec<(String, Vec<Value>)> =
             defs.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
         move |name: &str| {
@@ -3239,7 +3486,7 @@ mod exec_tests {
             Ok(owned
                 .iter()
                 .find(|(n, _)| n == name || n == bare)
-                .map(|(_, r)| r.clone()))
+                .map(|(_, r)| from_vec(r.clone())))
         }
     }
 
@@ -3494,7 +3741,7 @@ mod exec_tests {
     // ── THE acceptance tests ─────────────────────────────────────────────────
 
     /// The catalogue rows psql's `\dn` and `\dt` actually read.
-    fn catalog() -> impl Fn(&str) -> Result<Option<Vec<Value>>> {
+    fn catalog() -> impl Fn(&str) -> Result<Option<Box<dyn Relation>>> {
         tables(vec![
             (
                 "pg_namespace",
@@ -3631,8 +3878,8 @@ mod operator_syntax_tests {
 
     #[test]
     fn an_OPERATOR_qualified_comparison_EVALUATES() {
-        let t = |_: &str| -> Result<Option<Vec<Value>>> {
-            Ok(Some(vec![json!({"n": "orders"}), json!({"n": "pg_toast_1"})]))
+        let t = |_: &str| -> Result<Option<Box<dyn Relation>>> {
+            Ok(Some(from_vec(vec![json!({"n": "orders"}), json!({"n": "pg_toast_1"})])))
         };
         let (_, rows) = run(
             "SELECT n FROM pg_class WHERE n OPERATOR(pg_catalog.~) '^ord'",
@@ -3682,8 +3929,8 @@ mod collate_tests {
 
     #[test]
     fn a_COLLATE_annotated_comparison_still_evaluates() {
-        let t = |_: &str| -> Result<Option<Vec<Value>>> {
-            Ok(Some(vec![json!({"n": "b"}), json!({"n": "a"})]))
+        let t = |_: &str| -> Result<Option<Box<dyn Relation>>> {
+            Ok(Some(from_vec(vec![json!({"n": "b"}), json!({"n": "a"})])))
         };
         let (_, rows) = run(r#"SELECT n FROM pg_class ORDER BY n COLLATE "C""#, &t).unwrap();
         assert_eq!(rows[0]["n"], json!("a"), "the ORDER BY still sorts");

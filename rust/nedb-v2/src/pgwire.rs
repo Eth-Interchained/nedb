@@ -2460,17 +2460,25 @@ fn try_catalog_select(
         return Ok(None);
     }
 
-    let resolve = |name: &str| -> anyhow::Result<Option<Vec<Value>>> {
+    let resolve = |name: &str| -> anyhow::Result<Option<Box<dyn crate::sqlselect::Relation>>> {
         let cname = catalog_name(name);
         if let Some(rows) = crate::pgcatalog::rows(&cname, db) {
-            return Ok(Some(rows));
+            // A synthesised catalogue relation is small and built eagerly;
+            // wrapping it satisfies the streaming contract without pretending
+            // it is lazy.
+            return Ok(Some(crate::sqlselect::from_vec(rows)));
         }
         // A join between a catalogue relation and a real collection is
-        // legitimate, so a user table still resolves — read whole, because a
-        // join has no predicate to push down.
+        // legitimate, so a user table still resolves.
+        //
+        // NOTE: `nql::query` materialises the whole collection, so this side
+        // is eager even though the evaluator no longer requires it to be.
+        // Making the storage scan itself lazy is the other half of the work
+        // and is tracked in HANDOFF — stated here so nobody reads the
+        // streaming interface as a claim that storage is already streaming.
         match db {
             Some(db) => match crate::nql::query(db, &format!("FROM {}", cname)) {
-                Ok((rows, _)) => Ok(Some(rows)),
+                Ok((rows, _)) => Ok(Some(crate::sqlselect::from_vec(rows))),
                 Err(_) => Ok(None),
             },
             None => Ok(None),

@@ -56,8 +56,8 @@ fn relation(name: &str) -> Option<Vec<Value>> {
     })
 }
 
-fn resolve(name: &str) -> anyhow::Result<Option<Vec<Value>>> {
-    Ok(relation(name))
+fn resolve(name: &str) -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> {
+    Ok(relation(name).map(nedb_engine::sqlselect::from_vec))
 }
 
 /// Run one query with pushdown off and on, under both join strategies, and

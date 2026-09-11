@@ -76,11 +76,11 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn resolve(&self) -> impl Fn(&str) -> anyhow::Result<Option<Vec<Value>>> + '_ {
+    fn resolve(&self) -> impl Fn(&str) -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> + '_ {
         move |t: &str| {
             Ok(match t {
-                "l" => Some(self.left.clone()),
-                "r" => Some(self.right.clone()),
+                "l" => Some(nedb_engine::sqlselect::from_vec(self.left.clone())),
+                "r" => Some(nedb_engine::sqlselect::from_vec(self.right.clone())),
                 _ => None,
             })
         }
@@ -277,10 +277,10 @@ fn a_three_relation_chain_agrees() {
 
     let sel = parse(sql).unwrap();
     // `l AS l2` resolves through the same relation, so the resolver serves it.
-    let resolve = |t: &str| -> anyhow::Result<Option<Vec<Value>>> {
+    let resolve = |t: &str| -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> {
         Ok(match t {
-            "l" => Some(fx.left.clone()),
-            "r" => Some(fx.right.clone()),
+            "l" => Some(nedb_engine::sqlselect::from_vec(fx.left.clone())),
+            "r" => Some(nedb_engine::sqlselect::from_vec(fx.right.clone())),
             _ => None,
         })
     };

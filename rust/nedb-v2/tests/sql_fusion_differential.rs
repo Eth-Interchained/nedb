@@ -53,8 +53,8 @@ fn relation(name: &str) -> Option<Vec<Value>> {
     })
 }
 
-fn resolve(name: &str) -> anyhow::Result<Option<Vec<Value>>> {
-    Ok(relation(name))
+fn resolve(name: &str) -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> {
+    Ok(relation(name).map(nedb_engine::sqlselect::from_vec))
 }
 
 /// Run with the filter fused and unfused, under both join strategies, and
@@ -174,12 +174,12 @@ fn the_filter_must_not_decide_what_counts_as_matched() {
     // If `matched` were influenced by the filter, the left row would be
     // treated as unmatched, NULL-extended, and `r.label IS NULL` would be TRUE
     // for the synthesised row — inventing a row from nothing.
-    fn one(name: &str) -> anyhow::Result<Option<Vec<Value>>> {
-        Ok(Some(match name {
+    fn one(name: &str) -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> {
+        Ok(Some(nedb_engine::sqlselect::from_vec(match name {
             "l" => vec![json!({"k": 1, "v": 10})],
             "r" => vec![json!({"k": 1, "label": "q"})],
             _ => return Ok(None),
-        }))
+        })))
     }
     let sel = parse(
         "SELECT l.v FROM l LEFT JOIN r ON l.k = r.k WHERE r.label IS NULL",

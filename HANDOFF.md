@@ -37,6 +37,7 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #118 | **ambiguous bindings refused; duplicate output names fixed** | two wrong-answer surfaces closed before any further optimiser work |
 | #119 | **conservative predicate pushdown, with recorded refusals** | a selective filter no longer waits for the whole join |
 | #120 | **physical `Filter`-in-`Join`** | `WHERE ... LIMIT n` stops early; `ON` and `WHERE` stay logically distinct |
+| #121 | **streaming `Resolver`** | `LIMIT 20` pulls exactly 20 source rows, not 8000 |
 
 ### The two engines, and which one to trust
 
@@ -121,6 +122,7 @@ Both were caught again this session, and both are cheap to check for:
 | plan topology | 6 | structural, not rendered text |
 | **pushdown differential** | 6 | on vs off, x both join strategies |
 | **fusion differential** | 9 | fused vs unfused, x both join strategies |
+| **streaming** | 12 | counts rows PULLED, with exact assertions |
 | psql introspection | 44 | drives the **real `psql` binary** |
 | `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
@@ -328,13 +330,53 @@ SHRINKS with size (2.7x -> 3.2x -> 1.8x) because at that shape the hash path
 is dominated by materialising relations, not probing them. Stopping the probe
 early cannot recover time already spent cloning 9500 rows.
 
-**The next item, and the measurement above is the argument for it.**
+**Done in #121** — the streaming `Resolver`.
 
-* **A streaming `Resolver`.** The contract hands back an owned `Vec<Value>`,
-  so every execution materialises whole relations before any work. Do NOT
-  reach for a large async abstraction: the smallest iterator-shaped interface
-  permitting *next row* and *stop early*. Then prove `LIMIT 20` does not load
-  8000 source rows to return 20.
+`Resolver` now returns `Box<dyn Relation>`, a two-method trait: `next_row` and
+an optional `size_hint`. Not an async stream, not a borrowing iterator with a
+lifetime threaded through the evaluator — the smallest thing that permits
+*pull a row* and *stop*.
+
+The DRIVING relation is streamed and pre-filtered inline; the INNER side of
+every join is still materialised, on purpose, because a hash join must build
+its table before probing and a nested loop re-scans the inner side per left
+row. That limit is pinned by a test so it is recorded rather than rediscovered
+and mistaken for a bug.
+
+**Verified by counting, not by timing.** A fast run proves nothing about how
+many rows were requested. The test source counts every row it hands out:
+
+| query | left rows pulled (of 8000) |
+|---|---|
+| `... JOIN ... LIMIT 20` | **20** |
+| `... JOIN ... WHERE amount > 500 LIMIT 20` | **92** |
+| `... JOIN ... LIMIT 5 OFFSET 40` | **45** |
+| `... JOIN ...` (no limit) | 8000 |
+| `... ORDER BY ... LIMIT 20` | 8000 (correctly refused) |
+
+Those are EXACT assertions, and that matters. The first version asserted
+`left < 100` — which would have passed at 99 and hidden a real inefficiency.
+Mark asked "why doesn't it pull 20?", and the honest answer was that it does;
+the test simply was not saying so. Moving the budget check to the bottom of
+the loop makes it pull 21, and the exact assertion catches that where the
+loose bound did not.
+
+The 92 is worth keeping written down because it looks arbitrary and is not:
+`amount` is `(7 * i) % 1000`, so rows 0..=71 all fail `> 500` (7 * 71 = 497)
+and rows 72..=91 supply the twenty survivors. 72 rejected + 20 kept, minimal
+for that data.
+
+**Storage is still eager.** `nql::query` materialises a whole collection, so
+the daemon's own resolver hands back a `from_vec`. The EVALUATOR no longer
+requires that, which is the half of the work that had to come first — but
+nobody should read the streaming interface as a claim that the storage scan is
+lazy. Making `nql::query` yield rows is the next step and is noted in
+`pgwire.rs` where the eager call lives.
+
+**The next item.**
+
+* **A lazy storage scan**, so the `LIMIT 20` result above holds end to end
+  rather than only above the storage boundary.
 * **Skew benchmark, then derive the hash crossover from it.**
   `AUTO_HASH_MIN_PAIRS = 64` is a guess. Measure uniform-unique, moderate
   duplicates, a single hot key, all-same-key, and coercion-heavy
