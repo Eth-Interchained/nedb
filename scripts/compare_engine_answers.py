@@ -56,6 +56,23 @@ CORPUS = [
     'FROM jobs SEARCH "acme" LIMIT 1',
     "FROM jobs GROUP BY status COUNT",
     "FROM jobs GROUP BY region COUNT",
+    # Aggregates over `_`-prefixed METADATA fields. `_seq` lives on the node,
+    # not in its data payload, and the Rust aggregator read the payload
+    # directly — so it answered NULL where Python answered correctly. A live
+    # divergence that produced a confident wrong number for the single most
+    # load-bearing question in replication: "what is the newest sequence?"
+    "FROM jobs MAX _seq",
+    "FROM jobs MIN _seq",
+    "FROM jobs SUM _seq",
+    "FROM jobs GROUP BY _seq COUNT",
+    "FROM jobs GROUP BY _coll COUNT",
+    'FROM jobs WHERE status = "open" MAX _seq',
+    # …and over ordinary payload fields, so the comparison has a control.
+    "FROM jobs MAX fee",
+    "FROM jobs MIN fee",
+    "FROM jobs SUM fee",
+    "FROM jobs AVG fee",
+    "FROM jobs COUNT",
     "FROM jobs AS OF 0",
     "FROM jobs AS OF 2",
     "FROM jobs AS OF 3 WHERE fee > 10",

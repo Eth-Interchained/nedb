@@ -227,6 +227,37 @@ def run_engine(label, mk):
           len(q7("FROM t COUNT HAVING count > 3")) == 1
           and q7("FROM t COUNT HAVING count > 99") == [])
 
+    # ── an aggregate over a `_`-prefixed METADATA field ──────────────────────
+    #
+    # `_seq` does not live in a document's payload — it lives on the node. The
+    # Rust aggregator read the payload directly and so answered NULL for
+    # `MAX _seq`, while `SELECT _seq` listed the values and `WHERE _seq > 5`
+    # filtered on them perfectly. Python builds its groups from projected dicts
+    # that already carry `_seq` and answered correctly, so this was a live
+    # cross-engine divergence as well as a wrong answer.
+    #
+    # It matters more than its size: "what is the newest sequence?" is the
+    # question replication, `since()` and time travel are all built on, and a
+    # confident null is the worst possible shape for that answer.
+    print("\n── aggregates over node metadata ──")
+    seqs = [r.get("_seq") for r in q7("FROM t")]
+    check(f"{L} every row carries a _seq to aggregate over",
+          all(isinstance(s, int) for s in seqs), str(seqs[:4]))
+    check(f"{L} MAX _seq is the highest sequence, not null",
+          q7("FROM t MAX _seq")[0]["max__seq"] == max(seqs),
+          str(q7("FROM t MAX _seq")))
+    check(f"{L} MIN _seq is the lowest sequence",
+          q7("FROM t MIN _seq")[0]["min__seq"] == min(seqs))
+    check(f"{L} SUM _seq adds the sequences",
+          q7("FROM t SUM _seq")[0]["sum__seq"] == sum(seqs))
+    check(f"{L} MAX _seq respects WHERE",
+          q7("FROM t WHERE fee > 8 MAX _seq")[0]["max__seq"]
+          == max(r["_seq"] for r in q7("FROM t WHERE fee > 8")))
+    check(f"{L} GROUP BY _seq keys on the sequence, not null",
+          len(q7("FROM t GROUP BY _seq COUNT")) == 12
+          and all(g.get("_seq") is not None for g in q7("FROM t GROUP BY _seq COUNT")),
+          str(q7("FROM t GROUP BY _seq COUNT")[:2]))
+
     # ── a field named like a reserved word ───────────────────────────────────
     #
     # Field positions accept a keyword as a field name, but both engines
