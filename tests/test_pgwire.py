@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-The Postgres read endpoint, driven by a real libpq client.
+The Postgres endpoint — reads AND writes — driven by a real libpq client.
 
 This is the test that matters for `pgwire.rs`: unit tests can prove the SQL→NQL
 translation and the message framing, but only an actual PostgreSQL client can
@@ -88,9 +88,13 @@ def http(port, method, path, body=None):
         return json.loads(r.read() or b"null")
 
 
+HTTP_PORT = [0]
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="nedb-pgwire-")
     http_port, pg_port = free_port(), free_port()
+    HTTP_PORT[0] = http_port
     proc = subprocess.Popen(
         [BIN, "--data", os.path.join(tmp, "data"),
          "--port", str(http_port), "--pg-port", str(pg_port)],
@@ -141,8 +145,9 @@ def main():
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
         sys.exit(1)
-    print("A real PostgreSQL client reads the tamper-evident store with plain SQL —")
-    print("including AS OF SYSTEM TIME, which is Postgres's own time-travel syntax.")
+    print("A real PostgreSQL client READS AND WRITES the tamper-evident store with")
+    print("plain SQL. An UPDATE is a new version, so the prior value survives — which")
+    print("is the whole reason the write path belongs on this endpoint.")
 
 
 def run_suite(pg_port, cause_hash):
@@ -160,16 +165,22 @@ def run_suite(pg_port, cause_hash):
         return cols, (cur.fetchall() if cur.description else [])
 
     def err(sql):
+        """The error a statement raises, or None when it succeeded.
+
+        Deliberately does NOT fetchall(): a write without RETURNING has no
+        result set, and psycopg2 raises "no results to fetch" for that — which
+        would be reported as the statement failing when it actually worked.
+        """
         try:
             cur.execute(sql)
-            cur.fetchall()
             return None
         except Exception as e:                                      # noqa: BLE001
             return str(e).strip()
 
     cols, rows = q("SELECT version()")
     check("SELECT version() answers", rows and "NEDB" in rows[0][0], str(rows)[:80])
-    check("...and says it is read-only", rows and "read" in rows[0][0].lower())
+    check("...and advertises the write surface",
+          rows and "INSERT" in rows[0][0], str(rows)[:90])
 
     # ── reads ────────────────────────────────────────────────────────────────
     print("\n── SELECT ──")
@@ -238,12 +249,116 @@ def run_suite(pg_port, cause_hash):
     check("the causal parent's hash is visible over SQL",
           any(r[1] == cause_hash for r in rows), str(rows)[:90])
 
+    # ── WRITES: the reason this endpoint is worth having ─────────────────────
+    #
+    # SQL's write semantics and NEDB's append-only model line up, so these are
+    # first-class. The assertion that matters is the LAST one in this block:
+    # after a plain SQL UPDATE, the prior value is still readable.
+    print("\n── writes: INSERT / UPDATE / DELETE ──")
+    cur.execute("INSERT INTO inv (_id, item, qty) VALUES ('i1', 'bolt', 10)")
+    check("INSERT reports the Postgres command tag",
+          cur.statusmessage == "INSERT 0 1", cur.statusmessage)
+    cols, rows = q("SELECT item, qty FROM inv WHERE _id = 'i1'")
+    check("...and the row is really there", rows == [("bolt", 10)], str(rows))
+
+    cur.execute("INSERT INTO inv (_id, item, qty) VALUES ('i2','nut',5),('i3','washer',99)")
+    check("a multi-row INSERT writes every row",
+          cur.statusmessage == "INSERT 0 2", cur.statusmessage)
+
+    cols, rows = q("INSERT INTO inv (_id, item, qty) VALUES ('i4','screw',7) "
+                   "RETURNING _id, qty, _seq")
+    check("INSERT … RETURNING returns the written row",
+          len(rows) == 1 and rows[0][0] == "i4" and rows[0][1] == 7, str(rows))
+    check("...with the columns asked for", cols == ["_id", "qty", "_seq"], str(cols))
+    check("...and still exactly one command tag",
+          cur.statusmessage == "INSERT 0 1", cur.statusmessage)
+
+    # An INSERT with no id column: the server assigns one rather than
+    # overwriting a shared default.
+    cur.execute("INSERT INTO auto (n) VALUES (1)")
+    cur.execute("INSERT INTO auto (n) VALUES (2)")
+    cols, rows = q("SELECT COUNT(*) FROM auto")
+    check("an INSERT with no id column gets a unique key each time",
+          rows == [(2,)], f"{rows} — a shared default would collapse to 1")
+
+    print("\n── UPDATE is a new version, not an overwrite ──")
+    cols, rows = q("SELECT _seq FROM inv WHERE _id = 'i1'")
+    seq_before = rows[0][0]
+    cols, rows = q("UPDATE inv SET qty = 999, item = 'amended' WHERE _id = 'i1' "
+                   "RETURNING _id, item, qty")
+    check("UPDATE … RETURNING returns the new version",
+          rows == [("i1", "amended", 999)], str(rows))
+    check("UPDATE reports the row count", cur.statusmessage == "UPDATE 1",
+          cur.statusmessage)
+    cols, rows = q("SELECT item, qty FROM inv WHERE _id = 'i1'")
+    check("the current value is the updated one", rows == [("amended", 999)], str(rows))
+
+    # THE ASSERTION THIS WHOLE ENDPOINT EXISTS FOR.
+    cols, rows = q(f"SELECT item, qty FROM inv AS OF SYSTEM TIME {seq_before} "
+                   f"WHERE _id = 'i1'")
+    check("the PRIOR value survives a plain SQL UPDATE",
+          rows == [("bolt", 10)],
+          f"{rows} — an UPDATE must not destroy history")
+
+    cols, rows = q("UPDATE inv SET checked = TRUE WHERE qty > 50 RETURNING _id")
+    check("UPDATE uses the full predicate surface", len(rows) >= 1, str(rows))
+
+    print("\n── DELETE is a tombstone ──")
+    cols, rows = q("DELETE FROM inv WHERE _id = 'i2' RETURNING _id, item")
+    check("DELETE … RETURNING returns the row as it was",
+          rows == [("i2", "nut")], str(rows))
+    check("DELETE reports the row count", cur.statusmessage == "DELETE 1",
+          cur.statusmessage)
+    check("...and the row is gone from the live view",
+          q("SELECT _id FROM inv WHERE _id = 'i2'")[1] == [], "still present")
+    cur.execute("DELETE FROM inv WHERE _id = 'nope'")
+    check("a DELETE matching nothing reports 0",
+          cur.statusmessage == "DELETE 0", cur.statusmessage)
+
+    print("\n── provenance is settable from SQL ──")
+    cols, rows = q("INSERT INTO chain (_id, kind) VALUES ('root', 'policy') "
+                   "RETURNING _hash")
+    root_hash = rows[0][0]
+    cur.execute("INSERT INTO chain (_id, _caused_by, kind) "
+                f"VALUES ('leaf', '{root_hash}', 'derived')")
+    cols, rows = q("SELECT _id, _caused_by FROM chain WHERE _id = 'leaf'")
+    check("_caused_by set via SQL lands on the node",
+          rows and root_hash in str(rows[0][1]), str(rows))
+    cols, rows = q("SELECT _id FROM chain TRACE caused_by")
+    check("...and TRACE walks the chain it created", len(rows) >= 1, str(rows))
+
+    print("\n── writes that cannot be stored faithfully are refused ──")
+    for sql, expect in [
+        ("INSERT INTO t VALUES (1)", "explicit column list"),
+        ("INSERT INTO t (a) VALUES (1 + 1)", "cannot use"),
+        ("INSERT INTO t (a) VALUES (now())", "cannot use"),
+        ("INSERT INTO t (a, b) VALUES (1)", "values for"),
+        ("UPDATE t SET", "no assignments"),
+        ("TRUNCATE inv", "append-only"),
+        ("CREATE TABLE t (a int)", "DDL"),
+    ]:
+        e = err(sql)
+        check(f"refused: {sql[:40]}", e is not None and expect in e, str(e)[:100])
+
+    # The chain must still verify after all of that — writes through SQL are
+    # ordinary engine writes, not a side door around the hash chain.
+    print("\n── the chain is intact after SQL writes ──")
+    import urllib.request as _u
+    with _u.urlopen(f"http://127.0.0.1:{HTTP_PORT[0]}/v1/databases/shop/verify",
+                    timeout=10) as r:
+        v = json.loads(r.read())
+    check("verify() still passes after INSERT/UPDATE/DELETE over SQL",
+          v.get("ok") is True, str(v)[:110])
+    check("...and the chain is still tamper-evident",
+          v.get("tamper_evident") is True, str(v)[:110])
+
     # ── refusals: every one names the boundary ───────────────────────────────
     print("\n── refusals say what the boundary is ──")
     for sql, expect in [
-        ("INSERT INTO orders VALUES (1)", "caused_by"),
-        ("UPDATE orders SET total = 1", "append-only"),
-        ("DELETE FROM orders", "read-only"),
+        # INSERT/UPDATE/DELETE are SUPPORTED now — they are covered in the
+        # writes block above, and an unqualified DELETE really does affect the
+        # whole collection (as it does in Postgres), so it must not be fired
+        # against a fixture other assertions still depend on.
         ("CREATE TABLE t (a int)", "DDL"),
         ("SELECT * FROM orders JOIN audit ON 1=1", "JOIN is not supported"),
         ("SELECT DISTINCT region FROM orders", "GROUP BY"),
