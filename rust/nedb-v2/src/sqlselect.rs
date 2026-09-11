@@ -1728,6 +1728,32 @@ pub fn execute_explain(
     execute_with(sel, resolve, exec, true)
 }
 
+/// Execution options. Every switch exists so a differential test can run the
+/// SAME query with the optimisation on and off and compare — without that, a
+/// test believing it exercised an optimisation could be measuring the
+/// unoptimised path, and the equivalence suite would prove nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct Opts {
+    pub exec: JoinExec,
+    pub pushdown: bool,
+    /// Evaluate the `WHERE` clause inside the final join rather than as a
+    /// separate pass. Semantically identical; it is what lets the row budget
+    /// apply to a filtered join.
+    pub fuse_filter: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts { exec: JoinExec::Auto, pushdown: true, fuse_filter: true }
+    }
+}
+
+impl Opts {
+    pub fn exec(exec: JoinExec) -> Self {
+        Opts { exec, ..Default::default() }
+    }
+}
+
 /// As [`execute_explain`], with predicate pushdown switchable.
 ///
 /// The switch exists so differential tests can run the SAME query with and
@@ -1740,6 +1766,17 @@ pub fn execute_with(
     exec: JoinExec,
     pushdown: bool,
 ) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
+    execute_opts(sel, resolve, Opts { exec, pushdown, ..Default::default() })
+}
+
+/// The full form.
+pub fn execute_opts(
+    sel: &Select,
+    resolve: &Resolver,
+    opts: Opts,
+) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
+    let exec = opts.exec;
+    let pushdown = opts.pushdown;
     let mut plan = Plan::default();
 
     // ── 0a. semantic validation, before any work ────────────────────────────
@@ -1767,12 +1804,18 @@ pub fn execute_with(
     // interactive client sends constantly, and it was measured taking 32ms to
     // return 20 rows out of an 8000-row join. A wider rewrite needs a
     // streaming executor, not a cleverer predicate.
+    // Fusing the `WHERE` into the final join is what makes a filtered query
+    // eligible: the join's own output is then already filtered, so its length
+    // is a real count of final rows and stopping early keeps a true prefix.
+    // Without the fusion a `WHERE` had to disqualify the budget entirely.
+    let fuse = opts.fuse_filter && sel.where_.is_some() && !sel.joins.is_empty();
+
     let budget: Option<usize> = match sel.limit {
         Some(lim)
             if sel.order_by.is_empty()
                 && !sel.distinct
-                && sel.where_.is_none()
-                && sel.joins.len() == 1 =>
+                && !sel.joins.is_empty()
+                && (sel.where_.is_none() || fuse) =>
         {
             Some(lim.saturating_add(sel.offset.unwrap_or(0)))
         }
@@ -1829,7 +1872,8 @@ pub fn execute_with(
         None => vec![],
         Some(t) => vec![t.binding()],
     };
-    for join in &sel.joins {
+    let last = sel.joins.len().saturating_sub(1);
+    for (ji, join) in sel.joins.iter().enumerate() {
         let right_rows = fetch(&join.table.name, resolve)?;
         let rb = join.table.binding();
         plan.push(Stage::Scan {
@@ -1839,18 +1883,26 @@ pub fn execute_with(
         });
         let right_rows = prefilter(right_rows, &rb, &push, &mut plan)?;
 
+        // The filter can only be evaluated once every binding it reads is
+        // bound, so it fuses into the FINAL join and nowhere earlier. The
+        // budget likewise applies only there: capping an intermediate join
+        // can starve a later one of rows it needed.
+        let is_last = ji == last;
+        let post = if fuse && is_last { sel.where_.as_ref() } else { None };
+        let join_budget = if is_last { budget } else { None };
+
         // The planner proposes; sizes decide. A join with no provable equality
         // key has nothing to hash on and stays on the reference path.
         let keys = sqljoin::hash_keys(join.on.as_ref(), &left_bindings, &rb);
         let strategy = sqljoin::choose(exec, keys.len(), rows.len(), right_rows.len());
 
-        let out = match strategy {
-            Strategy::NestedLoop => {
-                join_nested_loop(&rows, &left_bindings, join, &right_rows, &rb, budget)?
-            }
-            Strategy::Hash => {
-                join_hash(&rows, &left_bindings, join, &right_rows, &rb, &keys, budget)?
-            }
+        let (out, removed) = match strategy {
+            Strategy::NestedLoop => join_nested_loop(
+                &rows, &left_bindings, join, &right_rows, &rb, join_budget, post,
+            )?,
+            Strategy::Hash => join_hash(
+                &rows, &left_bindings, join, &right_rows, &rb, &keys, join_budget, post,
+            )?,
         };
 
         plan.push(Stage::Join {
@@ -1862,14 +1914,15 @@ pub fn execute_with(
             left_rows: rows.len(),
             right_rows: right_rows.len(),
             out_rows: out.len(),
-            early_stopped: budget.is_some_and(|b| out.len() >= b),
+            early_stopped: join_budget.is_some_and(|b| out.len() >= b),
+            post_filter_removed: post.map(|_| removed),
         });
         left_bindings.push(rb);
         rows = out;
     }
 
     // ── 2. WHERE ────────────────────────────────────────────────────────────
-    if let Some(pred) = &sel.where_ {
+    if let Some(pred) = sel.where_.as_ref().filter(|_| !fuse) {
         let in_rows = rows.len();
         let mut kept = Vec::with_capacity(rows.len());
         for r in rows {
@@ -2086,6 +2139,45 @@ pub fn execute_with(
 // The two join implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Apply the post-join filter to one produced row.
+///
+/// # An `ON` predicate and a post-join `WHERE` predicate are NOT the same thing
+///
+/// The physical join evaluates both inside one loop, which is where the
+/// performance comes from. It does NOT merge them, and the difference is
+/// semantic law rather than a matter of taste:
+///
+/// ```text
+///   LEFT JOIN ... ON a.x = b.x AND b.tag = 'q'     keeps every left row
+///   LEFT JOIN ... ON a.x = b.x WHERE b.tag = 'q'   discards the outer rows
+/// ```
+///
+/// So the order is fixed and each step sees only what it should:
+///
+/// 1. form the candidate pair
+/// 2. evaluate `ON` — and this ALONE decides whether the row counts as
+///    matched, for both the left row and the right row
+/// 3. synthesise NULLs if the outer join requires it
+/// 4. evaluate the post-join filter
+/// 5. count the survivor toward the row budget
+///
+/// Step 2 is the load-bearing one. If the filter were allowed to influence
+/// "matched", a left row whose only partner fails the filter would be
+/// NULL-extended — and a filter like `WHERE b.tag IS NULL` would then ACCEPT
+/// that synthesised row, inventing output that the unfused pipeline never
+/// produces. It is the same trap that made the first predicate-pushdown
+/// attempt wrong, in a different place.
+fn keep_row(cand: &JoinedRow, post: Option<&Expr>, removed: &mut usize) -> Result<bool> {
+    let Some(p) = post else { return Ok(true) };
+    // Only TRUE keeps a row, exactly as a standalone `WHERE` stage does.
+    if truthy(&eval(p, &bind(cand))?) == Some(true) {
+        Ok(true)
+    } else {
+        *removed += 1;
+        Ok(false)
+    }
+}
+
 /// `RIGHT`/`FULL`: every right row that found no partner survives, with every
 /// left binding NULL.
 ///
@@ -2098,9 +2190,11 @@ fn emit_unmatched_right(
     right_rows: &[Value],
     right_matched: &[bool],
     rb: &str,
-) {
+    post: Option<&Expr>,
+    removed: &mut usize,
+) -> Result<()> {
     if !matches!(kind, JoinKind::Right | JoinKind::Full) {
-        return;
+        return Ok(());
     }
     for (ri, right) in right_rows.iter().enumerate() {
         if right_matched[ri] {
@@ -2108,8 +2202,13 @@ fn emit_unmatched_right(
         }
         let mut cand: JoinedRow = left_bindings.iter().map(|b| (b.clone(), None)).collect();
         cand.push((rb.to_string(), Some(right.clone())));
-        out.push(cand);
+        // Outer rows face the post-join filter too — it is a `WHERE`, and a
+        // `WHERE` applies to every row the join produced.
+        if keep_row(&cand, post, removed)? {
+            out.push(cand);
+        }
     }
+    Ok(())
 }
 
 /// The reference strategy: consider every pair.
@@ -2124,8 +2223,10 @@ fn join_nested_loop(
     right_rows: &[Value],
     rb: &str,
     budget: Option<usize>,
-) -> Result<Vec<JoinedRow>> {
+    post: Option<&Expr>,
+) -> Result<(Vec<JoinedRow>, usize)> {
     let mut out: Vec<JoinedRow> = vec![];
+    let mut removed = 0usize;
     // Which right rows found a partner — only needed for RIGHT and FULL.
     let mut right_matched = vec![false; right_rows.len()];
 
@@ -2133,11 +2234,13 @@ fn join_nested_loop(
         if budget.is_some_and(|b| out.len() >= b) {
             break;
         }
+        // Decided by the ON clause ALONE. See `keep_row` for why the
+        // post-join filter must not touch this.
         let mut matched = false;
         for (ri, right) in right_rows.iter().enumerate() {
             let mut cand: JoinedRow = left.clone();
             cand.push((rb.to_string(), Some(right.clone())));
-            let keep = match &join.on {
+            let joins_here = match &join.on {
                 // CROSS JOIN has no predicate: every pair survives.
                 None => true,
                 // An ON that evaluates to UNKNOWN does NOT join, exactly
@@ -2145,17 +2248,21 @@ fn join_nested_loop(
                 // pairings out of missing data.
                 Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
             };
-            if keep {
+            if joins_here {
                 matched = true;
                 right_matched[ri] = true;
-                out.push(cand);
+                if keep_row(&cand, post, &mut removed)? {
+                    out.push(cand);
+                }
             }
         }
         // LEFT/FULL: an unmatched left row survives with a NULL right.
         if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
             let mut cand: JoinedRow = left.clone();
             cand.push((rb.to_string(), None));
-            out.push(cand);
+            if keep_row(&cand, post, &mut removed)? {
+                out.push(cand);
+            }
         }
     }
 
@@ -2164,9 +2271,12 @@ fn join_nested_loop(
     // answer. Skipping them is the point of the budget; emitting them would be
     // correct but pointless work.
     if !budget.is_some_and(|b| out.len() >= b) {
-        emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+        emit_unmatched_right(
+            &mut out, join.kind, left_bindings, right_rows, &right_matched, rb, post,
+            &mut removed,
+        )?;
     }
-    Ok(out)
+    Ok((out, removed))
 }
 
 /// The fast strategy: bucket the right relation, probe it with the left.
@@ -2184,7 +2294,8 @@ fn join_hash(
     rb: &str,
     keys: &[(Expr, Expr)],
     budget: Option<usize>,
-) -> Result<Vec<JoinedRow>> {
+    post: Option<&Expr>,
+) -> Result<(Vec<JoinedRow>, usize)> {
     debug_assert!(!keys.is_empty(), "the planner must not choose Hash with no keys");
 
     // ── build: the right relation, keyed ────────────────────────────────────
@@ -2206,6 +2317,7 @@ fn join_hash(
 
     // ── probe: the accumulated left rows ────────────────────────────────────
     let mut out: Vec<JoinedRow> = vec![];
+    let mut removed = 0usize;
     let mut right_matched = vec![false; right_rows.len()];
 
     for left in rows {
@@ -2234,30 +2346,37 @@ fn join_hash(
                 let mut cand: JoinedRow = left.clone();
                 cand.push((rb.to_string(), Some(right_rows[ri].clone())));
                 // Confirm. The bucket only suggested this pair.
-                let keep = match &join.on {
+                let joins_here = match &join.on {
                     None => true,
                     Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
                 };
-                if keep {
+                if joins_here {
                     matched = true;
                     right_matched[ri] = true;
-                    out.push(cand);
+                    if keep_row(&cand, post, &mut removed)? {
+                        out.push(cand);
+                    }
                 }
             }
         }
         if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
             let mut cand: JoinedRow = left.clone();
             cand.push((rb.to_string(), None));
-            out.push(cand);
+            if keep_row(&cand, post, &mut removed)? {
+                out.push(cand);
+            }
         }
     }
 
     // See the note in `join_nested_loop`: beyond the budget these rows cannot
     // survive the `LIMIT` prefix.
     if !budget.is_some_and(|b| out.len() >= b) {
-        emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+        emit_unmatched_right(
+            &mut out, join.kind, left_bindings, right_rows, &right_matched, rb, post,
+            &mut removed,
+        )?;
     }
-    Ok(out)
+    Ok((out, removed))
 }
 
 /// Apply the pushed conjuncts for one relation, before it reaches the join.

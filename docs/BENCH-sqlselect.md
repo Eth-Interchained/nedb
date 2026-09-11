@@ -5,11 +5,12 @@ SPDX-FileCopyrightText: © 2026 INTERCHAINED LLC × Claude Sonnet 4.6
 
 # SQL evaluator baselines — nested loop vs hash join
 
-Recorded at engine **4.0.0**, PRs #116, #117 and #119, on the CI-class sandbox
-this repo is developed in (Linux x86-64). Reproduce with:
+Recorded at engine **4.0.0**, PRs #116, #117, #119 and #120, on the CI-class
+sandbox this repo is developed in (Linux x86-64). Reproduce with:
 
 ```bash
-cargo run --release --example sqlbench
+cargo run --release --example sqlbench    # the workload table
+cargo run --release --example fusebench   # filter fusion, measured directly
 ```
 
 ## Why this file exists
@@ -146,9 +147,45 @@ outer-join query with a predicate on the nullable side sees no improvement —
 and the plan says why. That is not a gap to close; it is the correctness
 boundary.
 
-**A `WHERE` clause still disqualifies the row budget**, because filtering
-happens after the join. Fusing `Filter` into the join is the next step, and it
-is what would let `join + selective pred` stop early as well as start smaller.
+**A `WHERE` clause used to disqualify the row budget entirely**, because
+filtering happened after the join — so `... WHERE ... LIMIT 20` had to
+materialise the whole join first. #120 fuses the filter INTO the final join,
+which makes the join's own output already-filtered and therefore a true
+prefix.
+
+Measured directly by `examples/fusebench`, which runs the same query with
+`fuse_filter` off and on and asserts both return the same row count:
+
+```
+SELECT o.id, c.name FROM orders o JOIN customers c
+  ON o.customer_id = c.id WHERE o.amount > 500 LIMIT 20
+```
+
+| shape | unfused | fused | gain |
+|---|---:|---:|---:|
+| 1000 x 500, nested | 190.92 | **5.28** | 36.1x |
+| 1000 x 500, hash | 3.23 | **1.21** | 2.7x |
+| 3000 x 1000, nested | 1115.02 | **11.43** | 97.5x |
+| 3000 x 1000, hash | 10.34 | **3.20** | 3.2x |
+| 8000 x 1500, nested | 4657.18 | **34.20** | 136.2x |
+| 8000 x 1500, hash | 19.90 | **11.22** | 1.8x |
+
+Two things in that table are worth reading carefully.
+
+The nested-loop gain **grows** with size (36x -> 98x -> 136x), which is the
+expected signature of replacing "materialise everything, then take 20" with
+"stop at 20".
+
+The hash-join gain **shrinks** at the largest shape (2.7x -> 3.2x -> 1.8x),
+and that is not noise — it is the next bottleneck becoming visible. At
+8000 x 1500 the hash path spends most of its 11ms materialising relations
+rather than probing, and stopping the probe early cannot recover time already
+spent cloning 9500 rows. That is the argument for a streaming `Resolver`,
+stated by measurement rather than by intuition.
+
+Note also that the unfused nested figure (4657ms) is well below the
+`join + broad pred` figure (8055ms) for a comparable predicate: pushdown has
+already halved `orders` before the join runs. The two optimisations compose.
 
 **`join + broad pred` and `join + sort` gain least**, which makes sense —
 their cost is dominated by materialising and then sorting ~5–7k output rows,

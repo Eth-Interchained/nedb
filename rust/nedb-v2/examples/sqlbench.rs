@@ -159,6 +159,7 @@ fn main() {
         ("join + broad pred", "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.amount > 100"),
         ("join + sort", "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id ORDER BY c.name, o.id"),
         ("join + limit", "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id LIMIT 20"),
+        ("join + pred + limit", "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.amount > 500 LIMIT 20"),
         ("non-equality join", "SELECT o.id FROM orders o JOIN customers c ON o.amount > 995"),
     ];
 
