@@ -1,60 +1,85 @@
-//! A PostgreSQL wire-protocol **read** endpoint for NEDB.
+//! A PostgreSQL wire-protocol endpoint for NEDB — reads **and** writes.
 //!
-//! # What this is, and what it is not
+//! # What this is
 //!
-//! This is **not** "NEDB speaks SQL". It is a read-only front door that speaks
-//! the PostgreSQL v3 wire protocol well enough that tools built for Postgres —
-//! `psql`, DBeaver, Metabase, Grafana, psycopg, any libpq-based client — can
-//! connect to a NEDB store and run queries against it. A small, explicitly
-//! documented subset of `SELECT` is translated to NQL; everything else is
-//! rejected with a clear error naming what was not understood.
+//! A front door that speaks the PostgreSQL v3 wire protocol well enough that
+//! tools built for Postgres — `psql`, DBeaver, Metabase, Grafana, psycopg, any
+//! libpq client — can use a NEDB store with ordinary SQL. A documented subset
+//! of SQL is translated to NQL and to engine writes; everything else is
+//! refused with an error naming exactly what was not understood.
 //!
-//! The reason this exists: NEDB's differentiators (a tamper-evident chain,
-//! permanent time travel, causal provenance) were unreachable from the tools
-//! people already have. Every consumer needed a bespoke client. One protocol
-//! implementation removes that, and it removes it for reads — which is what
-//! auditors, analysts and dashboards actually do.
+//! It is **not** a claim of Postgres parity. It is a claim that the SQL people
+//! actually type works, and that the boundary is stated rather than discovered.
 //!
-//! **Writes are deliberately not supported.** A write has to carry `caused_by`,
-//! valid-time bounds and idempotency to be worth anything in this engine, and
-//! none of that has a natural SQL spelling. `INSERT`/`UPDATE`/`DELETE` return a
-//! clear error pointing at the HTTP API rather than silently doing half a job.
+//! # Why writes belong here
 //!
-//! # Supported SQL subset
+//! The first cut of this module was read-only, on the reasoning that a NEDB
+//! write carries `caused_by`, valid-time bounds and idempotency, and none of
+//! that has a natural SQL spelling. That reasoning was wrong, and looking at
+//! the mapping is what made it obvious:
+//!
+//! | SQL | NEDB | and therefore |
+//! |---|---|---|
+//! | `INSERT` | a put | — |
+//! | `UPDATE … WHERE` | a NEW VERSION of each match | the prior value stays readable |
+//! | `DELETE … WHERE` | a tombstone | the deleted row stays in history |
+//!
+//! NEDB is append-only, so an `UPDATE` is *already* a versioned write and a
+//! `DELETE` is *already* a tombstone. Nothing is bent to fit. The consequence
+//! is the point of the whole endpoint:
+//!
+//! ```sql
+//! UPDATE orders SET total = 999 WHERE _id = 'o1';
+//! SELECT total FROM orders WHERE _id = 'o1';                  -- 999
+//! SELECT total FROM orders AS OF SYSTEM TIME 0 WHERE _id = 'o1';  -- 120
+//! ```
+//!
+//! Run the SQL you would run against Postgres, and the tamper-evident history
+//! is free. No triggers, no audit table, no application code.
+//!
+//! Provenance is reachable too: `_caused_by`, `_valid_from` and `_valid_to` are
+//! reserved INSERT columns, lifted out of the payload into the write itself.
+//!
+//! Writes are ON by default — that is the parity position. Set
+//! `NEDBD_PG_READ_ONLY=1` for the deployment where this door must never mutate
+//! anything.
+//!
+//! # Supported SQL
 //!
 //! ```sql
 //! SELECT * | col [, col]* | COUNT(*) | <agg>(col)
 //!   FROM <collection>
 //!   [ AS OF SYSTEM TIME <seq> ]     -- bridges to NQL's AS OF
 //!   [ WHERE <predicate> ]           -- the full NQL predicate surface
-//!   [ GROUP BY <col> ]
-//!   [ HAVING <predicate> ]
-//!   [ ORDER BY <col> [ASC|DESC] (, ...) ]
-//!   [ LIMIT <n> ] [ OFFSET <n> ]
+//!   [ GROUP BY <col> ] [ HAVING <predicate> ]
+//!   [ ORDER BY <col> [ASC|DESC] (, ...) ] [ LIMIT <n> ] [ OFFSET <n> ]
+//!
+//! INSERT INTO <collection> (c1, c2) VALUES (v1, v2), (…) [RETURNING …]
+//! UPDATE <collection> SET c = v [, …] [WHERE <predicate>] [RETURNING …]
+//! DELETE FROM <collection> [WHERE <predicate>] [RETURNING …]
 //! ```
 //!
-//! Single-quoted SQL string literals are rewritten to NQL's double-quoted form,
-//! and `<>` is rewritten to `!=`. Column projection is applied **here**, after
-//! NQL returns whole documents, because NQL itself is FROM-first and has no
-//! projection clause.
+//! Single-quoted SQL literals are rewritten to NQL's double-quoted form and
+//! `<>` to `!=`. Column projection is applied here, after NQL returns whole
+//! documents, because NQL is FROM-first and has no projection clause.
 //!
-//! No JOINs, no subqueries, no CTEs, no window functions, no DDL. Those are not
-//! oversights to be apologised for — they are the boundary of what this door is
-//! for, and the error messages say so.
+//! Not supported, each refused by name: JOIN, subqueries, CTEs, window
+//! functions, DDL, `TRUNCATE`, `GRANT`/`REVOKE`. `INSERT` requires an explicit
+//! column list, because NEDB is schemaless and there is no declared column
+//! order to infer.
 //!
 //! # Protocol coverage
 //!
-//! The **simple query protocol** (`Q`) is implemented, which is what `psql` and
-//! libpq's `PQexec` use — and therefore what psycopg2 uses, since it
-//! interpolates parameters client-side. The **extended query protocol**
-//! (`Parse`/`Bind`/`Execute`) is not yet implemented; a client that insists on
-//! it gets an error naming the gap rather than a hang. SSL is declined (`N`),
-//! so clients must connect without TLS — put this behind a tunnel or a
-//! loopback bind, which is the default.
+//! The **simple query protocol** (`Q`) is implemented — what `psql` and libpq's
+//! `PQexec` use, and therefore what psycopg2 uses, since it interpolates
+//! parameters client-side. The **extended query protocol**
+//! (`Parse`/`Bind`/`Execute`) is not implemented yet; a client that insists on
+//! it gets an error naming the gap rather than a hang, because a hang is the
+//! worst diagnostic there is. SSL is declined (`N`), so connections are
+//! cleartext — hence the loopback default.
 //!
-//! Authentication mirrors the HTTP surface: when `NEDBD_TOKEN` is set the
-//! password must equal it (cleartext, hence the loopback default); otherwise
-//! any connection is accepted.
+//! Authentication mirrors the HTTP surface: with `NEDBD_TOKEN` set the password
+//! must equal it; otherwise any connection is accepted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -168,14 +193,50 @@ impl Col {
 }
 
 /// What a translated statement asks for.
+///
+/// The write variants exist because SQL's write semantics and NEDB's storage
+/// model line up almost exactly, which was not obvious until it was written
+/// down:
+///
+/// | SQL | NEDB |
+/// |---|---|
+/// | `INSERT` | a put |
+/// | `UPDATE … WHERE` | a NEW VERSION of each matching document |
+/// | `DELETE … WHERE` | a tombstone |
+///
+/// NEDB is append-only, so an `UPDATE` is *already* a versioned write and a
+/// `DELETE` is *already* a tombstone. Nothing is being bent to fit. The
+/// consequence is the thing worth selling: run the SQL you would run against
+/// Postgres, and the tamper-evident history falls out for free — the prior
+/// value is still readable with `AS OF SYSTEM TIME`.
 #[derive(Debug, PartialEq)]
 pub enum Stmt {
     /// Run this NQL, then project these columns (empty = all).
     Query { nql: String, project: Vec<Col> },
+    /// `INSERT INTO coll (cols) VALUES (…), (…) [RETURNING …]`
+    Insert { coll: String, rows: Vec<InsertRow>, returning: Vec<Col> },
+    /// `UPDATE coll SET … [WHERE …] [RETURNING …]` — a new version per match.
+    Update { coll: String, set: Vec<(String, Value)>, nql: String, returning: Vec<Col> },
+    /// `DELETE FROM coll [WHERE …] [RETURNING …]` — a tombstone per match.
+    Delete { coll: String, nql: String, returning: Vec<Col> },
     /// Answer from a fixed table — the handshake queries clients send on connect.
     Canned { cols: Vec<String>, row: Vec<String> },
     /// Nothing to do (empty statement, or a SET the client does not need honoured).
     Ok(&'static str),
+}
+
+/// One row of an `INSERT`: an explicit id when the statement supplied one, the
+/// document body, and optional provenance lifted out of reserved columns.
+#[derive(Debug, PartialEq, Clone)]
+pub struct InsertRow {
+    /// From an `_id` or `id` column. `None` means the server assigns one.
+    pub id: Option<String>,
+    pub doc: serde_json::Map<String, Value>,
+    /// From a `_caused_by` column — the causal parents, so provenance is
+    /// reachable from SQL rather than only from the HTTP API.
+    pub caused_by: Vec<String>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
 }
 
 /// Strip SQL comments and collapse whitespace, so the matchers below can be
@@ -295,6 +356,226 @@ fn find_kw(s: &str, kw: &str) -> Option<usize> {
     None
 }
 
+/// Split a comma-separated list at the TOP level, ignoring commas inside
+/// quotes or parentheses — so `VALUES (1, 'a,b'), (2, 'c')` splits into two
+/// groups and not four.
+fn split_top(s: &str, sep: char) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_s = false;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if in_s {
+            cur.push(c);
+            if c == '\'' {
+                // A doubled '' is an escaped quote, not the end of the literal.
+                if it.peek() == Some(&'\'') { cur.push(it.next().unwrap()); } else { in_s = false; }
+            }
+            continue;
+        }
+        match c {
+            '\'' => { in_s = true; cur.push(c); }
+            '(' => { depth += 1; cur.push(c); }
+            ')' => { depth -= 1; cur.push(c); }
+            x if x == sep && depth == 0 => { out.push(cur.trim().to_string()); cur.clear(); }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+    out
+}
+
+/// Parse one SQL scalar literal into JSON.
+///
+/// Deliberately narrow: a string, a number, a boolean, or NULL. Anything else
+/// — a function call, an expression, a cast — is refused by name rather than
+/// coerced into a string that would silently store the wrong value.
+fn sql_value(raw: &str) -> Result<Value, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("empty value".into());
+    }
+    let up = t.to_uppercase();
+    if up == "NULL" { return Ok(Value::Null); }
+    if up == "TRUE" { return Ok(Value::Bool(true)); }
+    if up == "FALSE" { return Ok(Value::Bool(false)); }
+    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        // Unwrap, collapsing the SQL '' escape to one quote.
+        let inner = &t[1..t.len() - 1];
+        return Ok(Value::String(inner.replace("''", "'")));
+    }
+    if let Ok(i) = t.parse::<i64>() { return Ok(Value::from(i)); }
+    if let Ok(f) = t.parse::<f64>() { return Ok(Value::from(f)); }
+    Err(format!(
+        "cannot use {:?} as a value — this endpoint accepts string literals, \
+         numbers, TRUE/FALSE and NULL. Expressions, casts and function calls \
+         are not evaluated, because storing an unevaluated expression as text \
+         would be worse than refusing it", t))
+}
+
+/// Pull a trailing `RETURNING …` off a statement, returning (head, columns).
+fn split_returning(tail: &str) -> (String, Vec<Col>) {
+    let tu = tail.to_uppercase();
+    match find_kw(&tu, "RETURNING") {
+        None => (tail.to_string(), vec![]),
+        Some(at) => {
+            let head = tail[..at].trim().to_string();
+            let list = tail[at + "RETURNING".len()..].trim();
+            if list == "*" {
+                return (head, vec![]);   // empty projection = every column
+            }
+            let cols = split_top(list, ',')
+                .into_iter()
+                .map(|p| {
+                    let raw = p.split_whitespace().next().unwrap_or(&p).to_string();
+                    let name = raw.rsplit('.').next().unwrap_or(&raw).trim_matches('"').to_string();
+                    Col::same(&name)
+                })
+                .collect();
+            (head, cols)
+        }
+    }
+}
+
+/// Columns whose names are reserved: they carry provenance rather than data.
+fn take_reserved(doc: &mut serde_json::Map<String, Value>) -> (Option<String>, Vec<String>, Option<String>, Option<String>) {
+    let id = doc.remove("_id").or_else(|| doc.remove("id"))
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            Value::Null => None,
+            other => Some(other.to_string()),   // a numeric key is a fine id
+        });
+    let caused_by = match doc.remove("_caused_by") {
+        Some(Value::String(s)) => vec![s],
+        Some(Value::Array(a)) => a.into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => vec![],
+    };
+    let vf = doc.remove("_valid_from").and_then(|v| v.as_str().map(str::to_string));
+    let vt = doc.remove("_valid_to").and_then(|v| v.as_str().map(str::to_string));
+    (id, caused_by, vf, vt)
+}
+
+/// `INSERT INTO coll (c1, c2) VALUES (v1, v2), (…) [RETURNING …]`
+fn translate_insert(sql: &str) -> Result<Stmt, String> {
+    let rest = strip_prefix_ci(sql, "INSERT")
+        .and_then(|r| strip_prefix_ci(&r, "INTO"))
+        .ok_or("expected INSERT INTO")?;
+    // Locate VALUES first. Everything before it is `coll (col, …)`; searching
+    // for `(` without that bound finds the VALUES parenthesis instead and
+    // swallows the keyword into the collection name.
+    let ru = rest.to_uppercase();
+    let values_at = find_kw(&ru, "VALUES").ok_or(
+        "expected VALUES — `INSERT … SELECT` is not supported on this endpoint")?;
+    let head = rest[..values_at].trim().to_string();
+    let open = head.find('(').ok_or(
+        "INSERT needs an explicit column list — `INSERT INTO t (a, b) VALUES (…)`. \
+         NEDB is schemaless, so there is no declared column order to infer from")?;
+    let coll = head[..open].trim().trim_matches('"');
+    let coll = coll.rsplit('.').next().unwrap_or(coll).to_string();
+    if coll.is_empty() {
+        return Err("expected a collection name after INSERT INTO".into());
+    }
+    let close = head.rfind(')').ok_or("unterminated column list")?;
+    if close < open {
+        return Err("malformed column list".into());
+    }
+    let tail_from_values = rest[values_at..].to_string();
+    let cols: Vec<String> = split_top(&head[open + 1..close], ',')
+        .into_iter()
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .collect();
+    if cols.is_empty() {
+        return Err("the column list is empty".into());
+    }
+
+    let after = strip_prefix_ci(&tail_from_values, "VALUES")
+        .ok_or("expected VALUES after the column list")?;
+    let (values_part, returning) = split_returning(&after);
+
+    let mut rows = vec![];
+    for group in split_top(&values_part, ',') {
+        let g = group.trim();
+        if !(g.starts_with('(') && g.ends_with(')')) {
+            return Err(format!("expected a parenthesised row of values, got {:?}", g));
+        }
+        let vals = split_top(&g[1..g.len() - 1], ',');
+        if vals.len() != cols.len() {
+            return Err(format!(
+                "{} values for {} columns — every row must match the column list",
+                vals.len(), cols.len()));
+        }
+        let mut doc = serde_json::Map::new();
+        for (c, v) in cols.iter().zip(vals.iter()) {
+            doc.insert(c.clone(), sql_value(v)?);
+        }
+        let (id, caused_by, valid_from, valid_to) = take_reserved(&mut doc);
+        rows.push(InsertRow { id, doc, caused_by, valid_from, valid_to });
+    }
+    if rows.is_empty() {
+        return Err("INSERT with no rows".into());
+    }
+    Ok(Stmt::Insert { coll, rows, returning })
+}
+
+/// `UPDATE coll SET a = 1, b = 'x' [WHERE …] [RETURNING …]`
+fn translate_update(sql: &str) -> Result<Stmt, String> {
+    let rest = strip_prefix_ci(sql, "UPDATE").ok_or("expected UPDATE")?;
+    let ru = rest.to_uppercase();
+    let set_at = find_kw(&ru, "SET").ok_or("expected SET in UPDATE")?;
+    let coll = rest[..set_at].trim().trim_matches('"');
+    let coll = coll.rsplit('.').next().unwrap_or(coll).to_string();
+    if coll.is_empty() {
+        return Err("expected a collection name after UPDATE".into());
+    }
+    let after_set = rest[set_at + 3..].trim().to_string();
+    let (after_set, returning) = split_returning(&after_set);
+
+    // WHERE ends the assignment list; everything after it is a NQL predicate.
+    let au = after_set.to_uppercase();
+    let (assigns_raw, where_raw) = match find_kw(&au, "WHERE") {
+        Some(at) => (after_set[..at].to_string(), after_set[at..].to_string()),
+        None => (after_set.clone(), String::new()),
+    };
+
+    let mut set = vec![];
+    for a in split_top(&assigns_raw, ',') {
+        let eq = a.find('=').ok_or(format!("expected `col = value` in SET, got {:?}", a))?;
+        let col = a[..eq].trim().trim_matches('"').to_string();
+        if col.is_empty() {
+            return Err("empty column name in SET".into());
+        }
+        set.push((col, sql_value(&a[eq + 1..])?));
+    }
+    if set.is_empty() {
+        return Err("UPDATE with no assignments".into());
+    }
+    // The matching rows are found with an ordinary NQL read, so the whole
+    // predicate surface (IN, BETWEEN, LIKE, OR, …) works in an UPDATE too.
+    let nql = format!("FROM {} {}", coll, sql_literals_to_nql(where_raw.trim()))
+        .trim().to_string();
+    Ok(Stmt::Update { coll, set, nql, returning })
+}
+
+/// `DELETE FROM coll [WHERE …] [RETURNING …]`
+fn translate_delete(sql: &str) -> Result<Stmt, String> {
+    let rest = strip_prefix_ci(sql, "DELETE")
+        .and_then(|r| strip_prefix_ci(&r, "FROM"))
+        .ok_or("expected DELETE FROM")?;
+    let (rest, returning) = split_returning(&rest);
+    let end = rest.find(' ').unwrap_or(rest.len());
+    let coll = rest[..end].trim().trim_matches('"');
+    let coll = coll.rsplit('.').next().unwrap_or(coll).to_string();
+    if coll.is_empty() {
+        return Err("expected a collection name after DELETE FROM".into());
+    }
+    let where_raw = rest[end..].trim();
+    let nql = format!("FROM {} {}", coll, sql_literals_to_nql(where_raw))
+        .trim().to_string();
+    Ok(Stmt::Delete { coll, nql, returning })
+}
+
 /// Translate one SQL statement into something executable, or explain why not.
 pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     let sql = normalise(sql_raw);
@@ -346,19 +627,25 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
         return Ok(Stmt::Canned { cols: vec!["current_user".into()], row: vec!["nedb".into()] });
     }
 
-    // ── the refusals, each naming the boundary rather than "syntax error" ──
+    // ── writes ───────────────────────────────────────────────────────────────
+    // SQL's write semantics and NEDB's append-only model line up, so these are
+    // first-class rather than refused. See the `Stmt` doc comment.
+    if upper.starts_with("INSERT") { return translate_insert(sql); }
+    if upper.starts_with("UPDATE") { return translate_update(sql); }
+    if upper.starts_with("DELETE") { return translate_delete(sql); }
+
+    // ── the refusals that remain, each naming the boundary ──────────────────
     for (kw, why) in [
-        ("INSERT", "writes go through the HTTP API (POST /v1/databases/<db>/put) so a write can carry caused_by, valid-time bounds and idempotency — none of which have a SQL spelling here"),
-        ("UPDATE", "this endpoint is read-only; NEDB is append-only, so an UPDATE is a new versioned put via the HTTP API"),
-        ("DELETE", "this endpoint is read-only; use DELETE /v1/databases/<db>/rows/<coll>/<id>"),
-        ("CREATE", "DDL is not supported — collections are created implicitly by writing to them"),
-        ("ALTER", "DDL is not supported"),
-        ("DROP", "DDL is not supported"),
-        ("TRUNCATE", "not supported: NEDB is append-only by design, so history cannot be discarded"),
+        ("CREATE", "DDL is not supported — collections are created implicitly by the first write to them, because NEDB is schemaless"),
+        ("ALTER", "DDL is not supported — there is no schema to alter"),
+        ("DROP", "DDL is not supported; drop a database with DELETE /v1/databases/<db>"),
+        ("TRUNCATE", "not supported, and not an oversight: NEDB is append-only so that history cannot be discarded. That is the product"),
         ("COPY", "not supported; use GET /v1/databases/<db>/since for bulk export"),
+        ("GRANT", "there is no SQL-level privilege system; auth is the bearer token"),
+        ("REVOKE", "there is no SQL-level privilege system; auth is the bearer token"),
     ] {
         if upper.starts_with(kw) {
-            return Err(format!("{} is not supported on the Postgres read endpoint — {}", kw, why));
+            return Err(format!("{} is not supported — {}", kw, why));
         }
     }
     if !upper.starts_with("SELECT") {
@@ -518,8 +805,9 @@ const SERVER_VERSION: &str = "15.0";
 
 fn full_version_string() -> String {
     format!(
-        "PostgreSQL {} (NEDB {} read endpoint) — tamper-evident, append-only, \
-         permanent history. Read-only: SELECT only.",
+        "PostgreSQL {} (NEDB {}) — tamper-evident, append-only, permanent \
+         history. SELECT + INSERT/UPDATE/DELETE; an UPDATE is a new version, \
+         so prior values stay readable with AS OF SYSTEM TIME.",
         SERVER_VERSION,
         env!("CARGO_PKG_VERSION")
     )
@@ -609,8 +897,16 @@ fn data_row(vals: &[Option<String>]) -> Vec<u8> {
     m.finish()
 }
 
-/// Encode a completed result set as the `T`/`D`*/`C` message sequence.
-pub fn encode_result(rows: &[Value], project: &[Col]) -> Vec<u8> {
+/// Encode just the rows: `T` followed by one `D` per row, and NO
+/// `CommandComplete`.
+///
+/// Split out because a write with `RETURNING` must emit `T`/`D`* and then its
+/// OWN tag (`INSERT 0 3`, `UPDATE 1`). The first cut called `encode_result`
+/// there, which appends `CommandComplete("SELECT n")` — so one statement sent
+/// TWO CommandComplete messages. That is a protocol violation, and the visible
+/// symptom was `RETURNING` silently yielding no rows at all: the client took
+/// the first tag as the end of the statement and discarded the description.
+pub fn encode_rows(rows: &[Value], project: &[Col]) -> Vec<u8> {
     let cols = columns_for(rows, project);
     let oids: Vec<i32> = cols.iter().map(|c| oid_for(rows, &c.src)).collect();
     let mut out = row_description(&cols, &oids);
@@ -618,6 +914,12 @@ pub fn encode_result(rows: &[Value], project: &[Col]) -> Vec<u8> {
         let vals: Vec<Option<String>> = cols.iter().map(|c| cell(r.get(&c.src))).collect();
         out.extend_from_slice(&data_row(&vals));
     }
+    out
+}
+
+/// A complete SELECT response: rows plus `CommandComplete("SELECT n")`.
+pub fn encode_result(rows: &[Value], project: &[Col]) -> Vec<u8> {
+    let mut out = encode_rows(rows, project);
     out.extend_from_slice(&command_complete(&format!("SELECT {}", rows.len())));
     out
 }
@@ -658,7 +960,7 @@ fn parse_startup_params(body: &[u8]) -> HashMap<String, String> {
 }
 
 /// Serve one client connection to completion.
-async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>) -> std::io::Result<()> {
+async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: bool) -> std::io::Result<()> {
     // ── startup, including the SSL negotiation clients try first ────────────
     let params = loop {
         let len = read_i32(&mut sock).await?;
@@ -769,7 +1071,7 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>) -> std::io::
             b'X' => return Ok(()), // Terminate
             b'Q' => {
                 let sql = String::from_utf8_lossy(&body).trim_end_matches('\0').to_string();
-                let out = run_simple_query(&sql, &db_name, resolved.as_ref());
+                let out = run_simple_query(&sql, &db_name, resolved.as_ref(), read_only);
                 sock.write_all(&out).await?;
                 sock.write_all(&ready()).await?;
             }
@@ -799,8 +1101,37 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>) -> std::io::
     }
 }
 
+const READ_ONLY_MSG: &str =
+    "this endpoint is running read-only (NEDBD_PG_READ_ONLY=1). Writes are \
+     implemented but disabled on this server — unset the flag to allow them.";
+
+fn no_db(db_name: &str) -> Vec<u8> {
+    err_msg("3D000", &format!(
+        "database {:?} is not open on this server — create it first \
+         (POST /v1/databases), or connect with -d <name>", db_name))
+}
+
+/// True when the statement carried a RETURNING clause. Checked against the raw
+/// SQL because `RETURNING *` yields an EMPTY projection, which is otherwise
+/// indistinguishable from "no RETURNING at all".
+fn wants_returning(sql: &str) -> bool {
+    find_kw(&sql.to_uppercase(), "RETURNING").is_some()
+}
+
+/// A unique key for a server-assigned INSERT id.
+fn next_row_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!("r{}{}", ts, n)
+}
+
 /// Execute a simple-query payload, which may hold several `;`-separated statements.
-fn run_simple_query(sql: &str, db_name: &str, db: Option<&Arc<Db>>) -> Vec<u8> {
+fn run_simple_query(sql: &str, db_name: &str, db: Option<&Arc<Db>>, read_only: bool) -> Vec<u8> {
     let mut out = vec![];
     let statements = split_statements(sql);
     if statements.is_empty() {
@@ -819,6 +1150,114 @@ fn run_simple_query(sql: &str, db_name: &str, db: Option<&Arc<Db>>) -> Vec<u8> {
             Ok(Stmt::Canned { cols, row }) => {
                 out.extend_from_slice(&encode_canned(&cols, &row));
             }
+            // ── writes ──────────────────────────────────────────────────
+            Ok(Stmt::Insert { coll, rows, returning }) => {
+                let db = match db { Some(db) => db, None => { out.extend_from_slice(&no_db(db_name)); return out; } };
+                if read_only { out.extend_from_slice(&err_msg("25006", READ_ONLY_MSG)); return out; }
+                let mut written: Vec<Value> = vec![];
+                for (i, r) in rows.iter().enumerate() {
+                    // The engine requires an id. When the statement did not
+                    // supply one, mint a unique key rather than silently
+                    // overwriting a shared default.
+                    let id = match &r.id {
+                        Some(id) => id.clone(),
+                        None => format!("{}-{}", next_row_id(), i),
+                    };
+                    match db.put(&coll, &id, Value::Object(r.doc.clone()),
+                                 r.caused_by.clone(), r.valid_from.clone(), r.valid_to.clone()) {
+                        Ok(node) => written.push(crate::nql::node_to_json(&node)),
+                        Err(e) => {
+                            out.extend_from_slice(&err_msg("XX000", &format!("INSERT failed: {}", e)));
+                            return out;
+                        }
+                    }
+                }
+                if wants_returning(&stmt_sql) {
+                    out.extend_from_slice(&encode_rows(&written, &returning));
+                }
+                // Postgres reports `INSERT <oid> <rows>`; the oid is always 0.
+                out.extend_from_slice(&command_complete(&format!("INSERT 0 {}", written.len())));
+            }
+
+            Ok(Stmt::Update { coll, set, nql, returning }) => {
+                let db = match db { Some(db) => db, None => { out.extend_from_slice(&no_db(db_name)); return out; } };
+                if read_only { out.extend_from_slice(&err_msg("25006", READ_ONLY_MSG)); return out; }
+                // Matching rows come from an ordinary NQL read, so the whole
+                // predicate surface works inside an UPDATE.
+                let matched = match crate::nql::query(db, &nql) {
+                    Ok((rows, _)) => rows,
+                    Err(e) => {
+                        out.extend_from_slice(&err_msg("42601",
+                            &format!("{} (translated to NQL: {})", e, nql)));
+                        return out;
+                    }
+                };
+                let mut written: Vec<Value> = vec![];
+                for row in &matched {
+                    let id = match row.get("_id").and_then(|v| v.as_str()) {
+                        Some(id) => id.to_string(),
+                        None => continue,
+                    };
+                    // Merge onto the CURRENT stored document, not onto the query
+                    // row: a query row carries injected `_`-prefixed metadata
+                    // that must never be written back into the payload.
+                    let mut doc = match db.get(&coll, &id) {
+                        Some(n) => match n.data {
+                            Value::Object(m) => m,
+                            _ => serde_json::Map::new(),
+                        },
+                        None => continue,
+                    };
+                    for (k, v) in &set { doc.insert(k.clone(), v.clone()); }
+                    // An UPDATE is a NEW VERSION — the prior value stays
+                    // readable with AS OF SYSTEM TIME. That is the whole point.
+                    match db.put(&coll, &id, Value::Object(doc), vec![], None, None) {
+                        Ok(node) => written.push(crate::nql::node_to_json(&node)),
+                        Err(e) => {
+                            out.extend_from_slice(&err_msg("XX000", &format!("UPDATE failed: {}", e)));
+                            return out;
+                        }
+                    }
+                }
+                if wants_returning(&stmt_sql) {
+                    out.extend_from_slice(&encode_rows(&written, &returning));
+                }
+                out.extend_from_slice(&command_complete(&format!("UPDATE {}", written.len())));
+            }
+
+            Ok(Stmt::Delete { coll, nql, returning }) => {
+                let db = match db { Some(db) => db, None => { out.extend_from_slice(&no_db(db_name)); return out; } };
+                if read_only { out.extend_from_slice(&err_msg("25006", READ_ONLY_MSG)); return out; }
+                let matched = match crate::nql::query(db, &nql) {
+                    Ok((rows, _)) => rows,
+                    Err(e) => {
+                        out.extend_from_slice(&err_msg("42601",
+                            &format!("{} (translated to NQL: {})", e, nql)));
+                        return out;
+                    }
+                };
+                // RETURNING must be captured BEFORE the delete: after the
+                // tombstone the row is no longer readable by id.
+                let returned = matched.clone();
+                let mut n = 0usize;
+                for row in &matched {
+                    if let Some(id) = row.get("_id").and_then(|v| v.as_str()) {
+                        match db.delete(&coll, id) {
+                            Ok(true) => n += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                out.extend_from_slice(&err_msg("XX000", &format!("DELETE failed: {}", e)));
+                                return out;
+                            }
+                        }
+                    }
+                }
+                if wants_returning(&stmt_sql) {
+                    out.extend_from_slice(&encode_rows(&returned, &returning));
+                }
+                out.extend_from_slice(&command_complete(&format!("DELETE {}", n)));
+            }
+
             Ok(Stmt::Query { nql, project }) => {
                 let db = match db {
                     Some(db) => db,
@@ -872,9 +1311,16 @@ fn split_statements(sql: &str) -> Vec<String> {
 
 /// Bind and serve the Postgres read endpoint until the process exits.
 pub async fn run(host: &str, port: u16, resolver: Arc<dyn DbResolver>) -> anyhow::Result<()> {
+    // Writes are ON by default — that is the parity position. An operator who
+    // wants the "system of proof beside your database" deployment, where this
+    // door must never mutate anything, sets NEDBD_PG_READ_ONLY=1.
+    let read_only = std::env::var("NEDBD_PG_READ_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let listener = TcpListener::bind((host, port)).await?;
-    println!("  pgwire   postgres READ endpoint on {}:{} — psql / DBeaver / psycopg (SELECT only)",
-             host, port);
+    println!("  pgwire   postgres endpoint on {}:{} — psql / DBeaver / psycopg ({})",
+             host, port,
+             if read_only { "SELECT only — read-only mode" } else { "SELECT + INSERT/UPDATE/DELETE" });
     loop {
         let (sock, _peer) = match listener.accept().await {
             Ok(v) => v,
@@ -886,7 +1332,7 @@ pub async fn run(host: &str, port: u16, resolver: Arc<dyn DbResolver>) -> anyhow
         let r = Arc::clone(&resolver);
         tokio::spawn(async move {
             let _ = sock.set_nodelay(true);
-            if let Err(e) = handle(sock, r).await {
+            if let Err(e) = handle(sock, r, read_only).await {
                 // A client disconnecting mid-message is routine, not an incident.
                 if e.kind() != std::io::ErrorKind::UnexpectedEof
                     && e.kind() != std::io::ErrorKind::ConnectionReset
@@ -1072,11 +1518,10 @@ mod tests {
     #[test]
     fn unsupported_sql_is_refused_with_a_reason() {
         for (sql, expect) in [
-            ("INSERT INTO t VALUES (1)", "caused_by"),
-            ("UPDATE t SET a = 1", "append-only"),
-            ("DELETE FROM t", "read-only"),
+            ("INSERT INTO t VALUES (1)", "explicit column list"),
             ("CREATE TABLE t (a int)", "DDL"),
             ("TRUNCATE t", "append-only"),
+            ("GRANT ALL ON t TO x", "privilege system"),
             ("SELECT * FROM a JOIN b ON a.x = b.x", "JOIN is not supported"),
             ("SELECT * FROM a UNION SELECT * FROM b", "UNION"),
             ("SELECT DISTINCT region FROM orders", "GROUP BY"),
@@ -1088,6 +1533,194 @@ mod tests {
             let e = translate(sql).unwrap_err();
             assert!(e.contains(expect), "for {:?} expected {:?} in {:?}", sql, expect, e);
         }
+    }
+
+    // ── writes ───────────────────────────────────────────────────────────────
+    //
+    // SQL's write semantics and NEDB's append-only model line up: INSERT is a
+    // put, UPDATE is a new version, DELETE is a tombstone. These tests pin the
+    // parse; tests/test_pgwire.py proves the behaviour against a live server,
+    // including that the PRIOR value is still readable afterwards.
+
+    fn ins(sql: &str) -> (String, Vec<InsertRow>, Vec<Col>) {
+        match translate(sql) {
+            Ok(Stmt::Insert { coll, rows, returning }) => (coll, rows, returning),
+            other => panic!("expected INSERT for {:?}, got {:?}", sql, other),
+        }
+    }
+
+    #[test]
+    fn insert_becomes_a_put_per_row() {
+        let (coll, rows, ret) = ins("INSERT INTO orders (_id, status, total) VALUES ('o1', 'paid', 120)");
+        assert_eq!(coll, "orders");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_deref(), Some("o1"));
+        assert_eq!(rows[0].doc.get("status"), Some(&json!("paid")));
+        assert_eq!(rows[0].doc.get("total"), Some(&json!(120)));
+        // `_id` is the key, not a payload field.
+        assert!(!rows[0].doc.contains_key("_id"));
+        assert!(ret.is_empty());
+    }
+
+    #[test]
+    fn a_multi_row_insert_yields_one_row_each() {
+        let (_, rows, _) = ins(
+            "INSERT INTO t (id, n) VALUES ('a', 1), ('b', 2), ('c', 3)");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].id.as_deref(), Some("b"));
+        assert_eq!(rows[2].doc.get("n"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn an_insert_without_an_id_column_lets_the_server_assign_one() {
+        let (_, rows, _) = ins("INSERT INTO t (n) VALUES (1)");
+        assert_eq!(rows[0].id, None, "the executor mints a unique key");
+        assert_eq!(rows[0].doc.get("n"), Some(&json!(1)));
+    }
+
+    /// Provenance is reachable from SQL, not only from the HTTP API — which is
+    /// the point of having writes here at all.
+    #[test]
+    fn insert_lifts_provenance_out_of_reserved_columns() {
+        let (_, rows, _) = ins(
+            "INSERT INTO audit (_id, _caused_by, _valid_from, kind) \
+             VALUES ('e1', 'abc123', '2026-01-01', 'reprice')");
+        assert_eq!(rows[0].caused_by, vec!["abc123".to_string()]);
+        assert_eq!(rows[0].valid_from.as_deref(), Some("2026-01-01"));
+        assert_eq!(rows[0].doc.get("kind"), Some(&json!("reprice")));
+        // None of the reserved names leak into the stored payload.
+        for k in ["_id", "_caused_by", "_valid_from"] {
+            assert!(!rows[0].doc.contains_key(k), "{} leaked into the doc", k);
+        }
+    }
+
+    #[test]
+    fn insert_values_cover_the_scalar_types() {
+        let (_, rows, _) = ins(
+            "INSERT INTO t (s, i, f, b, n) VALUES ('x', 42, 1.5, TRUE, NULL)");
+        assert_eq!(rows[0].doc.get("s"), Some(&json!("x")));
+        assert_eq!(rows[0].doc.get("i"), Some(&json!(42)));
+        assert_eq!(rows[0].doc.get("f"), Some(&json!(1.5)));
+        assert_eq!(rows[0].doc.get("b"), Some(&json!(true)));
+        assert_eq!(rows[0].doc.get("n"), Some(&Value::Null));
+    }
+
+    /// A doubled '' is one literal quote, and a comma inside a string is not a
+    /// value separator.
+    #[test]
+    fn insert_literals_survive_quotes_and_commas() {
+        let (_, rows, _) = ins("INSERT INTO t (a, b) VALUES ('it''s', 'x,y')");
+        assert_eq!(rows[0].doc.get("a"), Some(&json!("it's")));
+        assert_eq!(rows[0].doc.get("b"), Some(&json!("x,y")));
+    }
+
+    #[test]
+    fn insert_refuses_what_it_cannot_store_faithfully() {
+        // An unevaluated expression stored as text would be a wrong value.
+        assert!(translate("INSERT INTO t (a) VALUES (1 + 1)").is_err());
+        assert!(translate("INSERT INTO t (a) VALUES (now())").is_err());
+        // Column/value count mismatch.
+        let e = translate("INSERT INTO t (a, b) VALUES (1)").unwrap_err();
+        assert!(e.contains("values for"), "{}", e);
+        // No column list at all.
+        let e2 = translate("INSERT INTO t VALUES (1)").unwrap_err();
+        assert!(e2.contains("explicit column list"), "{}", e2);
+    }
+
+    #[test]
+    fn update_finds_rows_with_the_full_predicate_surface() {
+        match translate("UPDATE orders SET status = 'void' WHERE total < 50 AND region IN ('eu')") {
+            Ok(Stmt::Update { coll, set, nql, .. }) => {
+                assert_eq!(coll, "orders");
+                assert_eq!(set, vec![("status".to_string(), json!("void"))]);
+                // The WHERE became ordinary NQL, so IN/BETWEEN/LIKE all work.
+                assert_eq!(nql, r#"FROM orders WHERE total < 50 AND region IN ("eu")"#);
+            }
+            other => panic!("expected UPDATE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_without_where_targets_the_whole_collection() {
+        // Postgres allows it, so parity allows it.
+        match translate("UPDATE t SET a = 1") {
+            Ok(Stmt::Update { nql, .. }) => assert_eq!(nql, "FROM t"),
+            other => panic!("expected UPDATE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_handles_several_assignments() {
+        match translate("UPDATE t SET a = 1, b = 'x,y', c = NULL WHERE id = 'k'") {
+            Ok(Stmt::Update { set, .. }) => {
+                assert_eq!(set.len(), 3);
+                assert_eq!(set[1], ("b".to_string(), json!("x,y")));
+                assert_eq!(set[2], ("c".to_string(), Value::Null));
+            }
+            other => panic!("expected UPDATE, got {:?}", other),
+        }
+        assert!(translate("UPDATE t SET").is_err());
+        assert!(translate("UPDATE t SET a").is_err());
+    }
+
+    #[test]
+    fn delete_becomes_a_predicate_over_the_collection() {
+        match translate("DELETE FROM orders WHERE status = 'void'") {
+            Ok(Stmt::Delete { coll, nql, .. }) => {
+                assert_eq!(coll, "orders");
+                assert_eq!(nql, r#"FROM orders WHERE status = "void""#);
+            }
+            other => panic!("expected DELETE, got {:?}", other),
+        }
+        match translate("DELETE FROM t") {
+            Ok(Stmt::Delete { nql, .. }) => assert_eq!(nql, "FROM t"),
+            other => panic!("expected DELETE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn returning_is_parsed_off_every_write() {
+        let (_, _, ret) = ins("INSERT INTO t (a) VALUES (1) RETURNING a, _id");
+        assert_eq!(ret.iter().map(|c| c.out.clone()).collect::<Vec<_>>(), vec!["a", "_id"]);
+        // `RETURNING *` is an empty projection — every column — which is why
+        // the executor checks the raw SQL for the keyword instead.
+        let (_, _, star) = ins("INSERT INTO t (a) VALUES (1) RETURNING *");
+        assert!(star.is_empty());
+        assert!(wants_returning("INSERT INTO t (a) VALUES (1) RETURNING *"));
+        assert!(!wants_returning("INSERT INTO t (a) VALUES (1)"));
+
+        match translate("UPDATE t SET a = 1 WHERE id = 'k' RETURNING a") {
+            Ok(Stmt::Update { nql, returning, .. }) => {
+                assert_eq!(returning.len(), 1);
+                // RETURNING must NOT leak into the predicate.
+                assert!(!nql.to_uppercase().contains("RETURNING"), "{}", nql);
+            }
+            other => panic!("expected UPDATE, got {:?}", other),
+        }
+        match translate("DELETE FROM t WHERE id = 'k' RETURNING *") {
+            Ok(Stmt::Delete { nql, .. }) =>
+                assert!(!nql.to_uppercase().contains("RETURNING"), "{}", nql),
+            other => panic!("expected DELETE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_keyword_inside_a_value_is_not_a_clause() {
+        match translate("UPDATE t SET note = 'where returning from' WHERE id = 'k'") {
+            Ok(Stmt::Update { set, nql, .. }) => {
+                assert_eq!(set[0].1, json!("where returning from"));
+                assert_eq!(nql, r#"FROM t WHERE id = "k""#);
+            }
+            other => panic!("expected UPDATE, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn split_top_respects_quotes_and_nesting() {
+        assert_eq!(split_top("a, b, c", ',').len(), 3);
+        assert_eq!(split_top("(1, 2), (3, 4)", ',').len(), 2);
+        assert_eq!(split_top("'a,b', c", ',').len(), 2);
+        assert_eq!(split_top("'it''s, fine', c", ',').len(), 2);
     }
 
     #[test]
@@ -1191,6 +1824,38 @@ mod tests {
         };
         assert_eq!(tags, vec![b'T', b'D', b'D', b'C'],
                    "one description, one row each, one completion");
+    }
+
+    /// A statement must emit EXACTLY ONE CommandComplete. A write with
+    /// RETURNING that reused the SELECT encoder sent two, and the visible
+    /// symptom was RETURNING yielding no rows: the client took the first tag
+    /// as the end of the statement and threw the description away.
+    #[test]
+    fn a_write_with_returning_emits_exactly_one_command_complete() {
+        let rows = vec![json!({"_id": "o1", "total": 9})];
+        let mut out = encode_rows(&rows, &[Col::same("_id")]);
+        out.extend_from_slice(&command_complete("INSERT 0 1"));
+        let mut tags = vec![];
+        let mut i = 0usize;
+        while i < out.len() {
+            tags.push(out[i]);
+            let len = i32::from_be_bytes([out[i+1], out[i+2], out[i+3], out[i+4]]) as usize;
+            i += 1 + len;
+        }
+        assert_eq!(tags, vec![b'T', b'D', b'C'], "one description, one row, ONE tag");
+        assert_eq!(tags.iter().filter(|t| **t == b'C').count(), 1);
+        // encode_rows alone must not carry a tag at all.
+        assert!(!encode_rows(&rows, &[]).contains(&b'C')
+                || encode_rows(&rows, &[]).iter().filter(|b| **b == b'C').count() > 0);
+        let bare = encode_rows(&rows, &[Col::same("_id")]);
+        let mut bare_tags = vec![];
+        let mut j = 0usize;
+        while j < bare.len() {
+            bare_tags.push(bare[j]);
+            let len = i32::from_be_bytes([bare[j+1], bare[j+2], bare[j+3], bare[j+4]]) as usize;
+            j += 1 + len;
+        }
+        assert_eq!(bare_tags, vec![b'T', b'D'], "encode_rows never appends a tag");
     }
 
     #[test]

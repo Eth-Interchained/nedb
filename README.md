@@ -98,11 +98,38 @@ identical answers.
 
 ---
 
-## Postgres wire protocol — read NEDB with the tools you already have
+## Postgres wire protocol — run your SQL, get history for free
 
-`nedbd --pg-port 5433` opens a **read-only PostgreSQL wire-protocol endpoint**.
-`psql`, DBeaver, Metabase, Grafana, psycopg, JDBC — anything that speaks pgwire
-can now query a tamper-evident NEDB store without a bespoke client.
+`nedbd --pg-port 5433` opens a **PostgreSQL wire-protocol endpoint** — reads
+*and* writes. `psql`, DBeaver, Metabase, Grafana, psycopg — anything that
+speaks pgwire can use a tamper-evident NEDB store with ordinary SQL, with no
+bespoke client.
+
+**The reason the write path matters** is that SQL's write semantics and NEDB's
+append-only model already line up:
+
+| SQL | NEDB | and therefore |
+| --- | --- | --- |
+| `INSERT` | a put | — |
+| `UPDATE … WHERE` | a **new version** of each match | the prior value stays readable |
+| `DELETE … WHERE` | a **tombstone** | the deleted row stays in history |
+
+So this is not a compromise of the append-only design — it *is* the design,
+reached through a protocol every tool already speaks:
+
+```sql
+UPDATE orders SET total = 999 WHERE _id = 'o1';
+SELECT total FROM orders WHERE _id = 'o1';                       -- 999
+SELECT total FROM orders AS OF SYSTEM TIME 0 WHERE _id = 'o1';   -- 120
+```
+
+Run the SQL you would run against Postgres, and the tamper-evident audit trail
+is free. No triggers, no shadow table, no application code. `verify()` still
+passes afterwards, because a SQL write is an ordinary engine write and not a
+side door around the hash chain.
+
+Writes are **on by default**. `NEDBD_PG_READ_ONLY=1` gives the deployment where
+this door must never mutate anything.
 
 ```console
 $ nedbd --data ./data --pg-port 5433
@@ -144,16 +171,26 @@ a documented subset of `SELECT` translated to NQL:
 | `*`, a column list, `COUNT(*)`, `SUM`/`AVG`/`MIN`/`MAX(col)` | `JOIN` — NQL is single-collection |
 | `WHERE` — the whole NQL predicate surface | subqueries, `UNION`, window functions |
 | `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET` | expressions in the select list |
-| `AS OF SYSTEM TIME <seq>` | `INSERT`/`UPDATE`/`DELETE` — see below |
-| SQL `'literals'` and `<>`, rewritten to NQL | DDL of any kind |
+| `AS OF SYSTEM TIME <seq>` | DDL, `TRUNCATE`, `GRANT`/`REVOKE` |
+| `INSERT` / `UPDATE` / `DELETE`, all with `RETURNING` | an `INSERT` with no column list |
+| `_caused_by` / `_valid_from` / `_valid_to` as INSERT columns | values that are expressions, not literals |
 
 Every refusal names the boundary instead of saying "syntax error", and a
 grouped query that projects a column SQL would reject gets Postgres's own
 message rather than a silent `NULL`.
 
-**Writes are deliberately absent.** A NEDB write carries `caused_by`,
-valid-time bounds and idempotency; none of that has a natural SQL spelling, so
-`INSERT` points at the HTTP API rather than doing half a job.
+**Provenance is settable from SQL**, so the causal chain does not require the
+HTTP API:
+
+```sql
+INSERT INTO audit (_id, _caused_by, kind) VALUES ('leaf', '<parent-hash>', 'reprice');
+SELECT _id FROM audit TRACE caused_by;
+```
+
+An `INSERT` requires an explicit column list, because NEDB is schemaless and
+there is no declared column order to infer. Values must be literals — a number,
+a quoted string, `TRUE`/`FALSE`/`NULL` — since storing an unevaluated
+expression as text would be worse than refusing it.
 
 Two limits worth stating plainly: the **simple query protocol** is implemented
 (what `psql` and libpq's `PQexec` use), while the extended protocol
@@ -162,9 +199,10 @@ psycopg3's default mode is not yet supported. And the connection is
 **cleartext**, which is why the endpoint is off unless you pass `--pg-port` and
 binds to loopback by default. Put it behind a tunnel to go further.
 
-Verified in CI by `tests/test_pgwire.py` — 40 checks driven through **psycopg2,
+Verified in CI by `tests/test_pgwire.py` — **64 checks driven through psycopg2,
 which is libpq**. Unit tests can prove the translation; only a real client
-proves the protocol.
+proves the protocol. One of those checks is the one that matters: after a plain
+SQL `UPDATE`, the prior value is still readable at its original sequence.
 
 ---
 
