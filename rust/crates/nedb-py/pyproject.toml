@@ -19,7 +19,6 @@ keywords = ["database", "embedded", "mvcc", "time-travel", "versioning",
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Database :: Database Engines/Servers",
 ]
