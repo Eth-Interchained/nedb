@@ -9,14 +9,31 @@ NQL grammar (keywords case-insensitive):
 
     FROM <collection>
       [ AS OF <seq> ]
-      [ WHERE <field> <op> <value> (AND <field> <op> <value>)* ]
+      [ WHERE <predicate> ]
       [ SEARCH "<text>" ]
       [ ORDER BY <field> [ASC|DESC] ]
       [ TRAVERSE <relation> ]
       [ LIMIT <n> ]
 
+    <predicate>  := <or>
+    <or>         := <and> (OR <and>)*
+    <and>        := <not> (AND <not>)*
+    <not>        := [NOT] <primary>
+    <primary>    := "(" <predicate> ")" | <comparison>
+    <comparison> := <field> <op> <value>
+                  | <field> [NOT] IN "(" <value> ("," <value>)* ")"
+                  | <field> [NOT] BETWEEN <value> AND <value>
+                  | <field> [NOT] LIKE|ILIKE <pattern>
+                  | <field> IS [NOT] NULL
+
     op    := = | != | < | <= | > | >=
     value := number | "string" | 'string' | true | false | null
+
+Predicates compile to a TREE at plan["predicate"]. For the special case of a
+pure conjunction of comparisons — the only shape the equality-index
+accelerator can exploit — plan["where"] is ALSO populated with the flat
+[(field, op, value)] list it has always held, so that fast path and the
+mongo.py caller keep working unchanged.
 """
 from __future__ import annotations
 
@@ -29,14 +46,16 @@ _TOKEN_RE = re.compile(
       | '(?P<sq>[^']*)'
       | (?P<num>-?\d+(?:\.\d+)?)
       | (?P<op><=|>=|!=|=|<|>)
+      | (?P<punct>[(),])
       | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
     """,
     re.VERBOSE,
 )
 
-_KEYWORDS = {"from", "as", "of", "where", "and", "search", "order", "by",
+_KEYWORDS = {"from", "as", "of", "where", "and", "or", "search", "order", "by",
              "asc", "desc", "traverse", "trace", "reverse", "limit",
-             "valid", "true", "false", "null", "group", "count", "sum", "avg", "min", "max"}
+             "valid", "true", "false", "null", "group", "count", "sum", "avg", "min", "max",
+             "not", "in", "between", "like", "ilike", "is"}
 
 
 def _lex(text: str) -> List[Tuple[str, Any]]:
@@ -56,6 +75,8 @@ def _lex(text: str) -> List[Tuple[str, Any]]:
             toks.append(("num", float(n) if "." in n else int(n)))
         elif m.group("op") is not None:
             toks.append(("op", m.group("op")))
+        elif m.group("punct") is not None:
+            toks.append(("punct", m.group("punct")))
         elif m.group("word") is not None:
             w = m.group("word")
             lw = w.lower()
@@ -69,7 +90,29 @@ def empty_plan(coll: str) -> dict:
             "order_by": None, "traverse": None, "limit": None,
             "group_by": None, "aggregate": None,
             "trace": None, "trace_reverse": False,
-            "valid_as_of": None}
+            "valid_as_of": None, "predicate": None}
+
+
+# ── LIKE ─────────────────────────────────────────────────────────────────────
+
+def like_to_regex(pattern: str, ci: bool = False) -> "re.Pattern":
+    """Compile a SQL LIKE pattern: `%` = any run, `_` = any single char.
+
+    Everything else is escaped, so a pattern containing regex metacharacters
+    (`.`, `*`, `[`, `(`) matches them literally — the reason this is not
+    `fnmatch`, which would additionally treat `[...]` as a character class and
+    silently reinterpret a literal bracket.
+    """
+    out = []
+    for ch in pattern:
+        if ch == "%":
+            out.append(".*")
+        elif ch == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    flags = re.DOTALL | (re.IGNORECASE if ci else 0)
+    return re.compile("^" + "".join(out) + "$", flags)
 
 
 def parse_nql(text: str) -> dict:
@@ -135,23 +178,140 @@ def parse_nql(text: str) -> dict:
         i += 1
         plan["valid_as_of"] = v
 
-    # WHERE ... AND ...
+    # ── WHERE <predicate> ────────────────────────────────────────────────────
+    # Recursive descent: OR binds loosest, then AND, then NOT, with
+    # parentheses overriding. Mirrors the Rust engine's grammar exactly so the
+    # two engines cannot disagree about what a query means.
+
+    def eat_kw(kw) -> bool:
+        nonlocal i
+        if peek() == ("kw", kw):
+            i += 1
+            return True
+        return False
+
+    def expect_punct(ch):
+        nonlocal i
+        t, v = peek()
+        if t != "punct" or v != ch:
+            raise SyntaxError(f"NQL: expected {ch!r}, got {v!r}")
+        i += 1
+
+    def field_name(ctx):
+        nonlocal i
+        t, v = peek()
+        if t not in ("word", "kw"):
+            raise SyntaxError(f"NQL: {ctx}: expected field name, got {v!r}")
+        i += 1
+        return v
+
+    def p_or():
+        terms = [p_and()]
+        while eat_kw("or"):
+            terms.append(p_and())
+        return terms[0] if len(terms) == 1 else {"op": "or", "terms": terms}
+
+    def p_and():
+        terms = [p_not()]
+        # BETWEEN consumes its own AND inside p_cmp, so any AND arriving here
+        # is a genuine conjunction.
+        while eat_kw("and"):
+            terms.append(p_not())
+        return terms[0] if len(terms) == 1 else {"op": "and", "terms": terms}
+
+    def p_not():
+        if eat_kw("not"):
+            return {"op": "not", "term": p_not()}
+        return p_primary()
+
+    def p_primary():
+        t, v = peek()
+        if t == "punct" and v == "(":
+            expect_punct("(")
+            inner = p_or()
+            expect_punct(")")
+            return inner
+        return p_cmp()
+
+    def p_cmp():
+        nonlocal i
+        field = field_name("WHERE")
+
+        if eat_kw("is"):
+            negated = eat_kw("not")
+            if not eat_kw("null"):
+                raise SyntaxError("NQL: expected NULL after IS")
+            return {"op": "isnull", "field": field, "negated": negated}
+
+        negated = eat_kw("not")
+
+        if eat_kw("in"):
+            expect_punct("(")
+            values = [value()]
+            while peek() == ("punct", ","):
+                i += 1
+                values.append(value())
+            expect_punct(")")
+            return {"op": "in", "field": field, "values": values, "negated": negated}
+
+        if eat_kw("between"):
+            low = value()
+            if not eat_kw("and"):
+                raise SyntaxError("NQL: BETWEEN expects AND between its bounds")
+            high = value()
+            return {"op": "between", "field": field, "low": low, "high": high,
+                    "negated": negated}
+
+        ci = peek() == ("kw", "ilike")
+        if ci or peek() == ("kw", "like"):
+            i += 1
+            t, pat = peek()
+            if t not in ("str", "word"):
+                raise SyntaxError(f"NQL: LIKE expects a pattern, got {pat!r}")
+            i += 1
+            return {"op": "like", "field": field, "pattern": pat,
+                    "negated": negated, "ci": ci}
+
+        if negated:
+            raise SyntaxError(
+                "NQL: NOT must be followed by IN, BETWEEN, LIKE or ILIKE "
+                "(use `NOT (field = value)` or `field != value` instead)")
+
+        t, op = peek()
+        if t != "op":
+            raise SyntaxError("NQL: expected operator in WHERE")
+        i += 1
+        return {"op": "cmp", "field": field, "cmp": op, "value": value()}
+
+    def flatten_conjuncts(pred):
+        """Return [(field, op, value)] if `pred` is a pure AND of comparisons.
+
+        Used to keep plan["where"] populated for the equality-index
+        accelerator. Returns None for anything containing OR/NOT/IN/BETWEEN/
+        LIKE/IS NULL, because a flat conjunct list cannot represent those and
+        handing the accelerator a partial view of the predicate would let it
+        narrow to the wrong candidate set.
+        """
+        if pred is None:
+            return []
+        if pred.get("op") == "cmp":
+            return [(pred["field"], pred["cmp"], pred["value"])]
+        if pred.get("op") == "and":
+            out = []
+            for t in pred["terms"]:
+                sub = flatten_conjuncts(t)
+                if sub is None:
+                    return None
+                out.extend(sub)
+            return out
+        return None
+
     if peek() == ("kw", "where"):
         i += 1
-        while True:
-            t, field = peek()
-            if t not in ("word", "kw"):
-                raise SyntaxError("NQL: expected field in WHERE")
-            i += 1
-            t, op = peek()
-            if t != "op":
-                raise SyntaxError("NQL: expected operator in WHERE")
-            i += 1
-            plan["where"].append((field, op, value()))
-            if peek() == ("kw", "and"):
-                i += 1
-                continue
-            break
+        pred = p_or()
+        plan["predicate"] = pred
+        flat = flatten_conjuncts(pred)
+        plan["where"] = flat if flat is not None else []
 
     # VALID AS OF <date> — also accepted after WHERE (second position)
     if peek() == ("kw", "valid") and plan["valid_as_of"] is None:
@@ -268,6 +428,54 @@ def cmp(a, op, b) -> bool:
     except TypeError:
         return False
     return False
+
+
+def eval_predicate(doc: dict, pred: Optional[dict]) -> bool:
+    """Evaluate a predicate tree against a document.
+
+    Semantics are pinned to the Rust engine's `eval_pred` — including the
+    three-valued-logic corner where LIKE over a missing/null field is false in
+    BOTH polarities, so a null row appears in neither `LIKE` nor `NOT LIKE`.
+    """
+    if pred is None:
+        return True
+
+    op = pred["op"]
+
+    if op == "and":
+        return all(eval_predicate(doc, t) for t in pred["terms"])
+    if op == "or":
+        return any(eval_predicate(doc, t) for t in pred["terms"])
+    if op == "not":
+        return not eval_predicate(doc, pred["term"])
+
+    field = pred["field"]
+    val = doc.get(field)
+
+    if op == "cmp":
+        return cmp(val, pred["cmp"], pred["value"])
+
+    if op == "in":
+        hit = any(cmp(val, "=", v) for v in pred["values"])
+        return hit != pred["negated"]
+
+    if op == "between":
+        # Inclusive on both ends, as in SQL.
+        hit = cmp(val, ">=", pred["low"]) and cmp(val, "<=", pred["high"])
+        return hit != pred["negated"]
+
+    if op == "like":
+        if val is None:
+            return False
+        hit = bool(like_to_regex(pred["pattern"], pred["ci"]).match(str(val)))
+        return hit != pred["negated"]
+
+    if op == "isnull":
+        # Absent and explicitly-null are the same observable state in a
+        # schemaless store, and `doc.get` collapses them identically.
+        return (val is None) != pred["negated"]
+
+    raise ValueError(f"NQL: unknown predicate op {op!r}")
 
 
 class Query:

@@ -19,7 +19,7 @@ from .index import Indexes, tokenize
 from .log import Op, OpLog, ReplayError, GENESIS, blake, canon  # noqa: F401  (re-exported)
 from typing import List as _List
 from .merkle import merkle_proof, merkle_verify
-from .query import Query, cmp, parse_nql
+from .query import Query, cmp, eval_predicate, parse_nql
 from .relations import Relations
 from .store import MVCCStore
 
@@ -655,6 +655,7 @@ class NEDB:
         as_of = plan.get("as_of")
         prefix = coll + ":"
         where = plan.get("where", [])
+        predicate = plan.get("predicate")
         search = plan.get("search")
 
         candidates: Optional[set] = None
@@ -688,7 +689,12 @@ class NEDB:
             doc = self.store.get(key, as_of)
             if doc is None:
                 continue
-            if all(cmp(doc.get(f), op, v) for (f, op, v) in where):
+            # The predicate tree is authoritative when the plan carries one.
+            # `where` remains the fallback for plans built directly by callers
+            # (mongo.py) and by the fluent Query builder, which both emit the
+            # flat conjunct list rather than a tree.
+            if (eval_predicate(doc, predicate) if predicate is not None
+                    else all(cmp(doc.get(f), op, v) for (f, op, v) in where)):
                 if search and not self.indexes.search_fields(coll):
                     blob = " ".join(str(x) for x in doc.values()).lower()
                     if not all(t in blob for t in tokenize(search)):

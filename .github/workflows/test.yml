@@ -71,7 +71,8 @@ jobs:
           fail=0
           for t in test_nedb test_bitemporal test_causal test_concurrent \
                    test_crypto test_deploy test_proof test_v050 \
-                   test_wrap_redis test_adapters test_wrap_sqlite_shadow; do
+                   test_wrap_redis test_adapters test_wrap_sqlite_shadow \
+                   test_nql_predicates; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then
               echo "PASS $t"
@@ -178,11 +179,23 @@ jobs:
       # N)" where N was the caller's own pid. The ticker now holds a Weak<Db>
       # and exits when the upgrade fails, so close/reopen works and this suite
       # is a real gate again.
+      # test_nql_predicates appears in BOTH tiers on purpose. In the pure tier
+      # it exercises the Python reference alone; here, with the maturin wheel
+      # installed, it additionally runs every query through the Rust core and
+      # asserts the two engines return IDENTICAL answers. That cross-engine leg
+      # is the gate that was missing when the two NQL implementations drifted
+      # apart on GROUP BY (required-vs-optional aggregate keyword, aggregating
+      # the group field instead of the target field, and disagreeing output
+      # keys) with nothing to catch it.
+      #
+      # It must NOT be run with PYTHONPATH=python here: the source tree has no
+      # `_native` module, so putting it first pins __has_native__ to False and
+      # the parity leg self-skips into a false green.
       - name: Run native-backed suites
         run: |
           set -uo pipefail
           fail=0
-          for t in test_native test_celebration_v2 test_wrap_family; do
+          for t in test_native test_celebration_v2 test_wrap_family test_nql_predicates; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then echo "PASS $t"; else echo "::error title=$t::suite failed"; fail=1; fi
             echo "::endgroup::"
