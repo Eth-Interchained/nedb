@@ -724,8 +724,23 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     if coll.contains(',') {
         return Err("selecting from more than one collection is not supported (no JOIN)".into());
     }
-    // Postgres clients often qualify as schema.table; NEDB has one namespace.
-    let coll = coll.rsplit('.').next().unwrap_or(coll).trim_matches('"');
+    // Postgres clients often qualify as schema.table; NEDB has one namespace,
+    // so the schema is dropped — EXCEPT for `information_schema`, whose table
+    // names (`tables`, `columns`) are words a user could plausibly name a
+    // collection. Keeping the qualifier there is what stops
+    // `SELECT * FROM information_schema.tables` and a real collection called
+    // `tables` from resolving to the same thing.
+    let bare = coll.rsplit('.').next().unwrap_or(coll).trim_matches('"');
+    let qualified = coll
+        .split('.')
+        .map(|p| p.trim_matches('"'))
+        .collect::<Vec<_>>()
+        .join(".");
+    let coll = if qualified.starts_with("information_schema.") {
+        qualified.as_str()
+    } else {
+        bare
+    };
     let tail = rest[coll_end..].trim();
 
     // ── the select list ──────────────────────────────────────────────────────
@@ -911,6 +926,15 @@ fn unify_oid(a: i32, b: i32) -> i32 {
 /// holding `3` in row one and `"n/a"` in row two was advertised as `int8`, and
 /// a client that believes the description then fails parsing `"n/a"` as an
 /// integer — or, on the binary path, cannot be sent the value at all.
+/// Public alias so `pgcatalog` types a column EXACTLY as the wire does.
+///
+/// The catalogue reporting `bigint` for a column the protocol then sends as
+/// text would be a self-contradiction a client is entitled to trust, so both
+/// go through this one function rather than two that agree today.
+pub fn oid_for_column(rows: &[Value], col: &str) -> i32 {
+    oid_for(rows, col)
+}
+
 fn oid_for(rows: &[Value], col: &str) -> i32 {
     let mut acc: Option<i32> = None;
     for r in rows {
@@ -2365,6 +2389,19 @@ fn no_db(db_name: &str) -> Vec<u8> {
          (POST /v1/databases), or connect with -d <name>", db_name))
 }
 
+/// The catalogue relation a translated query reads from, if any.
+///
+/// Reads the collection straight off the parsed NQL rather than re-parsing the
+/// SQL, so it cannot disagree with what the executor is about to run.
+fn catalog_target(nql: &str) -> Option<String> {
+    let coll = crate::nql::parse(nql).ok()?.coll;
+    if crate::pgcatalog::is_catalog(&coll) {
+        Some(coll)
+    } else {
+        None
+    }
+}
+
 /// True when the statement carried a RETURNING clause. Checked against the raw
 /// SQL because `RETURNING *` yields an EMPTY projection, which is otherwise
 /// indistinguishable from "no RETURNING at all".
@@ -2468,6 +2505,25 @@ fn execute_stmt(
         }
 
         Stmt::Query { nql, project } => {
+            // A catalogue relation is synthesised from the live database
+            // rather than read from it — but it is still queried with the
+            // ORDINARY predicate path, so WHERE / ORDER BY / LIMIT and the
+            // `~` operators work on it because they are the same operators.
+            //
+            // Checked BEFORE `need_db!()`: `SELECT * FROM pg_namespace` has to
+            // answer even when the client connected without naming a database,
+            // which is exactly what psql does on startup. Refusing there is
+            // how "psql cannot connect" starts.
+            if let Some(coll) = catalog_target(&nql) {
+                let rows = crate::pgcatalog::rows(&coll, db)
+                    .expect("catalog_target only returns names pgcatalog serves");
+                let rows = crate::nql::query_rows(rows, &nql)
+                    .map_err(|e| err_msg("42601", &e.to_string()))?;
+                return Ok(Executed {
+                    rows, project, has_rows: true,
+                    tag: "SELECT".into(), tag_counts_rows: true,
+                });
+            }
             let db = need_db!();
             let (rows, _) = crate::nql::query(db, &nql).map_err(|e| {
                 err_msg("42601", &format!("{} (translated to NQL: {})", e, nql))
