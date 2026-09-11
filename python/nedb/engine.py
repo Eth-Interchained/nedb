@@ -49,6 +49,18 @@ def apply_op(store: MVCCStore, relations: Relations, indexes: Indexes, op: Op,
         key, coll = p["key"], p["coll"]
         doc = dict(p["doc"])          # copy so we don't mutate the op payload
         doc["_seq"] = op.seq          # inject sequence number into every stored doc
+        # `_hash` and `_coll` mirror what the Rust engine's node_to_json emits,
+        # so the documented metadata fields (_id, _coll, _hash, _seq) resolve in
+        # a predicate on BOTH engines. Without them `WHERE _coll = "jobs"` and
+        # `WHERE _hash = "..."` compared against a missing field and silently
+        # returned an empty set here while working in Rust.
+        #
+        # `_hash` is the hash of the op that wrote this version — the
+        # anchorable identity of this exact record. Injected into the COPY, so
+        # the hashed op payload and therefore the chain are untouched; verify()
+        # recomputes from op payloads, not from materialized docs.
+        doc["_hash"] = op.hash
+        doc["_coll"] = coll
         old = store.get(key)
         if old is not None:
             indexes.remove(coll, key, old)
