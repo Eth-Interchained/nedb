@@ -153,9 +153,18 @@ shop=> SELECT * FROM orders AS OF SYSTEM TIME 1;     -- time travel, in SQL
 
 **`AS OF SYSTEM TIME` is the bridge worth knowing about.** It is the spelling
 Postgres and CockroachDB use, and here it reaches NEDB's permanent,
-never-garbage-collected history rather than a few hours of MVCC. A wall-clock
+never-garbage-collected history rather than a few hours of MVCC.[^compact] A wall-clock
 timestamp is refused with the reason: NEDB's history is sequence-addressed, so
 a seq is exact where a time would be approximate.
+
+[^compact]: One caveat, stated rather than buried. `Db::compact()` reclaims disk
+    space by rewriting the object segments with only each document's **current**
+    version — so it prunes superseded versions and tombstones, and `AS OF` can
+    no longer reach them. Nothing invokes it automatically: it is not on the
+    HTTP surface, not in the CLI, and not on any timer. It exists for the
+    operator who has explicitly chosen to trade the audit trail for space. A
+    compacted store answers "not available at that sequence" rather than
+    returning a stale value, and `verify()` stays clean.
 
 Provenance is selectable like any other column:
 

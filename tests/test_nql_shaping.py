@@ -403,6 +403,66 @@ if nedb.__has_native__:
             check(f"parity: {nql}", a == b,
                   "" if a == b else f"\n      python {a}\n      rust   {b}")
 
+        # ── a DELETE is a tombstone, not an erasure ──────────────────────────
+        #
+        # `AS OF` used to return NOTHING for a deleted id in the Rust engine —
+        # at every sequence, including sequences long before the delete where
+        # the row demonstrably existed. So the headline claim ("a DELETE is a
+        # tombstone, the row stays in history") was false on the engine that
+        # ships to crates.io and npm.
+        #
+        # The Python reference was already RIGHT, which made this a live
+        # cross-engine divergence, not just a bug in one. Nothing was ever lost
+        # on disk — the tombstone keeps a `prev` link to the chain and
+        # `verify()` counted every object as healthy. That is the worst kind of
+        # data loss: the kind that passes its own audit.
+        #
+        # Needs its own factories because `run_engine`'s only write puts rows.
+        print(f"\n{'=' * 62}\ncross-engine: history survives a DELETE\n{'=' * 62}")
+
+        def py_delete_case():
+            db = nedb.NEDB()
+            db.put("t", "a", {"t": 55})
+            db.put("t", "a", {"t": 66})
+            db.put("t", "keep", {"t": 1})
+            db.delete("t", "a")
+            return db.query
+
+        def rust_delete_case():
+            _seq[0] += 1
+            core = NedbCore.open(os.path.join(tmproot, f"del{_seq[0]}"))
+            core.put("t", "a", _json.dumps({"t": 55}))
+            core.put("t", "a", _json.dumps({"t": 66}))
+            core.put("t", "keep", _json.dumps({"t": 1}))
+            core.delete("t", "a")
+            return lambda nql: [_json.loads(r) for r in core.query(nql)]
+
+        for label, q in (("python", py_delete_case()), ("rust", rust_delete_case())):
+            now = q("FROM t")
+            check(f"[{label}] a delete still deletes",
+                  [r["_id"] for r in now] == ["keep"], str([r["_id"] for r in now]))
+            at0 = q("FROM t AS OF 0")
+            check(f"[{label}] AS OF 0 — the ORIGINAL value survives the delete",
+                  [r.get("t") for r in at0] == [55], str(at0))
+            at1 = [r for r in q("FROM t AS OF 1") if r["_id"] == "a"]
+            check(f"[{label}] AS OF 1 — the UPDATED value survives the delete",
+                  [r.get("t") for r in at1] == [66], str(at1))
+            at3 = [r for r in q("FROM t AS OF 3") if r["_id"] == "a"]
+            check(f"[{label}] AS OF at/after the tombstone reports it absent",
+                  at3 == [], str(at3))
+            check(f"[{label}] the tombstone is never surfaced as a document",
+                  all("_deleted" not in r for s in range(5)
+                      for r in q(f"FROM t AS OF {s}")),
+                  "a _deleted field would look like a real document")
+
+        # And the two engines must agree on every one of those.
+        pq, rq = py_delete_case(), rust_delete_case()
+        for nql in ["FROM t", "FROM t AS OF 0", "FROM t AS OF 1",
+                    "FROM t AS OF 2", "FROM t AS OF 3"]:
+            a, b = norm(pq(nql)), norm(rq(nql))
+            check(f"parity after a delete: {nql}", a == b,
+                  "" if a == b else f"\n      python {a}\n      rust   {b}")
+
         native = True
     finally:
         shutil.rmtree(tmproot, ignore_errors=True)
