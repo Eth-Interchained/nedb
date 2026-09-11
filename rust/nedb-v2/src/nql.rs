@@ -53,7 +53,15 @@ use crate::store::Node;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    Kw(String),     // uppercase keyword: FROM, WHERE, ORDER, BY, AS, OF, VALID, LIMIT, GROUP, TRACE, REVERSE, AND, DESC, COUNT, SUM, AVG, MIN, MAX, SEARCH
+    /// A reserved word: (UPPERCASED for matching, RAW as the user spelled it).
+    ///
+    /// The raw spelling has to survive. Field positions accept a keyword as a
+    /// field name -- a document may legitimately have a field called `count`,
+    /// `min`, `value` or `status` -- and using the uppercased form there looks
+    /// up a key that does not exist. That made `HAVING count > 1` and
+    /// `ORDER BY count DESC` silently match nothing, because they searched the
+    /// row for "COUNT".
+    Kw(String, String),
     Ident(String),  // field name or collection name (lowercase/mixed)
     Str(String),    // "quoted string"
     Num(f64),       // numeric literal
@@ -168,11 +176,12 @@ impl<'a> Lexer<'a> {
             let word = &self.src[start..self.pos];
             let upper = word.to_uppercase();
             let keywords = ["FROM","AS","OF","VALID","WHERE","AND","OR","ORDER","BY",
-                            "ASC","DESC","LIMIT","GROUP","COUNT","SUM","AVG","MIN","MAX",
+                            "ASC","DESC","LIMIT","OFFSET","GROUP","HAVING",
+                            "COUNT","SUM","AVG","MIN","MAX",
                             "TRACE","TRAVERSE","REVERSE","SEARCH","NOT","NULL","TRUE","FALSE",
                             "IN","BETWEEN","LIKE","ILIKE","IS"];
             if keywords.contains(&upper.as_str()) {
-                return Tok::Kw(upper);
+                return Tok::Kw(upper, word.to_string());
             }
             return Tok::Ident(word.to_string());
         }
@@ -219,8 +228,42 @@ pub enum Pred {
     Not(Box<Pred>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GroupAgg { Count, Sum, Avg, Min, Max }
+
+impl GroupAgg {
+    fn name(&self) -> &'static str {
+        match self {
+            GroupAgg::Count => "count", GroupAgg::Sum => "sum",
+            GroupAgg::Avg   => "avg",   GroupAgg::Min => "min",
+            GroupAgg::Max   => "max",
+        }
+    }
+}
+
+/// One `ORDER BY` key. A list of these replaces the old single
+/// `Option<String>` + `bool` pair, because `ORDER BY status, fee DESC` — sort
+/// by one column then break ties with another — has no encoding as a single
+/// field plus a single direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderKey {
+    pub field: String,
+    pub desc:  bool,
+}
+
+/// An aggregate, grouped or ungrouped.
+///
+/// `group_field: None` is a whole-result aggregate — `FROM t COUNT`,
+/// `FROM t SUM fee` — which returns exactly one row. That was previously
+/// inexpressible: the aggregate keywords only existed after `GROUP BY`, so
+/// "how many rows match this?" had to fetch every row and count client-side.
+#[derive(Debug, Clone)]
+pub struct Aggregate {
+    pub group_field: Option<String>,
+    pub agg:         GroupAgg,
+    /// The field to aggregate. None for COUNT, which needs no target.
+    pub agg_field:   Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -229,11 +272,14 @@ pub struct Query {
     pub valid_as_of: Option<String>,
     pub where_:     Option<Pred>,
     pub search:     Option<String>,
-    pub order_by:   Option<String>,
-    pub order_desc: bool,
+    pub order_by:   Vec<OrderKey>,
     pub limit:      Option<usize>,
-    /// (group field, aggregate, field to aggregate — None for COUNT)
-    pub group_by:   Option<(String, GroupAgg, Option<String>)>,
+    pub offset:     Option<usize>,
+    pub aggregate:  Option<Aggregate>,
+    /// `HAVING <predicate>` — filters the AGGREGATED rows, so it can test
+    /// `count`, `sum_fee`, or the group key itself. Distinct from WHERE, which
+    /// filters input rows before they are grouped.
+    pub having:     Option<Pred>,
     pub trace:      Option<String>,     // edge type (usually "caused_by")
     pub trace_rev:  bool,
     pub traverse:   Option<String>,     // named relation for TRAVERSE rel
@@ -251,7 +297,7 @@ impl Parser {
 
     fn expect_kw(&mut self, kw: &str) -> Result<()> {
         match self.advance() {
-            Tok::Kw(k) if k == kw => Ok(()),
+            Tok::Kw(k, _) if k == kw => Ok(()),
             other => bail!("expected keyword {}, got {:?}", kw, other),
         }
     }
@@ -266,16 +312,16 @@ impl Parser {
         Ok(match self.advance() {
             Tok::Str(s)  => Value::String(s),
             Tok::Num(n)  => json!(n),
-            Tok::Kw(k) if k == "NULL"  => Value::Null,
-            Tok::Kw(k) if k == "TRUE"  => Value::Bool(true),
-            Tok::Kw(k) if k == "FALSE" => Value::Bool(false),
+            Tok::Kw(k, _) if k == "NULL"  => Value::Null,
+            Tok::Kw(k, _) if k == "TRUE"  => Value::Bool(true),
+            Tok::Kw(k, _) if k == "FALSE" => Value::Bool(false),
             Tok::Ident(s) => Value::String(s),
             other => bail!("expected a value (string, number, TRUE, FALSE or NULL), got {:?}", other),
         })
     }
 
     fn peek_kw(&self, kw: &str) -> bool {
-        matches!(self.peek(), Tok::Kw(k) if k == kw)
+        matches!(self.peek(), Tok::Kw(k, _) if k == kw)
     }
 
     fn eat_kw(&mut self, kw: &str) -> bool {
@@ -289,9 +335,20 @@ impl Parser {
         }
     }
 
+    fn parse_agg_kw(&mut self) -> Result<GroupAgg> {
+        Ok(match self.advance() {
+            Tok::Kw(a, _) if a == "COUNT" => GroupAgg::Count,
+            Tok::Kw(a, _) if a == "SUM"   => GroupAgg::Sum,
+            Tok::Kw(a, _) if a == "AVG"   => GroupAgg::Avg,
+            Tok::Kw(a, _) if a == "MIN"   => GroupAgg::Min,
+            Tok::Kw(a, _) if a == "MAX"   => GroupAgg::Max,
+            other => bail!("expected an aggregate (COUNT/SUM/AVG/MIN/MAX), got {:?}", other),
+        })
+    }
+
     fn parse_field(&mut self, ctx: &str) -> Result<String> {
         match self.advance() {
-            Tok::Ident(s) | Tok::Kw(s) => Ok(s),
+            Tok::Ident(s) | Tok::Kw(_, s) => Ok(s),
             other => bail!("{}: expected field name, got {:?}", ctx, other),
         }
     }
@@ -402,15 +459,16 @@ impl Parser {
     fn parse(&mut self) -> Result<Query> {
         self.expect_kw("FROM")?;
         let coll = match self.advance() {
-            Tok::Ident(s) | Tok::Kw(s) => s,
+            Tok::Ident(s) | Tok::Kw(_, s) => s,
             other => bail!("expected collection name, got {:?}", other),
         };
 
         let mut q = Query {
             coll, as_of: None, valid_as_of: None,
             where_: None, search: None,
-            order_by: None, order_desc: false,
-            limit: None, group_by: None,
+            order_by: vec![],
+            limit: None, offset: None,
+            aggregate: None, having: None,
             trace: None, trace_rev: false,
             traverse: None,
         };
@@ -419,7 +477,7 @@ impl Parser {
             match self.peek() {
                 Tok::Eof => break,
 
-                Tok::Kw(k) if k == "AS" => {
+                Tok::Kw(k, _) if k == "AS" => {
                     self.advance();
                     self.expect_kw("OF")?;
                     match self.advance() {
@@ -428,7 +486,7 @@ impl Parser {
                     }
                 }
 
-                Tok::Kw(k) if k == "VALID" => {
+                Tok::Kw(k, _) if k == "VALID" => {
                     self.advance();
                     self.expect_kw("AS")?;
                     self.expect_kw("OF")?;
@@ -438,7 +496,7 @@ impl Parser {
                     }
                 }
 
-                Tok::Kw(k) if k == "WHERE" => {
+                Tok::Kw(k, _) if k == "WHERE" => {
                     self.advance();
                     let pred = self.parse_pred()?;
                     // Repeating WHERE is a conjunction, matching the old
@@ -449,7 +507,7 @@ impl Parser {
                     });
                 }
 
-                Tok::Kw(k) if k == "SEARCH" => {
+                Tok::Kw(k, _) if k == "SEARCH" => {
                     self.advance();
                     match self.advance() {
                         Tok::Str(s) => q.search = Some(s),
@@ -457,51 +515,84 @@ impl Parser {
                     }
                 }
 
-                Tok::Kw(k) if k == "ORDER" => {
+                Tok::Kw(k, _) if k == "ORDER" => {
                     self.advance();
                     self.expect_kw("BY")?;
-                    let field = match self.advance() {
-                        Tok::Ident(s) | Tok::Kw(s) => s,
-                        other => bail!("ORDER BY: expected field, got {:?}", other),
-                    };
-                    q.order_by = Some(field);
-                    // ASC is now a real keyword. It used to lex as an Ident and
-                    // survive only because the clause loop silently skipped
-                    // tokens it did not recognise; with strict parsing it has
-                    // to be accepted explicitly.
-                    if self.eat_kw("DESC") {
-                        q.order_desc = true;
-                    } else {
-                        self.eat_kw("ASC");
+                    // Comma-separated sort keys, each with its own direction:
+                    // ORDER BY status, fee DESC
+                    loop {
+                        let field = self.parse_field("ORDER BY")?;
+                        // ASC is a real keyword now. It used to lex as an Ident
+                        // and survive only because the clause loop silently
+                        // skipped tokens it did not recognise.
+                        let desc = if self.eat_kw("DESC") {
+                            true
+                        } else {
+                            self.eat_kw("ASC");
+                            false
+                        };
+                        q.order_by.push(OrderKey { field, desc });
+                        if matches!(self.peek(), Tok::Punct(',')) { self.advance(); continue; }
+                        break;
                     }
                 }
 
-                Tok::Kw(k) if k == "LIMIT" => {
+                Tok::Kw(k, _) if k == "LIMIT" => {
                     self.advance();
                     match self.advance() {
-                        Tok::Num(n) => q.limit = Some(n as usize),
-                        other => bail!("LIMIT expects number, got {:?}", other),
+                        Tok::Num(n) if n >= 0.0 => q.limit = Some(n as usize),
+                        other => bail!("LIMIT expects a non-negative number, got {:?}", other),
                     }
                 }
 
-                Tok::Kw(k) if k == "GROUP" => {
+                Tok::Kw(k, _) if k == "OFFSET" => {
+                    self.advance();
+                    match self.advance() {
+                        Tok::Num(n) if n >= 0.0 => q.offset = Some(n as usize),
+                        other => bail!("OFFSET expects a non-negative number, got {:?}", other),
+                    }
+                }
+
+                Tok::Kw(k, _) if k == "HAVING" => {
+                    self.advance();
+                    let pred = self.parse_pred()?;
+                    q.having = Some(match q.having.take() {
+                        None => pred,
+                        Some(prev) => Pred::And(vec![prev, pred]),
+                    });
+                }
+
+                // A bare aggregate with no GROUP BY: `FROM t COUNT`,
+                // `FROM t SUM fee`. Returns exactly one row.
+                Tok::Kw(k, _) if matches!(k.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") => {
+                    let agg = self.parse_agg_kw()?;
+                    let agg_field = match agg {
+                        GroupAgg::Count => None,
+                        _ => Some(self.parse_field("aggregate")?),
+                    };
+                    if q.aggregate.is_some() {
+                        bail!("only one aggregate per query");
+                    }
+                    q.aggregate = Some(Aggregate { group_field: None, agg, agg_field });
+                }
+
+                Tok::Kw(k, _) if k == "GROUP" => {
                     self.advance();
                     self.expect_kw("BY")?;
                     let field = match self.advance() {
-                        Tok::Ident(s) | Tok::Kw(s) => s,
+                        Tok::Ident(s) | Tok::Kw(_, s) => s,
                         other => bail!("GROUP BY: expected field, got {:?}", other),
                     };
                     // The aggregate is OPTIONAL, matching the Python reference
                     // (query.py): `GROUP BY field` on its own yields per-group
                     // counts. Rust previously REQUIRED the keyword, so a bare
                     // GROUP BY was a parse error here and valid there.
-                    let agg = match self.peek() {
-                        Tok::Kw(a) if a == "COUNT" => { self.advance(); GroupAgg::Count }
-                        Tok::Kw(a) if a == "SUM"   => { self.advance(); GroupAgg::Sum }
-                        Tok::Kw(a) if a == "AVG"   => { self.advance(); GroupAgg::Avg }
-                        Tok::Kw(a) if a == "MIN"   => { self.advance(); GroupAgg::Min }
-                        Tok::Kw(a) if a == "MAX"   => { self.advance(); GroupAgg::Max }
-                        _ => GroupAgg::Count,
+                    let agg = if matches!(self.peek(),
+                        Tok::Kw(a, _) if matches!(a.as_str(), "COUNT"|"SUM"|"AVG"|"MIN"|"MAX"))
+                    {
+                        self.parse_agg_kw()?
+                    } else {
+                        GroupAgg::Count
                     };
                     // SUM/AVG/MIN/MAX take the field to aggregate. Without it
                     // the executor fell back to aggregating the GROUP BY field
@@ -513,25 +604,30 @@ impl Parser {
                         GroupAgg::Count => None,
                         _ => Some(self.parse_field("GROUP BY aggregate")?),
                     };
-                    q.group_by = Some((field, agg, agg_field));
+                    if q.aggregate.is_some() {
+                        bail!("only one aggregate per query");
+                    }
+                    q.aggregate = Some(Aggregate {
+                        group_field: Some(field), agg, agg_field,
+                    });
                 }
 
-                Tok::Kw(k) if k == "TRACE" => {
+                Tok::Kw(k, _) if k == "TRACE" => {
                     self.advance();
                     let edge = match self.advance() {
-                        Tok::Ident(s) | Tok::Kw(s) => s,
+                        Tok::Ident(s) | Tok::Kw(_, s) => s,
                         other => bail!("TRACE: expected edge type, got {:?}", other),
                     };
                     q.trace = Some(edge);
-                    if let Tok::Kw(k) = self.peek() {
+                    if let Tok::Kw(k, _) = self.peek() {
                         if k == "REVERSE" { self.advance(); q.trace_rev = true; }
                     }
                 }
 
-                Tok::Kw(k) if k == "TRAVERSE" => {
+                Tok::Kw(k, _) if k == "TRAVERSE" => {
                     self.advance();
                     let rel = match self.advance() {
-                        Tok::Ident(s) | Tok::Kw(s) => s,
+                        Tok::Ident(s) | Tok::Kw(_, s) => s,
                         other => bail!("TRAVERSE: expected relation name, got {:?}", other),
                     };
                     q.traverse = Some(rel);
@@ -541,7 +637,8 @@ impl Parser {
                 // skip that answered a different query than the one asked.
                 other => bail!(
                     "unexpected {:?} in query. Expected one of: AS OF, VALID AS OF, \
-                     WHERE, SEARCH, ORDER BY, LIMIT, GROUP BY, TRACE, TRAVERSE",
+                     WHERE, SEARCH, ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, \
+                     COUNT, SUM, AVG, MIN, MAX, TRACE, TRAVERSE",
                     other
                 ),
             }
@@ -627,25 +724,31 @@ fn like_match(value: &str, pattern: &str, ci: bool) -> bool {
     pi == p.len()
 }
 
-fn eval_pred(node: &Node, pred: &Pred) -> bool {
+/// Evaluate a predicate against anything that can resolve a field name.
+///
+/// Generic over the row source so ONE implementation serves both `WHERE`
+/// (over stored nodes) and `HAVING` (over aggregated rows, which are plain
+/// JSON objects with no node behind them). Two copies would be two chances for
+/// the operators to drift apart.
+fn eval_pred_with(get: &dyn Fn(&str) -> Value, pred: &Pred) -> bool {
     match pred {
-        Pred::Cmp { field, op, value } => cmp_op(&field_value(node, field), op, value),
+        Pred::Cmp { field, op, value } => cmp_op(&get(field), op, value),
 
         Pred::In { field, values, negated } => {
-            let fv = field_value(node, field);
+            let fv = get(field);
             let hit = values.iter().any(|v| cmp_op(&fv, "=", v));
             hit != *negated
         }
 
         Pred::Between { field, low, high, negated } => {
-            let fv = field_value(node, field);
+            let fv = get(field);
             // Inclusive on both ends, as in SQL.
             let hit = cmp_op(&fv, ">=", low) && cmp_op(&fv, "<=", high);
             hit != *negated
         }
 
         Pred::Like { field, pattern, negated, ci } => {
-            let fv = field_value(node, field);
+            let fv = get(field);
             // A missing/null field matches no pattern, and NOT LIKE on a null
             // field stays false — mirroring SQL's three-valued logic, where a
             // predicate over NULL is never true in either polarity.
@@ -658,14 +761,173 @@ fn eval_pred(node: &Node, pred: &Pred) -> bool {
             // Absent and explicitly-null are both NULL here: a document store
             // has no schema, so "the field was never written" and "the field
             // holds null" are the same observable state.
-            let is_null = field_value(node, field).is_null();
-            is_null != *negated
+            get(field).is_null() != *negated
         }
 
-        Pred::And(terms) => terms.iter().all(|t| eval_pred(node, t)),
-        Pred::Or(terms)  => terms.iter().any(|t| eval_pred(node, t)),
-        Pred::Not(inner) => !eval_pred(node, inner),
+        Pred::And(terms) => terms.iter().all(|t| eval_pred_with(get, t)),
+        Pred::Or(terms)  => terms.iter().any(|t| eval_pred_with(get, t)),
+        Pred::Not(inner) => !eval_pred_with(get, inner),
     }
+}
+
+fn eval_pred(node: &Node, pred: &Pred) -> bool {
+    eval_pred_with(&|f| field_value(node, f), pred)
+}
+
+/// `HAVING` evaluation, over an aggregated row.
+fn eval_pred_json(obj: &Value, pred: &Pred) -> bool {
+    eval_pred_with(&|f| obj.get(f).cloned().unwrap_or(Value::Null), pred)
+}
+
+/// Sort by a list of keys, each with its own direction. Earlier keys dominate;
+/// later ones break ties.
+fn sort_by_keys<T>(rows: &mut [T], keys: &[OrderKey], get: impl Fn(&T, &str) -> Value) {
+    rows.sort_by(|a, b| {
+        for k in keys {
+            let av = OrderedValue::from(&get(a, &k.field));
+            let bv = OrderedValue::from(&get(b, &k.field));
+            let ord = if k.desc { bv.cmp(&av) } else { av.cmp(&bv) };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Apply OFFSET then LIMIT, in that order.
+///
+/// SQL semantics: OFFSET skips rows of the RESULT, LIMIT caps what remains.
+/// An offset past the end yields an empty page rather than an error.
+fn paginate<T>(rows: Vec<T>, offset: Option<usize>, limit: Option<usize>) -> Vec<T> {
+    let mut it = rows;
+    if let Some(off) = offset {
+        if off >= it.len() {
+            return vec![];
+        }
+        it.drain(..off);
+    }
+    if let Some(n) = limit {
+        it.truncate(n);
+    }
+    it
+}
+
+/// Collapse rows into aggregate rows.
+///
+/// With `group_field: Some(f)` this yields one row per distinct value of `f`;
+/// with `None` it yields exactly one row aggregating the whole result set.
+///
+/// `count` is the group size, while the aggregate considers ONLY rows whose
+/// target field is numeric. That split matters and matches the Python
+/// reference, which computes `count` from the group and the aggregate from
+/// `[d[af] for d in gdocs if isinstance(d[af], (int, float))]`: a group of 5
+/// rows where 2 carry a numeric `price` reports `count: 5` and averages over
+/// 2. Folding non-numeric values in as 1.0 — the behaviour before 3.3.0 —
+/// silently corrupted every SUM and AVG.
+fn aggregate_rows(rows: &[Node], spec: &Aggregate) -> Vec<Value> {
+    // `ints` tracks whether EVERY contributing value was an integer.
+    //
+    // Aggregating exclusively in f64 was both a type divergence from the
+    // Python reference (which returns `66`, not `66.0`, for a sum of integers)
+    // and a precision bug: f64 cannot represent integers above 2^53 exactly,
+    // so a SUM over satoshi amounts or block heights silently rounded. SUM /
+    // MIN / MAX now stay in i64 when the inputs are integral. AVG is always
+    // fractional — Python's `sum(nums) / len(nums)` is true division — so it
+    // stays f64 in both engines.
+    struct Group { count: usize, nums: Vec<f64>, ints: Vec<i64>, all_int: bool }
+
+    // First-seen order, so results are stable run to run. HashMap iteration
+    // order previously made the grouped output nondeterministic.
+    let mut order: Vec<String> = vec![];
+    let mut groups: HashMap<String, Group> = HashMap::new();
+
+    // The ungrouped case is one group under a fixed key, so a single code path
+    // serves both and they cannot disagree about the aggregate itself.
+    const WHOLE: &str = "";
+
+    for node in rows {
+        let key = match spec.group_field {
+            None => WHOLE.to_string(),
+            Some(ref gf) => node.data.get(gf)
+                .map(as_text)
+                .unwrap_or_else(|| "null".to_string()),
+        };
+        let entry = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Group { count: 0, nums: vec![], ints: vec![], all_int: true }
+        });
+        entry.count += 1;
+        if let Some(ref af) = spec.agg_field {
+            // A JSON bool is not a number here, matching Python's
+            // `isinstance(x, (int, float)) and not isinstance(x, bool)`.
+            match node.data.get(af) {
+                Some(Value::Number(n)) => {
+                    if let Some(i) = n.as_i64() {
+                        entry.ints.push(i);
+                        entry.nums.push(i as f64);
+                    } else if let Some(f) = n.as_f64() {
+                        entry.all_int = false;
+                        entry.nums.push(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // An ungrouped aggregate over ZERO rows still returns one row — COUNT of
+    // an empty set is 0, not "no answer". A grouped aggregate over zero rows
+    // correctly returns no groups.
+    if spec.group_field.is_none() && order.is_empty() {
+        order.push(WHOLE.to_string());
+        groups.insert(WHOLE.to_string(),
+                      Group { count: 0, nums: vec![], ints: vec![], all_int: true });
+    }
+
+    order.into_iter().map(|k| {
+        let g = &groups[&k];
+        let mut obj = serde_json::Map::new();
+        if let Some(ref gf) = spec.group_field {
+            obj.insert(gf.clone(), Value::String(k.clone()));
+        }
+        obj.insert("count".to_string(), json!(g.count));
+
+        // Empty aggregate input yields null, not 0 and not +/-infinity — the
+        // old fold seeded MIN with f64::INFINITY, which serialises to null
+        // anyway but would report INFINITY through any non-JSON path.
+        let int_path = g.all_int && !g.ints.is_empty();
+        let agg_val: Value = match spec.agg {
+            GroupAgg::Count => json!(g.count),
+            _ if g.nums.is_empty() => Value::Null,
+            // checked_add: an i64 overflow falls back to f64 rather than
+            // panicking in release or wrapping to a negative sum.
+            GroupAgg::Sum if int_path => {
+                match g.ints.iter().try_fold(0i64, |a, &b| a.checked_add(b)) {
+                    Some(t) => json!(t),
+                    None => json!(g.nums.iter().sum::<f64>()),
+                }
+            }
+            GroupAgg::Min if int_path => json!(g.ints.iter().min().copied().unwrap()),
+            GroupAgg::Max if int_path => json!(g.ints.iter().max().copied().unwrap()),
+            GroupAgg::Sum => json!(g.nums.iter().sum::<f64>()),
+            // AVG is true division in both engines, so always fractional.
+            GroupAgg::Avg => json!(g.nums.iter().sum::<f64>() / g.nums.len() as f64),
+            GroupAgg::Min => json!(g.nums.iter().cloned().fold(f64::INFINITY, f64::min)),
+            GroupAgg::Max => json!(g.nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
+        };
+
+        // Python-parity key: sum_price / avg_score / min_price / max_price.
+        if let Some(ref af) = spec.agg_field {
+            obj.insert(format!("{}_{}", spec.agg.name(), af), agg_val.clone());
+        }
+        // `value` is retained as an alias. It was this engine's only aggregate
+        // key before 3.3.0, so Studio and any existing caller still read it;
+        // dropping it would be a silent breakage on a client we do not
+        // control from here.
+        obj.insert("value".to_string(), agg_val);
+        Value::Object(obj)
+    }).collect()
 }
 
 /// Find an `_id = "..."` equality usable as an O(1) index lookup.
@@ -761,8 +1023,13 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
         db.id_index.list_ids(&q.coll).into_iter()
             .filter_map(|id| db.get_as_of(&q.coll, &id, seq_target))
             .collect()
-    } else if let Some(ref order_field) = q.order_by {
+    } else if q.order_by.len() == 1 && q.aggregate.is_none() {
         // ORDER BY with optional sorted index — get candidates in order.
+        //
+        // Single key only: the sorted index is per-field, so a multi-key sort
+        // cannot be served from it and falls through to the post-filter sort
+        // below. Never used when aggregating either, because the sort then
+        // applies to the GROUPED rows, which do not exist yet.
         //
         // Push LIMIT down into the index scan ONLY when nothing filters rows
         // after candidate generation. WHERE / SEARCH / VALID AS OF all run on
@@ -771,22 +1038,30 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
         // would fetch the 10 lowest blocks by height and then filter — losing
         // matches past the top-k window. The Python reference filters → sorts
         // → limits (engine.py execute()); this keeps the engines in agreement.
+        let key = &q.order_by[0];
         let has_post_filters = q.where_.is_some()
             || q.search.is_some()
             || q.valid_as_of.is_some();
         let limit = if has_post_filters {
             9_999_999
         } else {
-            q.limit.unwrap_or(9_999_999)
+            // OFFSET is applied AFTER the sort, so the pushdown has to fetch
+            // offset + limit rows and discard the prefix later. Fetching only
+            // `limit` would return the first page for every page.
+            match q.limit {
+                Some(n) => n.saturating_add(q.offset.unwrap_or(0)),
+                None => 9_999_999,
+            }
         };
-        if q.order_desc {
-            db.order_by_desc(&q.coll, order_field, limit)
+        if key.desc {
+            db.order_by_desc(&q.coll, &key.field, limit)
         } else {
-            db.order_by_asc(&q.coll, order_field, limit)
+            db.order_by_asc(&q.coll, &key.field, limit)
         }
     } else if let (Some(n), true) = (q.limit, q.where_.is_none()
             && q.search.is_none() && q.trace.is_none()
-            && q.traverse.is_none() && q.group_by.is_none()
+            && q.traverse.is_none() && q.aggregate.is_none()
+            && q.order_by.is_empty() && q.offset.is_none()
             && q.valid_as_of.is_none()) {
         // LIMIT-only fast path: no filters, no ordering, no trace.
         // Take only the first N IDs from the id-index and fetch those docs.
@@ -839,93 +1114,80 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
         rows = traversed;
     }
 
-    // ── ORDER BY (post-filter sort if no sorted index was used) ───────────────
+    // ── Aggregate → HAVING → ORDER BY → OFFSET → LIMIT ───────────────────────
+    //
+    // This is the SQL pipeline order, and getting it wrong was a live source
+    // of silently-wrong answers. The old order was ORDER BY → LIMIT → GROUP BY,
+    // which means:
+    //
+    //   `LIMIT 5 GROUP BY status COUNT` truncated the INPUT to five rows and
+    //   then grouped them, so with twelve rows across three statuses the
+    //   counts summed to 5 instead of 12. A confident wrong aggregate.
+    //
+    //   `ORDER BY count DESC GROUP BY status COUNT` sorted the raw documents
+    //   on a field none of them carry (`count` only exists after grouping),
+    //   so the grouped output came back in arbitrary order and the clause was
+    //   silently inert.
+    //
+    // In SQL, LIMIT and ORDER BY apply to the RESULT. They now do here.
 
-    if let Some(ref field) = q.order_by {
-        if q.as_of.is_some() || q.where_.is_some() || q.search.is_some() {
-            // Re-sort after filtering
-            rows.sort_by(|a, b| {
-                let av = a.data.get(field).map(OrderedValue::from).unwrap_or(OrderedValue::Null);
-                let bv = b.data.get(field).map(OrderedValue::from).unwrap_or(OrderedValue::Null);
-                if q.order_desc { bv.cmp(&av) } else { av.cmp(&bv) }
+    if let Some(ref spec) = q.aggregate {
+        let mut out = aggregate_rows(&rows, spec);
+
+        // HAVING filters the aggregated rows, so it can test `count`,
+        // `sum_fee` or the group key — none of which exist before this point.
+        if let Some(ref pred) = q.having {
+            out.retain(|row| eval_pred_json(row, pred));
+        }
+
+        if !q.order_by.is_empty() {
+            sort_by_keys(&mut out, &q.order_by,
+                         |row, f| row.get(f).cloned().unwrap_or(Value::Null));
+        } else if let Some(ref gf) = spec.group_field {
+            // Deterministic default: groups sorted by key.
+            //
+            // NOT first-seen order. The Python reference draws candidates from
+            // a `set`, so its input row order is arbitrary; a first-seen
+            // ordering would differ between the two engines even though both
+            // are internally consistent. Sorting by the key gives one answer
+            // they can agree on, which the cross-engine parity suite pins.
+            let gf = gf.clone();
+            out.sort_by(|a, b| {
+                as_text(&a.get(&gf).cloned().unwrap_or(Value::Null))
+                    .cmp(&as_text(&b.get(&gf).cloned().unwrap_or(Value::Null)))
             });
+        }
+
+        return Ok(paginate(out, q.offset, q.limit));
+    }
+
+    if q.having.is_some() {
+        bail!("HAVING requires an aggregate — add GROUP BY <field>, or use WHERE \
+               to filter individual rows");
+    }
+
+    // ── ORDER BY (post-filter sort if no sorted index was used) ──────────────
+
+    if !q.order_by.is_empty() {
+        // The single-key sorted-index path above already returned candidates
+        // in order, but only when nothing filtered them afterwards. Re-sort
+        // whenever a filter ran, or whenever the sort has more than one key.
+        let index_path_held = q.order_by.len() == 1
+            && q.as_of.is_none()
+            && q.where_.is_none()
+            && q.search.is_none()
+            && q.valid_as_of.is_none()
+            && q.trace.is_none()
+            && q.traverse.is_none();
+        if !index_path_held {
+            sort_by_keys(&mut rows, &q.order_by,
+                         |n, f| field_value(n, f));
         }
     }
 
-    // ── LIMIT ─────────────────────────────────────────────────────────────────
+    // ── OFFSET then LIMIT ────────────────────────────────────────────────────
 
-    if let Some(n) = q.limit {
-        rows.truncate(n);
-    }
-
-    // ── GROUP BY ─────────────────────────────────────────────────────────────
-
-    if let Some((ref group_field, ref agg, ref agg_field)) = q.group_by {
-        // Group membership is counted for every row; the aggregate only sees
-        // rows where the TARGET field is numeric. That split matters: the
-        // Python reference computes `count` from the group and the aggregate
-        // from `[d[af] for d in gdocs if isinstance(d[af], (int, float))]`, so
-        // a group of 5 rows where 2 carry a numeric `price` reports count=5
-        // and averages over 2. Folding non-numeric values in as 1.0 (the old
-        // behaviour) silently corrupted every AVG and SUM.
-        struct Group { count: usize, nums: Vec<f64> }
-        // Preserve first-seen group order so results are stable run to run —
-        // a HashMap iteration order made the old output nondeterministic.
-        let mut order: Vec<String> = vec![];
-        let mut groups: HashMap<String, Group> = HashMap::new();
-
-        for node in &rows {
-            let key = node.data.get(group_field)
-                .map(|v| as_text(v))
-                .unwrap_or_else(|| "null".to_string());
-            let entry = groups.entry(key.clone()).or_insert_with(|| {
-                order.push(key.clone());
-                Group { count: 0, nums: vec![] }
-            });
-            entry.count += 1;
-            if let Some(af) = agg_field {
-                if let Some(n) = node.data.get(af).and_then(|v| v.as_f64()) {
-                    entry.nums.push(n);
-                }
-            }
-        }
-
-        let result: Vec<Value> = order.into_iter().map(|k| {
-            let g = &groups[&k];
-            let mut obj = serde_json::Map::new();
-            obj.insert(group_field.clone(), Value::String(k.clone()));
-            obj.insert("count".to_string(), json!(g.count));
-
-            // Empty aggregate input yields null, not 0 or +/-infinity — the
-            // old fold seeded MIN with f64::INFINITY, which serialises to
-            // null anyway but would report INFINITY through any non-JSON path.
-            let agg_val: Value = match agg {
-                GroupAgg::Count => json!(g.count),
-                _ if g.nums.is_empty() => Value::Null,
-                GroupAgg::Sum => json!(g.nums.iter().sum::<f64>()),
-                GroupAgg::Avg => json!(g.nums.iter().sum::<f64>() / g.nums.len() as f64),
-                GroupAgg::Min => json!(g.nums.iter().cloned().fold(f64::INFINITY, f64::min)),
-                GroupAgg::Max => json!(g.nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
-            };
-
-            // Python-parity key: sum_price / avg_score / min_price / max_price.
-            if let Some(af) = agg_field {
-                let name = match agg {
-                    GroupAgg::Sum => "sum", GroupAgg::Avg => "avg",
-                    GroupAgg::Min => "min", GroupAgg::Max => "max",
-                    GroupAgg::Count => "count",
-                };
-                obj.insert(format!("{}_{}", name, af), agg_val.clone());
-            }
-            // `value` is retained as an alias. It was this engine's only
-            // aggregate key before 3.3.0, so Studio and any existing caller
-            // still read it; dropping it would be a silent breakage on a
-            // client we do not control from here.
-            obj.insert("value".to_string(), agg_val);
-            Value::Object(obj)
-        }).collect();
-        return Ok(result);
-    }
+    let rows = paginate(rows, q.offset, q.limit);
 
     // ── Serialize ─────────────────────────────────────────────────────────────
 
@@ -1300,11 +1562,13 @@ mod tests {
     fn unknown_clauses_are_errors_not_silent_skips() {
         let (_tmp, db) = setup();
         for bad in [
-            "FROM blocks OFFSET 2",              // not implemented in this slice
             "FROM blocks ORDRE BY height",       // typo
             "FROM blocks WHERE height > 3 JUNK", // trailing garbage
-            "FROM blocks HAVING height > 3",     // valid SQL, unsupported here
             "FROM blocks SELECT height",         // wrong dialect
+            "FROM blocks LIMIT",                 // missing count
+            "FROM blocks OFFSET",                // missing count
+            "FROM blocks ORDER BY",              // missing key
+            "FROM blocks ORDER BY height,",      // trailing comma
         ] {
             assert!(query(&db, bad).is_err(), "`{}` must be rejected, not silently reinterpreted", bad);
         }
@@ -1358,6 +1622,451 @@ mod tests {
         assert_eq!(rows.len(), 5); // all unique n_tx values
     }
 
+    // ── Result shaping (3.3.0): OFFSET, multi-key ORDER BY, HAVING, ─────────
+    // ── bare aggregates, and the SQL pipeline order ─────────────────────────
+
+    fn heights(rows: &[Value]) -> Vec<u64> {
+        rows.iter().filter_map(|r| r["height"].as_u64()).collect()
+    }
+
+    #[test]
+    fn offset_skips_result_rows() {
+        let (_tmp, db) = setup();
+        let (rows, _) = query(&db, "FROM blocks ORDER BY height OFFSET 2").unwrap();
+        assert_eq!(heights(&rows), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn offset_with_limit_pages() {
+        let (_tmp, db) = setup();
+        // Page through 5 rows two at a time. Each page must be disjoint and
+        // in order — the bug to catch is a pushdown that fetches only `limit`
+        // rows and therefore returns page 1 for every page.
+        let mut seen = vec![];
+        for page in 0..3 {
+            let (rows, _) = query(
+                &db,
+                &format!("FROM blocks ORDER BY height LIMIT 2 OFFSET {}", page * 2),
+            ).unwrap();
+            seen.extend(heights(&rows));
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn offset_past_the_end_is_an_empty_page() {
+        let (_tmp, db) = setup();
+        let (rows, count) = query(&db, "FROM blocks OFFSET 99").unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(count, 0);
+        let (zero, _) = query(&db, "FROM blocks OFFSET 0").unwrap();
+        assert_eq!(zero.len(), 5, "OFFSET 0 skips nothing");
+    }
+
+    #[test]
+    fn offset_applies_after_the_filter() {
+        let (_tmp, db) = setup();
+        // n_tx = h*2, so `>= 6` matches heights 3,4,5. Offsetting by one must
+        // skip the first MATCH, not the first row of the collection.
+        let (rows, _) = query(
+            &db, "FROM blocks WHERE n_tx >= 6 ORDER BY height OFFSET 1").unwrap();
+        assert_eq!(heights(&rows), vec![4, 5]);
+    }
+
+    #[test]
+    fn order_by_multiple_keys() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        // Two statuses, each with several fees, so the second key has to do
+        // real work to break the first key's ties.
+        for (i, (s, f)) in [("open", 30), ("open", 10), ("closed", 20),
+                            ("open", 20), ("closed", 5)].iter().enumerate() {
+            db.put("t", &i.to_string(),
+                serde_json::json!({"status": s, "fee": f}), vec![], None, None).unwrap();
+        }
+        let (rows, _) = query(&db, "FROM t ORDER BY status, fee DESC").unwrap();
+        let got: Vec<(String, u64)> = rows.iter()
+            .map(|r| (r["status"].as_str().unwrap().to_string(), r["fee"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![
+            ("closed".into(), 20), ("closed".into(), 5),
+            ("open".into(), 30), ("open".into(), 20), ("open".into(), 10),
+        ]);
+    }
+
+    #[test]
+    fn order_by_mixed_directions() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        for (i, (a, b)) in [(1, 1), (1, 2), (2, 1), (2, 2)].iter().enumerate() {
+            db.put("t", &i.to_string(),
+                serde_json::json!({"a": a, "b": b}), vec![], None, None).unwrap();
+        }
+        let (rows, _) = query(&db, "FROM t ORDER BY a DESC, b ASC").unwrap();
+        let got: Vec<(u64, u64)> = rows.iter()
+            .map(|r| (r["a"].as_u64().unwrap(), r["b"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![(2, 1), (2, 2), (1, 1), (1, 2)]);
+    }
+
+    /// The headline pipeline-order bug. In SQL, LIMIT applies to the RESULT.
+    /// The old order was ORDER BY -> LIMIT -> GROUP BY, so LIMIT truncated the
+    /// INPUT and the aggregate was computed over a fraction of the rows —
+    /// reporting counts that summed to the limit instead of the true total.
+    #[test]
+    fn limit_applies_to_grouped_rows_not_to_the_input() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        for i in 0..12 {
+            // Hoisted: json! cannot parse an indexing expression inline.
+            let status = ["open", "closed", "void"][i % 3];
+            db.put("t", &i.to_string(),
+                serde_json::json!({"status": status, "fee": i}),
+                vec![], None, None).unwrap();
+        }
+        let (all, _) = query(&db, "FROM t GROUP BY status COUNT").unwrap();
+        assert_eq!(all.len(), 3);
+        let total: u64 = all.iter().filter_map(|r| r["count"].as_u64()).sum();
+        assert_eq!(total, 12, "every input row must be counted");
+
+        // LIMIT 2 must return 2 GROUPS, each with its full count — not two
+        // input rows regrouped.
+        let (limited, _) = query(&db, "FROM t GROUP BY status COUNT LIMIT 2").unwrap();
+        assert_eq!(limited.len(), 2, "LIMIT caps the number of groups");
+        for r in &limited {
+            assert_eq!(r["count"], json!(4),
+                       "each group keeps its true count, got {:?}", r);
+        }
+    }
+
+    /// The second pipeline-order bug: ORDER BY ran before grouping, so it
+    /// sorted the raw documents on a field that only exists AFTER grouping
+    /// (`count`, `sum_fee`) and the grouped output came back unordered. The
+    /// clause was silently inert.
+    #[test]
+    fn order_by_sorts_the_grouped_rows() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        // Deliberately uneven: 1 x "a", 3 x "b", 2 x "c".
+        for (i, s) in ["a", "b", "b", "b", "c", "c"].iter().enumerate() {
+            db.put("t", &i.to_string(),
+                serde_json::json!({"g": s, "n": i}), vec![], None, None).unwrap();
+        }
+        let (rows, _) = query(&db, "FROM t GROUP BY g COUNT ORDER BY count DESC").unwrap();
+        let got: Vec<(String, u64)> = rows.iter()
+            .map(|r| (r["g"].as_str().unwrap().to_string(), r["count"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got, vec![("b".into(), 3), ("c".into(), 2), ("a".into(), 1)]);
+
+        // And the group key itself is sortable.
+        let (by_key, _) = query(&db, "FROM t GROUP BY g COUNT ORDER BY g DESC").unwrap();
+        let keys: Vec<&str> = by_key.iter().map(|r| r["g"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn order_by_an_aggregate_key() {
+        let (_tmp, db) = setup_items();
+        let (rows, _) = query(
+            &db, "FROM items GROUP BY cat SUM price ORDER BY sum_price DESC").unwrap();
+        let cats: Vec<&str> = rows.iter().map(|r| r["cat"].as_str().unwrap()).collect();
+        assert_eq!(cats, vec!["y", "x"], "y sums to 60, x to 15");
+    }
+
+    #[test]
+    fn offset_and_limit_page_grouped_rows() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        for i in 0..9 {
+            db.put("t", &i.to_string(),
+                serde_json::json!({"g": format!("g{}", i % 3)}), vec![], None, None).unwrap();
+        }
+        let (page, _) = query(
+            &db, "FROM t GROUP BY g COUNT ORDER BY g LIMIT 1 OFFSET 1").unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["g"], "g1");
+    }
+
+    // ── HAVING ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn having_filters_groups_by_count() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        for (i, s) in ["a", "b", "b", "b", "c", "c"].iter().enumerate() {
+            db.put("t", &i.to_string(),
+                serde_json::json!({"g": s, "n": i}), vec![], None, None).unwrap();
+        }
+        let (rows, _) = query(&db, "FROM t GROUP BY g COUNT HAVING count > 1").unwrap();
+        let mut keys: Vec<&str> = rows.iter().map(|r| r["g"].as_str().unwrap()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["b", "c"], "the single-row group `a` is filtered out");
+    }
+
+    #[test]
+    fn having_filters_on_the_aggregate_value() {
+        let (_tmp, db) = setup_items();
+        // x sums to 15, y to 60.
+        let (rows, _) = query(
+            &db, "FROM items GROUP BY cat SUM price HAVING sum_price > 20").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["cat"], "y");
+    }
+
+    /// HAVING gets the full predicate surface, because it runs through the
+    /// same evaluator as WHERE rather than a second copy.
+    #[test]
+    fn having_supports_the_whole_predicate_surface() {
+        let (_tmp, db) = setup_items();
+        let (in_, _) = query(
+            &db, r#"FROM items GROUP BY cat COUNT HAVING cat IN ("x")"#).unwrap();
+        assert_eq!(in_.len(), 1);
+        assert_eq!(in_[0]["cat"], "x");
+
+        let (btw, _) = query(
+            &db, "FROM items GROUP BY cat SUM price HAVING sum_price BETWEEN 10 AND 20").unwrap();
+        assert_eq!(btw.len(), 1);
+        assert_eq!(btw[0]["cat"], "x");
+
+        let (like, _) = query(
+            &db, r#"FROM items GROUP BY cat COUNT HAVING cat LIKE "y""#).unwrap();
+        assert_eq!(like.len(), 1);
+
+        let (or_, _) = query(
+            &db, "FROM items GROUP BY cat SUM price HAVING sum_price < 20 OR count = 3").unwrap();
+        assert_eq!(or_.len(), 2);
+    }
+
+    /// WHERE filters input rows, HAVING filters groups. Confusing them gives
+    /// different answers, so the distinction must hold.
+    #[test]
+    fn where_and_having_are_different_stages() {
+        let (_tmp, db) = setup_items();
+        // WHERE drops rows BEFORE grouping, shrinking the sums.
+        let (w, _) = query(
+            &db, "FROM items WHERE price > 10 GROUP BY cat SUM price").unwrap();
+        let x = w.iter().find(|r| r["cat"] == "x");
+        assert!(x.is_none(), "x's rows (0,5,10) are all filtered out by WHERE");
+
+        // HAVING keeps every row in the aggregate and filters the RESULT.
+        let (h, _) = query(
+            &db, "FROM items GROUP BY cat SUM price HAVING sum_price > 10").unwrap();
+        assert_eq!(h.len(), 2, "both groups sum above 10 when nothing is pre-filtered");
+    }
+
+    #[test]
+    fn having_without_an_aggregate_is_an_error() {
+        let (_tmp, db) = setup();
+        // HAVING is meaningless without grouping, and silently treating it as
+        // a second WHERE would be exactly the kind of reinterpretation this
+        // parser no longer does.
+        assert!(query(&db, "FROM blocks HAVING height > 3").is_err());
+    }
+
+    // ── Bare aggregates, no GROUP BY ────────────────────────────────────────
+
+    /// `FROM t COUNT` — "how many rows match?" without fetching them. The
+    /// July engine note recorded `SELECT COUNT(*)` returning `[]` silently;
+    /// this is the capability that was missing behind that silence.
+    #[test]
+    fn bare_count_returns_one_row() {
+        let (_tmp, db) = setup();
+        let (rows, _) = query(&db, "FROM blocks COUNT").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["count"], json!(5));
+        assert_eq!(rows[0]["value"], json!(5));
+    }
+
+    #[test]
+    fn bare_count_respects_the_filter() {
+        let (_tmp, db) = setup();
+        let (rows, _) = query(&db, "FROM blocks WHERE height > 3 COUNT").unwrap();
+        assert_eq!(rows[0]["count"], json!(2));
+    }
+
+    #[test]
+    fn bare_sum_avg_min_max() {
+        let (_tmp, db) = setup();
+        // heights 1..=5, n_tx = h*2 -> 2,4,6,8,10
+        let (s, _) = query(&db, "FROM blocks SUM n_tx").unwrap();
+        assert_eq!(s[0]["sum_n_tx"], json!(30), "integer inputs give an integer sum");
+        let (a, _) = query(&db, "FROM blocks AVG n_tx").unwrap();
+        assert_eq!(a[0]["avg_n_tx"], json!(6.0));
+        let (mn, _) = query(&db, "FROM blocks MIN n_tx").unwrap();
+        assert_eq!(mn[0]["min_n_tx"], json!(2));
+        let (mx, _) = query(&db, "FROM blocks MAX n_tx").unwrap();
+        assert_eq!(mx[0]["max_n_tx"], json!(10));
+    }
+
+    /// Integer inputs must produce integer aggregates.
+    ///
+    /// Aggregating exclusively in f64 was a type divergence from the Python
+    /// reference (which returns `66`, not `66.0`) AND a precision bug: f64
+    /// cannot represent integers above 2^53 exactly, so a SUM over satoshi
+    /// amounts or block heights silently rounded. This engine stores exactly
+    /// that kind of number.
+    #[test]
+    fn integer_aggregates_stay_integers_and_keep_full_precision() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        // Beyond 2^53 (9_007_199_254_740_992), where f64 starts skipping
+        // integers. Their true sum ends in ...9, which a f64 round-trip loses.
+        let big: [i64; 3] = [9_007_199_254_740_993, 9_007_199_254_740_995, 1];
+        for (i, v) in big.iter().enumerate() {
+            db.put("t", &i.to_string(), serde_json::json!({"v": v}),
+                   vec![], None, None).unwrap();
+        }
+        let (s, _) = query(&db, "FROM t SUM v").unwrap();
+        assert_eq!(s[0]["sum_v"], json!(18_014_398_509_481_989i64),
+                   "exact i64 sum, not a rounded f64");
+        assert!(s[0]["sum_v"].is_i64(), "must serialise as an integer");
+
+        let (mx, _) = query(&db, "FROM t MAX v").unwrap();
+        assert_eq!(mx[0]["max_v"], json!(9_007_199_254_740_995i64));
+        let (mn, _) = query(&db, "FROM t MIN v").unwrap();
+        assert_eq!(mn[0]["min_v"], json!(1));
+    }
+
+    /// A float anywhere in the column makes the whole aggregate fractional,
+    /// which is what Python's arithmetic does too.
+    #[test]
+    fn a_single_float_makes_the_aggregate_fractional() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("t", "1", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+        db.put("t", "2", serde_json::json!({"v": 2.5}), vec![], None, None).unwrap();
+        let (s, _) = query(&db, "FROM t SUM v").unwrap();
+        assert_eq!(s[0]["sum_v"], json!(3.5));
+        // AVG is true division, so it is fractional even over pure integers.
+        let (a, _) = query(&db, "FROM t AVG v").unwrap();
+        assert_eq!(a[0]["avg_v"], json!(1.75));
+    }
+
+    /// A JSON bool is not a number, matching Python's explicit
+    /// `not isinstance(x, bool)` guard.
+    #[test]
+    fn booleans_are_not_aggregated_as_numbers() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("t", "1", serde_json::json!({"v": true}), vec![], None, None).unwrap();
+        db.put("t", "2", serde_json::json!({"v": 5}), vec![], None, None).unwrap();
+        let (s, _) = query(&db, "FROM t SUM v").unwrap();
+        assert_eq!(s[0]["sum_v"], json!(5), "the bool contributes nothing");
+        assert_eq!(s[0]["count"], json!(2), "but it still counts toward the group");
+    }
+
+    /// COUNT over an empty result is 0, not "no rows". A caller asking "how
+    /// many?" must get a number.
+    #[test]
+    fn bare_count_of_nothing_is_zero_not_empty() {
+        let (_tmp, db) = setup();
+        let (rows, count) = query(&db, "FROM blocks WHERE height > 999 COUNT").unwrap();
+        assert_eq!(count, 1, "still exactly one row");
+        assert_eq!(rows[0]["count"], json!(0));
+
+        // A GROUPED aggregate over zero rows correctly has no groups.
+        let (g, _) = query(&db, "FROM blocks WHERE height > 999 GROUP BY height COUNT").unwrap();
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn bare_aggregate_over_an_empty_collection() {
+        let (_tmp, db) = setup();
+        let (rows, _) = query(&db, "FROM nonexistent COUNT").unwrap();
+        assert_eq!(rows[0]["count"], json!(0));
+        let (s, _) = query(&db, "FROM nonexistent SUM n_tx").unwrap();
+        assert_eq!(s[0]["sum_n_tx"], Value::Null, "sum of nothing is null, not 0");
+    }
+
+    #[test]
+    fn bare_aggregate_carries_no_group_key() {
+        let (_tmp, db) = setup();
+        let (rows, _) = query(&db, "FROM blocks COUNT").unwrap();
+        if let Value::Object(m) = &rows[0] {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            assert_eq!(keys, vec!["count", "value"]);
+        } else {
+            panic!("expected an object");
+        }
+    }
+
+    /// A document field whose name collides with a reserved word must be
+    /// addressable. The lexer uppercases keywords for matching, and field
+    /// positions accept a keyword as a field name — but they used the
+    /// UPPERCASED text, so `WHERE count > 1` searched the document for "COUNT"
+    /// and matched nothing. Silent, and it hit real field names: count, min,
+    /// max, sum, avg, value, search, group, order, limit, offset, trace.
+    #[test]
+    fn a_field_named_like_a_keyword_is_still_addressable() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("t", "1", serde_json::json!({
+            "count": 5, "min": 1, "max": 9, "sum": 3, "avg": 2,
+            "value": "keep", "limit": 7, "offset": 8, "group": "g1", "search": "s",
+        }), vec![], None, None).unwrap();
+        db.put("t", "2", serde_json::json!({
+            "count": 1, "min": 0, "max": 2, "sum": 0, "avg": 0,
+            "value": "drop", "limit": 0, "offset": 0, "group": "g2", "search": "t",
+        }), vec![], None, None).unwrap();
+
+        for (nql, want) in [
+            ("FROM t WHERE count > 3", "1"),
+            ("FROM t WHERE min = 1", "1"),
+            ("FROM t WHERE max >= 9", "1"),
+            ("FROM t WHERE sum = 3", "1"),
+            ("FROM t WHERE avg = 2", "1"),
+            (r#"FROM t WHERE value = "keep""#, "1"),
+            ("FROM t WHERE limit = 7", "1"),
+            ("FROM t WHERE offset = 8", "1"),
+            (r#"FROM t WHERE group = "g1""#, "1"),
+        ] {
+            let (rows, _) = query(&db, nql).unwrap();
+            assert_eq!(rows.len(), 1, "`{}` matched {} rows", nql, rows.len());
+            assert_eq!(rows[0]["_id"], want, "`{}`", nql);
+        }
+
+        // Sorting and grouping on such a field too.
+        let (ord, _) = query(&db, "FROM t ORDER BY count DESC").unwrap();
+        assert_eq!(ord[0]["_id"], "1");
+        let (grp, _) = query(&db, "FROM t GROUP BY group COUNT").unwrap();
+        assert_eq!(grp.len(), 2);
+        let keys: Vec<&str> = grp.iter().filter_map(|r| r["group"].as_str()).collect();
+        assert!(keys.contains(&"g1") && keys.contains(&"g2"), "{:?}", grp);
+    }
+
+    /// The raw spelling is preserved, so a mixed-case field name round-trips
+    /// while the keyword it collides with still matches case-insensitively.
+    #[test]
+    fn keyword_matching_stays_case_insensitive() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("t", "1", serde_json::json!({"Count": 5, "n": 1}),
+               vec![], None, None).unwrap();
+        // Field spelled `Count`, clause keywords in lower case.
+        let (rows, _) = query(&db, "from t where Count = 5 order by n").unwrap();
+        assert_eq!(rows.len(), 1);
+        // And a differently-cased field name does NOT collide with it.
+        let (miss, _) = query(&db, "FROM t WHERE count = 5").unwrap();
+        assert!(miss.is_empty(), "`count` and `Count` are distinct field names");
+    }
+
+    #[test]
+    fn two_aggregates_is_an_error() {
+        let (_tmp, db) = setup();
+        assert!(query(&db, "FROM blocks COUNT SUM n_tx").is_err());
+        assert!(query(&db, "FROM blocks GROUP BY height COUNT SUM n_tx").is_err());
+    }
+
+    #[test]
+    fn bare_aggregate_with_having() {
+        let (_tmp, db) = setup();
+        let (keep, _) = query(&db, "FROM blocks COUNT HAVING count > 3").unwrap();
+        assert_eq!(keep.len(), 1);
+        let (drop, _) = query(&db, "FROM blocks COUNT HAVING count > 99").unwrap();
+        assert!(drop.is_empty());
+    }
+
     // ── GROUP BY parity with the Python reference (query.py + engine.py) ────
 
     /// Fixture mirroring tests/test_v050.py::test_group_by_min_max exactly:
@@ -1390,16 +2099,16 @@ mod tests {
         let (_tmp, db) = setup_items();
 
         let (mins, _) = query(&db, "FROM items GROUP BY cat MIN price").unwrap();
-        assert_eq!(group(&mins, "cat", "x")["min_price"], json!(0.0));
-        assert_eq!(group(&mins, "cat", "y")["min_price"], json!(15.0));
+        assert_eq!(group(&mins, "cat", "x")["min_price"], json!(0));
+        assert_eq!(group(&mins, "cat", "y")["min_price"], json!(15));
 
         let (maxs, _) = query(&db, "FROM items GROUP BY cat MAX price").unwrap();
-        assert_eq!(group(&maxs, "cat", "y")["max_price"], json!(25.0));
-        assert_eq!(group(&maxs, "cat", "x")["max_price"], json!(10.0));
+        assert_eq!(group(&maxs, "cat", "y")["max_price"], json!(25));
+        assert_eq!(group(&maxs, "cat", "x")["max_price"], json!(10));
 
         let (sums, _) = query(&db, "FROM items GROUP BY cat SUM price").unwrap();
-        assert_eq!(group(&sums, "cat", "x")["sum_price"], json!(15.0));  // 0+5+10
-        assert_eq!(group(&sums, "cat", "y")["sum_price"], json!(60.0));  // 15+20+25
+        assert_eq!(group(&sums, "cat", "x")["sum_price"], json!(15));  // 0+5+10
+        assert_eq!(group(&sums, "cat", "y")["sum_price"], json!(60));  // 15+20+25
 
         let (avgs, _) = query(&db, "FROM items GROUP BY cat AVG price").unwrap();
         assert_eq!(group(&avgs, "cat", "x")["avg_price"], json!(5.0));
@@ -1414,8 +2123,8 @@ mod tests {
         let (_tmp, db) = setup_items();
         let (rows, _) = query(&db, "FROM items GROUP BY cat SUM price").unwrap();
         let x = group(&rows, "cat", "x");
-        assert_eq!(x["sum_price"], json!(15.0), "python-parity key");
-        assert_eq!(x["value"], json!(15.0), "back-compat alias must agree");
+        assert_eq!(x["sum_price"], json!(15), "python-parity key");
+        assert_eq!(x["value"], json!(15), "back-compat alias must agree");
         assert_eq!(x["count"], json!(3), "count is the group size");
     }
 
@@ -1489,8 +2198,8 @@ mod tests {
         let (_tmp, db) = setup_items();
         let (rows, _) = query(
             &db, "FROM items WHERE price IN (0, 5, 25) GROUP BY cat SUM price").unwrap();
-        assert_eq!(group(&rows, "cat", "x")["sum_price"], json!(5.0));
-        assert_eq!(group(&rows, "cat", "y")["sum_price"], json!(25.0));
+        assert_eq!(group(&rows, "cat", "x")["sum_price"], json!(5));
+        assert_eq!(group(&rows, "cat", "y")["sum_price"], json!(25));
     }
 
     #[test]

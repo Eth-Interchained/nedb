@@ -72,7 +72,7 @@ jobs:
           for t in test_nedb test_bitemporal test_causal test_concurrent \
                    test_crypto test_deploy test_proof test_v050 \
                    test_wrap_redis test_adapters test_wrap_sqlite_shadow \
-                   test_nql_predicates; do
+                   test_nql_predicates test_nql_shaping; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then
               echo "PASS $t"
@@ -195,7 +195,7 @@ jobs:
         run: |
           set -uo pipefail
           fail=0
-          for t in test_native test_celebration_v2 test_wrap_family test_nql_predicates; do
+          for t in test_native test_celebration_v2 test_wrap_family test_nql_predicates test_nql_shaping; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then echo "PASS $t"; else echo "::error title=$t::suite failed"; fail=1; fi
             echo "::endgroup::"

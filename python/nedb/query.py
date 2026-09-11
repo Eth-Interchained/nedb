@@ -53,13 +53,15 @@ _TOKEN_RE = re.compile(
 )
 
 _KEYWORDS = {"from", "as", "of", "where", "and", "or", "search", "order", "by",
-             "asc", "desc", "traverse", "trace", "reverse", "limit",
+             "asc", "desc", "traverse", "trace", "reverse", "limit", "offset",
+             "having",
              "valid", "true", "false", "null", "group", "count", "sum", "avg", "min", "max",
              "not", "in", "between", "like", "ilike", "is"}
 
 
-def _lex(text: str) -> List[Tuple[str, Any]]:
-    toks: List[Tuple[str, Any]] = []
+def _lex(text: str) -> List[Tuple[str, Any, str]]:
+    """Tokenize. Every token is (kind, canonical value, RAW source text)."""
+    toks: List[Tuple[str, Any, str]] = []
     pos = 0
     while pos < len(text):
         m = _TOKEN_RE.match(text, pos)
@@ -67,28 +69,37 @@ def _lex(text: str) -> List[Tuple[str, Any]]:
             raise SyntaxError(f"NQL: cannot tokenize near: {text[pos:pos+20]!r}")
         pos = m.end()
         if m.group("dq") is not None:
-            toks.append(("str", m.group("dq")))
+            toks.append(("str", m.group("dq"), m.group("dq")))
         elif m.group("sq") is not None:
-            toks.append(("str", m.group("sq")))
+            toks.append(("str", m.group("sq"), m.group("sq")))
         elif m.group("num") is not None:
             n = m.group("num")
-            toks.append(("num", float(n) if "." in n else int(n)))
+            toks.append(("num", float(n) if "." in n else int(n), n))
         elif m.group("op") is not None:
-            toks.append(("op", m.group("op")))
+            toks.append(("op", m.group("op"), m.group("op")))
         elif m.group("punct") is not None:
-            toks.append(("punct", m.group("punct")))
+            toks.append(("punct", m.group("punct"), m.group("punct")))
         elif m.group("word") is not None:
             w = m.group("word")
             lw = w.lower()
-            toks.append(("kw", lw) if lw in _KEYWORDS else ("word", w))
+            # A keyword token carries BOTH the canonical lowercase form (for
+            # clause matching) and the raw spelling (for field positions).
+            #
+            # The raw spelling has to survive: field positions accept a keyword
+            # as a field name — a document may legitimately have a field called
+            # `count`, `min`, `value` or `status` — and using the canonicalised
+            # form there looks up a key that does not exist. A field spelled
+            # `Count` became `count` and matched nothing, silently.
+            toks.append(("kw", lw, w) if lw in _KEYWORDS else ("word", w, w))
         # whitespace -> skip
     return toks
 
 
 def empty_plan(coll: str) -> dict:
     return {"from": coll, "as_of": None, "where": [], "search": None,
-            "order_by": None, "traverse": None, "limit": None,
-            "group_by": None, "aggregate": None,
+            "order_by": None, "order_keys": None,
+            "traverse": None, "limit": None, "offset": None,
+            "group_by": None, "aggregate": None, "having": None,
             "trace": None, "trace_reverse": False,
             "valid_as_of": None, "predicate": None}
 
@@ -120,7 +131,17 @@ def parse_nql(text: str) -> dict:
     i = 0
 
     def peek():
-        return toks[i] if i < len(toks) else (None, None)
+        """(kind, canonical value) — deliberately 2-wide.
+
+        Every clause test in this parser compares `peek() == ("kw", "limit")`,
+        so widening the return value would break all of them. Field positions
+        that need the user's original spelling call `peek_raw()` instead.
+        """
+        return toks[i][:2] if i < len(toks) else (None, None)
+
+    def peek_raw():
+        """The RAW source text of the current token, case preserved."""
+        return toks[i][2] if i < len(toks) else None
 
     def expect_kw(kw):
         nonlocal i
@@ -147,8 +168,9 @@ def parse_nql(text: str) -> dict:
     t, v = peek()
     if t not in ("word", "kw"):
         raise SyntaxError("NQL: expected collection after FROM")
+    coll_raw = peek_raw()
     i += 1
-    plan = empty_plan(v)
+    plan = empty_plan(coll_raw)
 
     # AS OF <seq>
     if peek() == ("kw", "as"):
@@ -198,12 +220,20 @@ def parse_nql(text: str) -> dict:
         i += 1
 
     def field_name(ctx):
+        """A field name, which MAY collide with a reserved word.
+
+        Returns the RAW spelling: a document can legitimately have a field
+        called `count`, `min`, `value` or `status`, and canonicalising it here
+        looks up a key the document does not have. `WHERE Count = 5` matched
+        nothing before this, silently.
+        """
         nonlocal i
         t, v = peek()
         if t not in ("word", "kw"):
             raise SyntaxError(f"NQL: {ctx}: expected field name, got {v!r}")
+        raw = peek_raw()
         i += 1
-        return v
+        return raw
 
     def p_or():
         terms = [p_and()]
@@ -333,21 +363,45 @@ def parse_nql(text: str) -> dict:
         i += 1
         plan["search"] = v
 
-    # ORDER BY field [ASC|DESC]
-    if peek() == ("kw", "order"):
+    # ORDER BY field [ASC|DESC] (, field [ASC|DESC])*
+    #
+    # plan["order_by"] keeps its historical (field, direction) shape for a
+    # single key so existing callers and the fluent builder are unaffected;
+    # plan["order_keys"] carries the full list. The executor reads order_keys.
+    #
+    # Absorbed in two positions for the same reason as LIMIT/OFFSET: SQL puts
+    # ORDER BY after GROUP BY, and the Rust engine's clause loop is position-
+    # independent, so accepting only the pre-GROUP-BY position here made
+    # `GROUP BY g COUNT ORDER BY count DESC` a syntax error in one engine and
+    # valid in the other.
+    def absorb_order():
+        nonlocal i
+        if peek() != ("kw", "order") or plan["order_keys"] is not None:
+            return
         i += 1
         expect_kw("by")
-        t, field = peek()
-        if t not in ("word", "kw"):
-            raise SyntaxError("NQL: expected field after ORDER BY")
-        i += 1
-        direction = "ASC"
-        if peek() == ("kw", "asc"):
+        keys = []
+        while True:
+            t, _f = peek()
+            if t not in ("word", "kw"):
+                raise SyntaxError("NQL: expected field after ORDER BY")
+            field = peek_raw()
             i += 1
-        elif peek() == ("kw", "desc"):
-            i += 1
-            direction = "DESC"
-        plan["order_by"] = (field, direction)
+            direction = "ASC"
+            if peek() == ("kw", "asc"):
+                i += 1
+            elif peek() == ("kw", "desc"):
+                i += 1
+                direction = "DESC"
+            keys.append((field, direction))
+            if peek() == ("punct", ","):
+                i += 1
+                continue
+            break
+        plan["order_keys"] = keys
+        plan["order_by"] = keys[0]
+
+    absorb_order()
 
     # TRAVERSE relation
     if peek() == ("kw", "traverse"):
@@ -373,36 +427,84 @@ def parse_nql(text: str) -> dict:
             i += 1
             plan["trace_reverse"] = True
 
-    # LIMIT n
-    if peek() == ("kw", "limit"):
+    # LIMIT n [OFFSET m]  /  OFFSET m [LIMIT n] — either order.
+    #
+    # Absorbed in TWO positions: before GROUP BY (where this parser has always
+    # accepted LIMIT) and again after GROUP BY/HAVING, which is where SQL
+    # actually puts it. The Rust engine parses clauses in a position-
+    # independent loop, so accepting only the pre-GROUP-BY position here made
+    # `GROUP BY status COUNT LIMIT 2` a syntax error in one engine and valid
+    # in the other.
+    def absorb_paging():
+        nonlocal i
+        for _ in range(2):
+            if peek() == ("kw", "limit") and plan["limit"] is None:
+                i += 1
+                t, v = peek()
+                if t != "num" or int(v) < 0:
+                    raise SyntaxError("NQL: LIMIT expects a non-negative integer")
+                i += 1
+                plan["limit"] = int(v)
+            elif peek() == ("kw", "offset") and plan["offset"] is None:
+                i += 1
+                t, v = peek()
+                if t != "num" or int(v) < 0:
+                    raise SyntaxError("NQL: OFFSET expects a non-negative integer")
+                i += 1
+                plan["offset"] = int(v)
+
+    absorb_paging()
+
+    def parse_agg():
+        """<AGG> [target_field] — COUNT takes none, the rest require one."""
+        nonlocal i
+        _t, agg = peek()
         i += 1
-        t, v = peek()
-        if t != "num":
-            raise SyntaxError("NQL: LIMIT expects an integer")
+        if agg == "count":
+            return ("count", None)
+        t2, _f = peek()
+        if t2 not in ("word", "kw"):
+            raise SyntaxError(f"NQL: {agg.upper()} expects a field name")
+        agg_field = peek_raw()
         i += 1
-        plan["limit"] = int(v)
+        return (agg, agg_field)
+
+    _AGGS = ("count", "sum", "avg", "min", "max")
 
     # GROUP BY field [COUNT | SUM field | AVG field | MIN field | MAX field]
     if peek() == ("kw", "group"):
         i += 1
         expect_kw("by")
-        t, field = peek()
+        t, _f = peek()
         if t not in ("word", "kw"):
             raise SyntaxError("NQL: expected field after GROUP BY")
+        plan["group_by"] = peek_raw()
         i += 1
-        plan["group_by"] = field
-        # optional aggregate after GROUP BY
         t, agg = peek()
-        if t == "kw" and agg in ("count", "sum", "avg", "min", "max"):
-            i += 1
-            if agg == "count":
-                plan["aggregate"] = ("count", None)
-            else:
-                t2, agg_field = peek()
-                if t2 not in ("word", "kw"):
-                    raise SyntaxError(f"NQL: {agg.upper()} expects a field name")
-                i += 1
-                plan["aggregate"] = (agg, agg_field)
+        if t == "kw" and agg in _AGGS:
+            plan["aggregate"] = parse_agg()
+
+    # A bare aggregate with no GROUP BY: `FROM t COUNT`, `FROM t SUM fee`.
+    # Returns exactly one row. Previously inexpressible — the aggregate
+    # keywords only existed after GROUP BY, so "how many rows match?" meant
+    # fetching every row and counting client-side.
+    elif peek()[0] == "kw" and peek()[1] in _AGGS:
+        plan["aggregate"] = parse_agg()
+
+    # HAVING <predicate> — filters the AGGREGATED rows, so it can test
+    # `count`, `sum_fee`, or the group key itself. Distinct from WHERE, which
+    # filters input rows before they are grouped.
+    if peek() == ("kw", "having"):
+        i += 1
+        if plan["aggregate"] is None and plan["group_by"] is None:
+            raise SyntaxError(
+                "NQL: HAVING requires an aggregate — add GROUP BY <field>, "
+                "or use WHERE to filter individual rows")
+        plan["having"] = p_or()
+
+    # ORDER BY and LIMIT/OFFSET in their SQL positions, after grouping.
+    absorb_order()
+    absorb_paging()
 
     if i != len(toks):
         raise SyntaxError(f"NQL: unexpected trailing tokens: {toks[i:]}")

@@ -503,12 +503,27 @@ FROM <collection>
   [ VALID AS OF "<date>" ]                   valid time (when was it true in the world?)
   [ WHERE <predicate> ]                      full boolean predicate, see below
   [ SEARCH "<text>" ]                        full-text search
-  [ ORDER BY <field> [ASC|DESC] ]
   [ TRAVERSE <relation> ]                    graph traversal
   [ TRACE caused_by [REVERSE] ]              causal provenance (why? / what did this cause?)
-  [ LIMIT <n> ]
   [ GROUP BY <field> [COUNT|SUM f|AVG f|MIN f|MAX f] ]
+  [ COUNT | SUM f | AVG f | MIN f | MAX f ]  whole-result aggregate, one row
+  [ HAVING <predicate> ]                     filters the AGGREGATED rows
+  [ ORDER BY <field> [ASC|DESC] (, ...) ]
+  [ LIMIT <n> ] [ OFFSET <n> ]
 ```
+
+Clauses are evaluated in SQL's order, whatever order you write them in:
+
+```
+FROM → WHERE → GROUP BY → HAVING → ORDER BY → OFFSET → LIMIT
+```
+
+That matters, and before 3.3.0 it was wrong. `LIMIT` truncated the *input* to
+an aggregate rather than the result, so `LIMIT 5 GROUP BY status COUNT` over
+twelve rows reported counts summing to 5 — it said only five rows existed when
+twelve did. `ORDER BY` ran before grouping, so sorting on `count` or `sum_fee`
+silently did nothing. `VALID AS OF` was applied after `LIMIT` in the Python
+engine, so a limited bi-temporal query returned fewer valid rows than exist.
 
 ### Predicates
 
@@ -574,6 +589,55 @@ db.query('FROM items GROUP BY cat MAX price')
 is numeric, so a group of 5 where 2 carry a numeric `price` reports `count: 5`
 and averages over 2. An aggregate with no numeric input is `null`, never `0`.
 The `value` key is a back-compatible alias for the aggregate result.
+
+Integer inputs give integer results — `SUM`/`MIN`/`MAX` stay in 64-bit
+integers rather than passing through a float, so a sum over satoshi amounts or
+block heights above 2^53 is exact. `AVG` is always fractional.
+
+Groups come back sorted by key unless you say otherwise, so results are stable
+run to run and identical across engines.
+
+Drop the `GROUP BY` for a whole-result aggregate, which returns exactly one row:
+
+```python
+db.query('FROM orders COUNT')                    # → [{"count": 1049, "value": 1049}]
+db.query('FROM orders WHERE status = "paid" COUNT')
+db.query('FROM orders SUM total')                # → [{"count": 1049, "sum_total": 88123, …}]
+```
+
+`COUNT` of an empty result is one row holding `0` — a caller asking "how many?"
+always gets a number. `SUM` of an empty result is `null`.
+
+### HAVING
+
+`WHERE` filters rows before they are grouped; `HAVING` filters the groups.
+
+```python
+db.query('FROM orders GROUP BY region SUM total HAVING sum_total > 10000')
+db.query('FROM orders GROUP BY region COUNT HAVING count BETWEEN 5 AND 50')
+```
+
+`HAVING` runs through the same evaluator as `WHERE`, so it gets the whole
+predicate surface — `IN`, `BETWEEN`, `LIKE`, `OR`, `NOT`, parentheses — rather
+than a poorer second copy.
+
+### Sorting and paging
+
+```python
+db.query('FROM orders ORDER BY region, total DESC')   # ties broken by the next key
+db.query('FROM orders ORDER BY total DESC LIMIT 20 OFFSET 40')
+```
+
+`OFFSET` skips rows of the result and pairs with `LIMIT` for pagination. An
+offset past the end is an empty page, not an error.
+
+A field whose name collides with a reserved word is still addressable — a
+document may legitimately have a `count`, `min`, `value` or `status` field, and
+`WHERE count > 3` reads that field rather than the aggregate:
+
+```python
+db.query('FROM metrics WHERE count > 3 ORDER BY count DESC')
+```
 
 Combine both time axes:
 ```python
