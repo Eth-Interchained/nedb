@@ -33,6 +33,7 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #110–#114 | BUSL relicense, fork relicense, SPDX headers, `~` regex, `pg_catalog` as real tables | the licence actually holds; `\dn` became reachable |
 | #115 | **a real SQL evaluator** (`sqlselect.rs`) | `psql \dt` works — 11/14 backslash commands |
 | #116 | **hash join + the frozen semantic corpus** | the evaluator became a subsystem with a contract |
+| #117 | **execution plan + `EXPLAIN` + the row budget** | the engine can say why it ran a query that way; `LIMIT` stopped materialising whole joins |
 
 ### The two engines, and which one to trust
 
@@ -96,6 +97,7 @@ go missing in CI.
 | `cargo test --tests` | 15 | integration, incl. v3 segments + compaction |
 | **semantic corpus** | 44 | frozen SQL meaning, run under **every** join strategy |
 | **join differential** | 11 | hash vs nested loop, incl. 640 generated cases |
+| `EXPLAIN` over libpq | 15 | inside the `pg_catalog` suite, real psycopg2 |
 | psql introspection | 44 | drives the **real `psql` binary** |
 | `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
@@ -197,20 +199,35 @@ relation, so bucketing alone cannot be correct here. `hkey()` needs exactly one
 property — *if `a = b` is TRUE then `hkey(a) == hkey(b)`* — and everything else
 is performance.
 
-**The next two items, in this order.** Correct result first, faster execution
-second; never invert that.
+**Done in #117:**
+
+* **An execution plan** (`src/sqlplan.rs`) and `EXPLAIN` / `EXPLAIN ANALYZE`
+  over the wire. The plan is **emitted by the executor** as it works, never
+  assembled alongside it — a plan built independently can drift, and an
+  `EXPLAIN` that confidently describes a pipeline the engine did not run is
+  worse than none, because it sends the reader to optimise a shape that never
+  existed. For the same reason `EXPLAIN` of a statement the **NQL path** runs
+  says so plainly instead of inventing a plan for it.
+* `EXPLAIN` always reports **actual** rows. There are no statistics to estimate
+  from, and a guess printed as a number is worse than the truth. The output
+  says so, so nobody mistakes it for PostgreSQL's estimate.
+* **The row budget** — when the final answer is a prefix of a join's output,
+  the join stops once it has enough rows. Every disqualifying condition is
+  load-bearing and independently proven by mutation: `ORDER BY`, `DISTINCT`, a
+  `WHERE` clause, or more than one join. `OFFSET` is *added* to the budget
+  rather than disqualifying it.
+
+**The next item.** Correct result first, faster execution second; never invert
+that.
 
 * **Predicate pushdown, conservatively.** A predicate may move below a join
   only when that provably preserves meaning. `LEFT JOIN ... WHERE right.x = 5`
   is **not** equivalent to filtering the right relation first — in `WHERE` it
   discards the outer rows, in `ON` it keeps them. Both spellings are already
   pinned in the corpus. If equivalence cannot be proven, do not transform.
-* **A logical plan + `EXPLAIN`.** `Scan / Filter / Project / Join / Aggregate
-  / Sort / Limit` is enough. The point is not to build a PostgreSQL planner —
-  it is to stop parsing, semantics, optimisation and execution collapsing into
-  one growing function. `execute_explain` already returns a per-join report
-  (strategy, key count, row counts) which is the seed of it. No cost model yet;
-  deterministic rules are fine.
+* The natural next win after that is **fusing `Filter` into the join**, which
+  would let the row budget apply to filtered joins too — currently a `WHERE`
+  disqualifies it entirely, because filtering happens after the join.
 
 Then **subqueries**, one semantic class at a time, each with its own
 regression corpus: scalar uncorrelated, `IN (SELECT ...)`, `EXISTS`,
@@ -363,6 +380,16 @@ Learned the hard way. Breaking these has cost real time.
   durability regression. It is not. `git checkout -- index.js index.d.ts`.
 * A `git checkout -- a b c` with one **untracked** path in the list fails
   wholesale and restores *nothing*, silently. Restore tracked paths only.
+* **Never patch Rust string literals from inside a Python heredoc.** A trailing
+  `\` inside a Python triple-quoted string is a PYTHON line continuation, so
+  Rust's own `\`-newline continuations get flattened *with their source
+  indentation baked in* — three user-visible strings shipped reading
+  "executed by                      the storage engine". Use the editor for
+  string literals, or grep for runs of 6+ spaces inside quotes afterwards.
+* **A join has two inputs, so a plan renderer is not a list.** The first
+  `EXPLAIN` indented a join's two scans differently, which reads as "the left
+  relation was scanned inside the scan of the right one" — a false claim about
+  execution, caught only by looking at real `psql` output.
 
 **Tooling in this repo**
 

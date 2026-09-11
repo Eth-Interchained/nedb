@@ -258,6 +258,65 @@ def run_suite(cur):
                   "catalogue" in str(e), str(e)[:90])
 
 
+def run_explain_suite(cur):
+    def q(sql):
+        cur.execute(sql)
+        return [r[0] for r in cur.fetchall()]
+
+    section("EXPLAIN reports what actually ran")
+
+    plan = q("EXPLAIN SELECT n.nspname FROM pg_namespace n")
+    check("EXPLAIN returns a QUERY PLAN column with plan lines",
+          len(plan) >= 2 and any("Seq Scan on pg_namespace" in l for l in plan),
+          f"{plan}")
+    # No statistics exist, so an estimate would be a guess dressed as a number.
+    check("the plan states it reports ACTUAL rows, not estimates",
+          any("ACTUAL rows" in l for l in plan), f"{plan}")
+    check("the column is named QUERY PLAN exactly, as PostgreSQL names it",
+          [d.name for d in cur.description] == ["QUERY PLAN"],
+          f"{[d.name for d in cur.description]}")
+
+    # The single most useful line when a join is unexpectedly slow.
+    joined = q(
+        "EXPLAIN SELECT c.relname, n.nspname FROM pg_class c "
+        "LEFT JOIN pg_namespace n ON n.oid = c.relnamespace")
+    check("a join names its strategy",
+          any("Nested Loop" in l or "Hash Join" in l for l in joined), f"{joined}")
+    check("a join reports its proven key count",
+          any("hash key" in l or "no equality key" in l for l in joined), f"{joined}")
+    check("the join names the kind of join it was",
+          any("Left" in l for l in joined), f"{joined}")
+
+    # Indentation: the outermost operation first, inputs nested under it.
+    check("inputs are indented under the operation that consumes them",
+          any(l.startswith("  -> ") for l in joined), f"{joined}")
+
+    filtered = q("EXPLAIN SELECT relname FROM pg_class WHERE relkind = 'r'")
+    check("a WHERE clause appears as a Filter reporting what it removed",
+          any("Filter" in l and "removed" in l for l in filtered), f"{filtered}")
+
+    limited = q("EXPLAIN SELECT relname FROM pg_class LIMIT 1")
+    check("LIMIT appears in the plan", any("Limit" in l for l in limited), f"{limited}")
+
+    check("EXPLAIN ANALYZE is accepted (it already reports actual rows)",
+          any("Seq Scan" in l
+              for l in q("EXPLAIN ANALYZE SELECT nspname FROM pg_namespace")))
+
+    # A statement the SQL evaluator does NOT run must not be given a plan that
+    # describes a pipeline it never took.
+    user = q("EXPLAIN SELECT * FROM orders")
+    check("a statement the NQL path runs says so instead of inventing a plan",
+          any("NQL path" in l for l in user) and not any("Seq Scan" in l for l in user),
+          f"{user}")
+    check("and it says WHY no plan is reported",
+          any("never executed" in l for l in user), f"{user}")
+
+    # The plan must describe the query asked about, not a cached one.
+    a = q("EXPLAIN SELECT nspname FROM pg_namespace")
+    bq = q("EXPLAIN SELECT relname FROM pg_class")
+    check("two different queries get two different plans", a != bq)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="nedb-pgcat-")
     http_port, pg_port = free_port(), free_port()
@@ -296,6 +355,7 @@ def main():
         conn.autocommit = True
         cur = conn.cursor()
         run_suite(cur)
+        run_explain_suite(cur)
         cur.close()
         conn.close()
     finally:

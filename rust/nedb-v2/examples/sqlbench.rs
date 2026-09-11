@@ -34,6 +34,7 @@
 //! than reporting the faster of two different questions.
 
 use nedb_engine::sqljoin::{JoinExec, Strategy};
+use nedb_engine::sqlplan::Plan;
 use nedb_engine::sqlselect::{execute_explain, parse};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -109,7 +110,7 @@ fn time_it(sql: &str, orders: &[Value], customers: &[Value], exec: JoinExec, rep
 
     // One untimed pass, so allocator warm-up is not charged to the first
     // strategy measured.
-    let (_, warm, _) = execute_explain(&sel, &resolve, exec).unwrap();
+    let (_, warm, _): (_, _, Plan) = execute_explain(&sel, &resolve, exec).unwrap();
 
     let mut samples = vec![];
     let mut strategy = None;
@@ -117,7 +118,7 @@ fn time_it(sql: &str, orders: &[Value], customers: &[Value], exec: JoinExec, rep
         let t = Instant::now();
         let (_, rows, choices) = execute_explain(&sel, &resolve, exec).unwrap();
         samples.push(t.elapsed());
-        strategy = choices.first().map(|c| c.strategy);
+        strategy = choices.join_strategy(0);
         std::hint::black_box(rows);
     }
     Outcome { elapsed: median(samples), rows: warm.len(), strategy }
