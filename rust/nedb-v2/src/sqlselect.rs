@@ -38,7 +38,8 @@
 //! indistinguishable from a correct one until somebody's data appears to be
 //! missing.
 
-use crate::sqljoin::{self, JoinChoice, JoinExec, Strategy};
+use crate::sqljoin::{self, JoinExec, Strategy};
+use crate::sqlplan::{Plan, Stage};
 
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
@@ -1664,7 +1665,44 @@ pub fn execute_explain(
     sel: &Select,
     resolve: &Resolver,
     exec: JoinExec,
-) -> Result<(Vec<String>, Vec<Value>, Vec<JoinChoice>)> {
+) -> Result<(Vec<String>, Vec<Value>, Plan)> {
+    let mut plan = Plan::default();
+
+    // ── 0. the row budget ───────────────────────────────────────────────────
+    //
+    // The only safe rewrite available without a streaming executor: when the
+    // final answer is a PREFIX of the join's output, the join may stop as soon
+    // as it has produced enough rows.
+    //
+    // Every one of these conditions is load-bearing, and each corresponds to
+    // an operation that can REDUCE the row count after the join — capping the
+    // join's output early would then starve it:
+    //
+    //   * `ORDER BY` — the prefix depends on the sort, not on emission order.
+    //   * `DISTINCT` — deduplication can shrink 100 rows to 3.
+    //   * a `WHERE` clause — filtering happens after the join here.
+    //   * more than one join — an intermediate cap can starve a later join.
+    //
+    // `OFFSET` is added to the budget rather than disqualifying it, because
+    // the rows skipped still have to be produced.
+    //
+    // This is narrow on purpose. `SELECT ... JOIN ... LIMIT n` is the shape an
+    // interactive client sends constantly, and it was measured taking 32ms to
+    // return 20 rows out of an 8000-row join. A wider rewrite needs a
+    // streaming executor, not a cleverer predicate.
+    let budget: Option<usize> = match sel.limit {
+        Some(lim)
+            if sel.order_by.is_empty()
+                && !sel.distinct
+                && sel.where_.is_none()
+                && sel.joins.len() == 1 =>
+        {
+            Some(lim.saturating_add(sel.offset.unwrap_or(0)))
+        }
+        _ => None,
+    };
+    plan.budget = budget;
+
     // ── 1. source rows, and the join ────────────────────────────────────────
     let mut rows: Vec<JoinedRow> = match &sel.from {
         None => {
@@ -1674,6 +1712,11 @@ pub fn execute_explain(
         }
         Some(t) => {
             let src = fetch(&t.name, resolve)?;
+            plan.push(Stage::Scan {
+                table: t.name.clone(),
+                binding: t.binding(),
+                rows: src.len(),
+            });
             src.into_iter()
                 .map(|r| vec![(t.binding(), Some(r))])
                 .collect()
@@ -1689,11 +1732,14 @@ pub fn execute_explain(
         None => vec![],
         Some(t) => vec![t.binding()],
     };
-    let mut choices: Vec<JoinChoice> = vec![];
-
     for join in &sel.joins {
         let right_rows = fetch(&join.table.name, resolve)?;
         let rb = join.table.binding();
+        plan.push(Stage::Scan {
+            table: join.table.name.clone(),
+            binding: rb.clone(),
+            rows: right_rows.len(),
+        });
 
         // The planner proposes; sizes decide. A join with no provable equality
         // key has nothing to hash on and stays on the reference path.
@@ -1702,21 +1748,23 @@ pub fn execute_explain(
 
         let out = match strategy {
             Strategy::NestedLoop => {
-                join_nested_loop(&rows, &left_bindings, join, &right_rows, &rb)?
+                join_nested_loop(&rows, &left_bindings, join, &right_rows, &rb, budget)?
             }
             Strategy::Hash => {
-                join_hash(&rows, &left_bindings, join, &right_rows, &rb, &keys)?
+                join_hash(&rows, &left_bindings, join, &right_rows, &rb, &keys, budget)?
             }
         };
 
-        choices.push(JoinChoice {
+        plan.push(Stage::Join {
             kind: join.kind,
             table: join.table.name.clone(),
+            binding: rb.clone(),
             strategy,
             keys: keys.len(),
             left_rows: rows.len(),
             right_rows: right_rows.len(),
             out_rows: out.len(),
+            early_stopped: budget.is_some_and(|b| out.len() >= b),
         });
         left_bindings.push(rb);
         rows = out;
@@ -1724,6 +1772,7 @@ pub fn execute_explain(
 
     // ── 2. WHERE ────────────────────────────────────────────────────────────
     if let Some(pred) = &sel.where_ {
+        let in_rows = rows.len();
         let mut kept = Vec::with_capacity(rows.len());
         for r in rows {
             // Only TRUE keeps a row. UNKNOWN excludes it, which is what makes
@@ -1734,6 +1783,7 @@ pub fn execute_explain(
             }
         }
         rows = kept;
+        plan.push(Stage::Filter { in_rows, out_rows: rows.len() });
     }
 
     // ── 3. the output shape ─────────────────────────────────────────────────
@@ -1808,8 +1858,11 @@ pub fn execute_explain(
         projected.push((obj, r));
     }
 
+    plan.push(Stage::Project { columns: names.len(), out_rows: projected.len() });
+
     // ── 5. DISTINCT ─────────────────────────────────────────────────────────
     if sel.distinct {
+        let in_rows = projected.len();
         let mut seen: Vec<String> = vec![];
         let mut kept = vec![];
         for (obj, src) in projected {
@@ -1826,6 +1879,7 @@ pub fn execute_explain(
             }
         }
         projected = kept;
+        plan.push(Stage::Distinct { in_rows, out_rows: projected.len() });
     }
 
     // ── 6. ORDER BY ─────────────────────────────────────────────────────────
@@ -1892,6 +1946,7 @@ pub fn execute_explain(
         });
 
         projected = keyed.into_iter().map(|(_, row)| row).collect();
+        plan.push(Stage::Sort { keys: sel.order_by.len(), rows: projected.len() });
     }
 
     // ── 7. OFFSET / LIMIT ───────────────────────────────────────────────────
@@ -1899,14 +1954,23 @@ pub fn execute_explain(
         .into_iter()
         .map(|(obj, _)| Value::Object(obj))
         .collect();
+    let in_rows = out.len();
     if let Some(off) = sel.offset {
         out = if off >= out.len() { vec![] } else { out.split_off(off) };
     }
     if let Some(lim) = sel.limit {
         out.truncate(lim);
     }
+    if sel.limit.is_some() || sel.offset.is_some() {
+        plan.push(Stage::Limit {
+            limit: sel.limit,
+            offset: sel.offset,
+            in_rows,
+            out_rows: out.len(),
+        });
+    }
 
-    Ok((names, out, choices))
+    Ok((names, out, plan))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1950,12 +2014,16 @@ fn join_nested_loop(
     join: &Join,
     right_rows: &[Value],
     rb: &str,
+    budget: Option<usize>,
 ) -> Result<Vec<JoinedRow>> {
     let mut out: Vec<JoinedRow> = vec![];
     // Which right rows found a partner — only needed for RIGHT and FULL.
     let mut right_matched = vec![false; right_rows.len()];
 
     for left in rows {
+        if budget.is_some_and(|b| out.len() >= b) {
+            break;
+        }
         let mut matched = false;
         for (ri, right) in right_rows.iter().enumerate() {
             let mut cand: JoinedRow = left.clone();
@@ -1982,7 +2050,13 @@ fn join_nested_loop(
         }
     }
 
-    emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+    // Right-outer rows are appended AFTER every left row, so once the budget
+    // is met they sit beyond the prefix `LIMIT` will keep and cannot affect the
+    // answer. Skipping them is the point of the budget; emitting them would be
+    // correct but pointless work.
+    if !budget.is_some_and(|b| out.len() >= b) {
+        emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+    }
     Ok(out)
 }
 
@@ -2000,6 +2074,7 @@ fn join_hash(
     right_rows: &[Value],
     rb: &str,
     keys: &[(Expr, Expr)],
+    budget: Option<usize>,
 ) -> Result<Vec<JoinedRow>> {
     debug_assert!(!keys.is_empty(), "the planner must not choose Hash with no keys");
 
@@ -2025,6 +2100,9 @@ fn join_hash(
     let mut right_matched = vec![false; right_rows.len()];
 
     for left in rows {
+        if budget.is_some_and(|b| out.len() >= b) {
+            break;
+        }
         let lb = bind(left);
         let mut lk = Vec::with_capacity(keys.len());
         let mut null_key = false;
@@ -2065,7 +2143,11 @@ fn join_hash(
         }
     }
 
-    emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+    // See the note in `join_nested_loop`: beyond the budget these rows cannot
+    // survive the `LIMIT` prefix.
+    if !budget.is_some_and(|b| out.len() >= b) {
+        emit_unmatched_right(&mut out, join.kind, left_bindings, right_rows, &right_matched, rb);
+    }
     Ok(out)
 }
 

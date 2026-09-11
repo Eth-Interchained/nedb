@@ -2409,7 +2409,7 @@ fn no_db(db_name: &str) -> Vec<u8> {
 fn try_catalog_select(
     sql: &str,
     db: Option<&Arc<Db>>,
-) -> Result<Option<Executed>, Vec<u8>> {
+) -> Result<Option<(Executed, crate::sqlplan::Plan)>, Vec<u8>> {
     let sel = match crate::sqlselect::parse(sql) {
         Ok(sel) => sel,
         Err(why) => {
@@ -2477,16 +2477,71 @@ fn try_catalog_select(
         }
     };
 
-    let (names, rows) = crate::sqlselect::execute(&sel, &resolve)
-        .map_err(|e| err_msg("42601", &e.to_string()))?;
+    let (names, rows, plan) = crate::sqlselect::execute_explain(
+        &sel,
+        &resolve,
+        crate::sqljoin::JoinExec::Auto,
+    )
+    .map_err(|e| err_msg("42601", &e.to_string()))?;
 
-    Ok(Some(Executed {
-        rows,
-        project: names.iter().map(|n| Col::same(n)).collect(),
+    Ok(Some((
+        Executed {
+            rows,
+            project: names.iter().map(|n| Col::same(n)).collect(),
+            has_rows: true,
+            tag: "SELECT".into(),
+            tag_counts_rows: true,
+        },
+        plan,
+    )))
+}
+
+/// Strip a leading `EXPLAIN`, returning the statement it wraps.
+///
+/// `ANALYZE` and `VERBOSE` are accepted and ignored: this endpoint always
+/// executes and always reports actual rows, so `EXPLAIN` and
+/// `EXPLAIN ANALYZE` genuinely do the same thing here. Accepting the keyword
+/// and silently doing the honest thing beats refusing a client's spelling.
+fn strip_explain(sql: &str) -> Option<&str> {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let mut rest = t.strip_prefix("EXPLAIN").or_else(|| t.strip_prefix("explain"))?;
+    // Require a word boundary so `EXPLAINED` is not mistaken for a keyword.
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    rest = rest.trim_start();
+    loop {
+        let low = rest.to_lowercase();
+        if let Some(r) = low.strip_prefix("analyze").or_else(|| low.strip_prefix("analyse")) {
+            if r.starts_with(char::is_whitespace) || r.is_empty() {
+                rest = rest[rest.len() - r.len()..].trim_start();
+                continue;
+            }
+        }
+        if let Some(r) = low.strip_prefix("verbose") {
+            if r.starts_with(char::is_whitespace) || r.is_empty() {
+                rest = rest[rest.len() - r.len()..].trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    Some(rest)
+}
+
+/// One text column named `QUERY PLAN`, which is exactly the shape PostgreSQL
+/// returns — so `psql` prints it without special handling.
+fn plan_result(lines: Vec<String>) -> Executed {
+    Executed {
+        rows: lines
+            .into_iter()
+            .map(|l| serde_json::json!({ "QUERY PLAN": l }))
+            .collect(),
+        project: vec![Col::same("QUERY PLAN")],
         has_rows: true,
-        tag: "SELECT".into(),
-        tag_counts_rows: true,
-    }))
+        tag: "EXPLAIN".into(),
+        tag_counts_rows: false,
+    }
 }
 
 /// Does the raw SQL plainly read a catalogue relation?
@@ -2609,7 +2664,40 @@ fn execute_stmt(
     // touch the catalogue — see `try_catalog_select`. It has to run before
     // `translate`, because `translate` targets NQL and NQL cannot express a
     // join, a CASE or a scalar function at all.
-    if let Some(done) = try_catalog_select(stmt_sql, db)? {
+    // EXPLAIN reports which engine would run the statement, and a plan only
+    // when the SQL evaluator is the engine that actually runs it. Describing a
+    // pipeline the statement would not take is the one thing an EXPLAIN must
+    // never do.
+    if let Some(inner) = strip_explain(stmt_sql) {
+        if let Some((_, plan)) = try_catalog_select(inner, db)? {
+            return Ok(plan_result(plan.render()));
+        }
+        let mut lines = vec![];
+        match translate(inner) {
+            Ok(_) => {
+                lines.push(
+                    "NQL path — this statement is translated to NQL and \
+                     executed by the storage engine, not by the SQL evaluator."
+                        .to_string(),
+                );
+                lines.push(
+                    "No plan is reported, because the SQL evaluator is not \
+                     what runs it. Reporting one would describe a pipeline \
+                     that never executed."
+                        .to_string(),
+                );
+                lines.push(
+                    "The SQL evaluator (joins, CASE, scalar functions, a \
+                     hash-join planner) currently serves catalogue queries."
+                        .to_string(),
+                );
+            }
+            Err(why) => lines.push(format!("cannot be executed: {why}")),
+        }
+        return Ok(plan_result(lines));
+    }
+
+    if let Some((done, _plan)) = try_catalog_select(stmt_sql, db)? {
         return Ok(done);
     }
 
@@ -2868,6 +2956,56 @@ pub async fn run(host: &str, port: u16, resolver: Arc<dyn DbResolver>) -> anyhow
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_explain_is_stripped() {
+        assert_eq!(strip_explain("EXPLAIN SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("explain select 1"), Some("select 1"));
+        assert_eq!(strip_explain("  EXPLAIN   SELECT 1 ;  "), Some("SELECT 1"));
+    }
+
+    #[test]
+    fn analyze_and_verbose_are_accepted_and_ignored() {
+        // This endpoint always executes and always reports actual rows, so
+        // EXPLAIN and EXPLAIN ANALYZE genuinely do the same thing. Accepting
+        // the client's spelling beats refusing it.
+        assert_eq!(strip_explain("EXPLAIN ANALYZE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("EXPLAIN ANALYSE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("EXPLAIN VERBOSE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("EXPLAIN ANALYZE VERBOSE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("explain analyze verbose select 1"), Some("select 1"));
+    }
+
+    #[test]
+    fn a_word_merely_starting_with_explain_is_not_a_keyword() {
+        assert_eq!(strip_explain("EXPLAINED SELECT 1"), None);
+        assert_eq!(strip_explain("SELECT 1"), None);
+        assert_eq!(strip_explain("SELECT explain FROM t"), None);
+    }
+
+    #[test]
+    fn a_column_named_analyze_is_not_eaten() {
+        // `analyzed` merely starts with the keyword; the word boundary check
+        // is what stops it being consumed as an option.
+        assert_eq!(strip_explain("EXPLAIN analyzed_view"), Some("analyzed_view"));
+    }
+
+    #[test]
+    fn the_plan_result_has_postgres_shape() {
+        let e = plan_result(vec!["Seq Scan on t".into(), "note".into()]);
+        assert_eq!(e.project.len(), 1);
+        assert_eq!(e.project[0].out, "QUERY PLAN");
+        assert_eq!(e.rows.len(), 2);
+        assert_eq!(e.rows[0]["QUERY PLAN"], "Seq Scan on t");
+        assert_eq!(e.tag, "EXPLAIN");
+        // EXPLAIN's tag carries no row count in PostgreSQL.
+        assert!(!e.tag_counts_rows);
+    }
+}
 
 #[cfg(test)]
 mod tests {

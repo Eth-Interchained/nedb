@@ -103,19 +103,21 @@ fn differ(sql: &str, fx: &Fixture) -> bool {
         .unwrap_or_else(|e| panic!("{sql}\n  hash join failed: {e:#}"));
 
     assert!(
-        nl_choices.iter().all(|c| c.strategy == Strategy::NestedLoop),
+        nl_choices.join_strategies().iter().all(|s| *s == Strategy::NestedLoop),
         "{sql}\n  forcing NestedLoop did not take effect"
     );
 
     assert_eq!(nl_names, h_names, "{sql}\n  column names differ");
     assert_eq!(
         nl_rows, h_rows,
-        "{sql}\n  RESULTS DIFFER\n  left  = {}\n  right = {}\n  nested loop {nl_choices:?}\n  hash {h_choices:?}",
+        "{sql}\n  RESULTS DIFFER\n  left  = {}\n  right = {}\n  nested loop {:?}\n  hash {:?}",
         json!(nl_rows),
-        json!(h_rows)
+        json!(h_rows),
+        nl_choices.render(),
+        h_choices.render()
     );
 
-    h_choices.iter().any(|c| c.strategy == Strategy::Hash)
+    h_choices.join_strategies().contains(&Strategy::Hash)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,8 +288,8 @@ fn a_three_relation_chain_agrees() {
     let (n2, r2, c2) = execute_explain(&sel, &resolve, JoinExec::Hash).unwrap();
     assert_eq!(n1, n2);
     assert_eq!(r1, r2, "chained joins disagree\n{c1:?}\n{c2:?}");
-    assert_eq!(c2.len(), 2, "both joins accounted for");
-    assert!(c2.iter().all(|c| c.strategy == Strategy::Hash));
+    assert_eq!(c2.joins().len(), 2, "both joins accounted for");
+    assert!(c2.join_strategies().iter().all(|s| *s == Strategy::Hash));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -386,10 +388,10 @@ fn auto_picks_the_hash_path_only_once_the_work_justifies_it() {
     let sel = parse("SELECT l.v, r.w FROM l JOIN r ON l.k1 = r.k1").unwrap();
 
     let (_, _, c) = execute_explain(&sel, &small.resolve(), JoinExec::Auto).unwrap();
-    assert_eq!(c[0].strategy, Strategy::NestedLoop, "16 pairs is not worth a table");
+    assert_eq!(c.join_strategy(0), Some(Strategy::NestedLoop), "16 pairs is not worth a table");
 
     let (_, _, c) = execute_explain(&sel, &big.resolve(), JoinExec::Auto).unwrap();
-    assert_eq!(c[0].strategy, Strategy::Hash, "1600 pairs is");
+    assert_eq!(c.join_strategy(0), Some(Strategy::Hash), "1600 pairs is");
 }
 
 #[test]
@@ -398,7 +400,7 @@ fn a_join_with_no_equality_key_reports_the_nested_loop_under_every_setting() {
     let sel = parse("SELECT l.v, r.w FROM l JOIN r ON l.v > r.w").unwrap();
     for exec in [JoinExec::Auto, JoinExec::NestedLoop, JoinExec::Hash] {
         let (_, _, c) = execute_explain(&sel, &fx.resolve(), exec).unwrap();
-        assert_eq!(c[0].strategy, Strategy::NestedLoop, "{exec:?}");
-        assert_eq!(c[0].keys, 0);
+        assert_eq!(c.join_strategy(0), Some(Strategy::NestedLoop), "{exec:?}");
+        assert_eq!(c.join_keys(0), Some(0));
     }
 }

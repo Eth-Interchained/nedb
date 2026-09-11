@@ -5,8 +5,8 @@ SPDX-FileCopyrightText: © 2026 INTERCHAINED LLC × Claude Sonnet 4.6
 
 # SQL evaluator baselines — nested loop vs hash join
 
-Recorded at engine **4.0.0**, PR #116, on the CI-class sandbox this repo is
-developed in (Linux x86-64). Reproduce with:
+Recorded at engine **4.0.0**, PRs #116 and #117, on the CI-class sandbox this
+repo is developed in (Linux x86-64). Reproduce with:
 
 ```bash
 cargo run --release --example sqlbench
@@ -54,7 +54,7 @@ nested loop is quadratic and the largest shape has to finish. Read the
 | join + selective pred | 370.32 | 3.85 | **96.3x** | 14 |
 | join + broad pred | 369.51 | 6.98 | **52.9x** | 1750 |
 | join + sort | 403.51 | 6.35 | **63.6x** | 1922 |
-| join + limit | 368.21 | 4.21 | **87.4x** | 20 |
+| join + limit | 5.13 | 0.97 | **5.3x** | 20 |
 | non-equality join | 344.69 | 346.33 | — *(same path)* | 2500 |
 
 ### orders=3000, customers=1000, 500 distinct keys (median of 3)
@@ -68,7 +68,7 @@ nested loop is quadratic and the largest shape has to finish. Read the
 | join + selective pred | 2229.06 | 12.77 | **174.5x** | 56 |
 | join + broad pred | 2212.43 | 19.44 | **113.8x** | 5144 |
 | join + sort | 2202.42 | 20.90 | **105.4x** | 5708 |
-| join + limit | 2191.93 | 14.82 | **147.9x** | 20 |
+| join + limit | 10.37 | 2.57 | **4.0x** | 20 |
 | non-equality join | 2079.45 | 2125.99 | — *(same path)* | 14000 |
 
 ### orders=8000, customers=1500, 1500 distinct keys (single run)
@@ -82,7 +82,7 @@ nested loop is quadratic and the largest shape has to finish. Read the
 | join + selective pred | 8774.78 | 27.07 | **324.1x** | 64 |
 | join + broad pred | 8929.38 | 37.50 | **238.1x** | 6816 |
 | join + sort | 8804.33 | 36.91 | **238.5x** | 7578 |
-| join + limit | 8848.69 | 32.12 | **275.5x** | 20 |
+| join + limit | 29.59 | 6.72 | **4.4x** | 20 |
 | non-equality join | 8367.82 | 8569.10 | — *(same path)* | 40500 |
 
 ## What the numbers say
@@ -103,11 +103,31 @@ stopped being the only option.
 confirm this change is confined to join execution and did not perturb the
 surrounding pipeline.
 
-**`join + limit` is the most interesting remaining gap.** 275x faster and still
-32ms to return 20 rows, because `LIMIT` is applied *after* the whole join is
-materialised. Neither strategy stops early. That is the clearest argument for
-the plan representation: limit pushdown is invisible without one, and it is
-worth more to an interactive client than anything else on this list.
+**`join + limit` was the most interesting remaining gap, and #117 closed it.**
+`LIMIT` used to be applied *after* the whole join had been materialised, so
+neither strategy stopped early. With the row budget, the join stops as soon as
+it has enough rows:
+
+| shape | nested before | nested after | hash before | hash after |
+|---|---:|---:|---:|---:|
+| 1000 x 500 | 368.21 | **5.13** | 4.21 | **0.97** |
+| 3000 x 1000 | 2191.93 | **10.37** | 14.82 | **2.57** |
+| 8000 x 1500 | 8848.69 | **29.59** | 32.12 | **6.72** |
+
+At the largest shape that is **299x** off the nested loop and **4.8x** off the
+hash join. Note what the speedup *column* now shows for that row: a mere 4.4x,
+because both strategies got faster. The column compares strategies, not
+releases — which is exactly why the before/after has to be stated separately
+rather than read off the table.
+
+The residual 6.7ms is almost entirely relation materialisation (the resolver
+hands back an owned `Vec`), not join work. Removing that needs a streaming
+resolver, not a cleverer join.
+
+**A `WHERE` clause still disqualifies the budget**, because filtering happens
+after the join here — capping the join would starve the filter. Fusing `Filter`
+into the join is the natural next step, and it is what would let
+`join + selective pred` (currently 27ms to return 64 rows) stop early too.
 
 **`join + broad pred` and `join + sort` gain least**, which makes sense —
 their cost is dominated by materialising and then sorting ~5–7k output rows,

@@ -59,6 +59,10 @@ fn relation(name: &str) -> Option<Vec<Value>> {
             json!({"pid": 1, "dept_id": 10, "pname": "apollo"}),
             json!({"pid": 2, "dept_id": 20, "pname": "gemini"}),
         ],
+        // Matches ONLY `legal`, which is the LAST row the emp-dept join emits.
+        // That is what makes it able to detect an intermediate join being
+        // capped: cap the first join at all and this relation joins nothing.
+        "proj_late" => vec![json!({"pid": 9, "dept_id": 4, "pname": "zeta"})],
         _ => return None,
     })
 }
@@ -596,6 +600,128 @@ fn a_missing_field_reads_as_null_because_documents_are_schemaless() {
     // Absent and NULL are one state in a schemaless store. This is a design
     // decision, not an omission.
     expect("SELECT p.nope AS n FROM proj p WHERE p.pid = 1", json!([{"n": null}]));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The row budget — early termination must not change any answer
+//
+// When the final answer is a PREFIX of a join's output, the join is allowed to
+// stop as soon as it has produced enough rows. The invariant that makes this
+// safe is simple and is asserted directly below:
+//
+//     `q LIMIT n`  ==  the first n rows of `q`
+//
+// Every join kind is checked, because outer joins append their unmatched rows
+// AFTER the main pass — so an early stop has to be proven not to drop rows
+// that belong inside the prefix.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `q LIMIT n` must equal the first n rows of `q`, for every join kind and
+/// every n from 0 past the end of the result.
+#[test]
+fn a_limit_is_always_a_prefix_of_the_unlimited_answer() {
+    for kind in ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", "CROSS JOIN"] {
+        let on = if kind == "CROSS JOIN" { "" } else { " ON e.dept_id = d.id" };
+        let base = format!("SELECT e.name, d.dname FROM emp e {kind} dept d{on}");
+        let (_, all) = run_all_strategies(&base);
+
+        for n in 0..=all.len() + 2 {
+            let (_, got) = run_all_strategies(&format!("{base} LIMIT {n}"));
+            let want: Vec<Value> = all.iter().take(n).cloned().collect();
+            assert_eq!(
+                got, want,
+                "{base} LIMIT {n}\n  early termination changed the answer"
+            );
+        }
+    }
+}
+
+/// The same invariant with an OFFSET, which must be ADDED to the budget rather
+/// than disqualifying it — the skipped rows still have to be produced.
+#[test]
+fn limit_with_offset_is_always_the_right_window() {
+    for kind in ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"] {
+        let base = format!(
+            "SELECT e.name, d.dname FROM emp e {kind} dept d ON e.dept_id = d.id"
+        );
+        let (_, all) = run_all_strategies(&base);
+
+        for off in 0..=all.len() + 1 {
+            for lim in 0..4 {
+                let (_, got) =
+                    run_all_strategies(&format!("{base} LIMIT {lim} OFFSET {off}"));
+                let want: Vec<Value> =
+                    all.iter().skip(off).take(lim).cloned().collect();
+                assert_eq!(got, want, "{base} LIMIT {lim} OFFSET {off}");
+            }
+        }
+    }
+}
+
+/// A `WHERE` clause disqualifies the budget, because filtering happens AFTER
+/// the join here — capping the join would starve the filter.
+#[test]
+fn a_filter_after_the_join_still_sees_every_row() {
+    // Only `rob` survives, and he is the LAST matching row emitted. A join
+    // capped at one row would return nothing.
+    expect(
+        "SELECT e.name FROM emp e JOIN dept d ON e.dept_id = d.id \
+         WHERE d.dname = 'legal' LIMIT 1",
+        json!([{"name": "rob"}]),
+    );
+}
+
+/// `ORDER BY` disqualifies it, because the prefix depends on the sort rather
+/// than on emission order.
+#[test]
+fn a_sort_after_the_join_still_sees_every_row() {
+    // The highest salary belongs to `grace`, emitted second. Capping the join
+    // at one row would answer `ada`.
+    expect(
+        "SELECT e.name FROM emp e JOIN dept d ON e.dept_id = d.id \
+         ORDER BY e.salary DESC LIMIT 1",
+        json!([{"name": "grace"}]),
+    );
+}
+
+/// `DISTINCT` disqualifies it, because deduplication can shrink the row count.
+#[test]
+fn distinct_after_the_join_still_sees_every_row() {
+    // Two employees are in `eng`, so DISTINCT collapses them. A join capped at
+    // 2 rows would yield only `eng` where 2 distinct departments exist.
+    expect(
+        "SELECT DISTINCT d.dname FROM emp e JOIN dept d ON e.dept_id = d.id \
+         ORDER BY 1 LIMIT 2",
+        json!([{"dname": "eng"}, {"dname": "legal"}]),
+    );
+}
+
+/// More than one join disqualifies it, because capping an intermediate result
+/// can starve a later join of the rows it needed.
+///
+/// `proj_late` matches only `legal`, and `legal` is the LAST row the emp-dept
+/// join emits. So capping that first join at ANY size below its full output
+/// makes this query return nothing at all.
+///
+/// Written this way on purpose: an earlier version of this test used `proj`
+/// and an `ORDER BY`, and a deliberate mutation that removed the multi-join
+/// guard still passed it — the rows it needed happened to survive the cap.
+/// A test that cannot fail is not evidence.
+#[test]
+fn a_second_join_still_sees_every_row_from_the_first() {
+    expect(
+        "SELECT p.pname FROM emp e \
+         JOIN dept d ON e.dept_id = d.id \
+         JOIN proj_late p ON d.id = p.dept_id \
+         LIMIT 1",
+        json!([{"pname": "zeta"}]),
+    );
+    // And with the budget-eligible shape, for completeness: a single join to a
+    // relation whose only match is last.
+    expect(
+        "SELECT d.dname FROM dept d JOIN proj_late p ON d.id = p.dept_id LIMIT 1",
+        json!([{"dname": "legal"}]),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
