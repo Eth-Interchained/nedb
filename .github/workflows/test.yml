@@ -15,6 +15,7 @@ name: test
 #   rust         cargo test on the engine + cargo check on both binding crates
 #   node         napi addon build, then smoke + durability + wrap family
 #   python-native  maturin wheel, then the suites that need `nedb._native`
+#   clients        the PUBLISHED PyPI + npm client packages, vs a live server
 #   python-daemon  nedbd binary on PATH, then the suites that self-spawn it
 #
 # Deliberately NOT a release gate: this runs the same suites the release
@@ -204,6 +205,43 @@ jobs:
             echo "::endgroup::"
           done
           exit $fail
+
+  # -------------------------------------------------------------- clients ---
+  # The PUBLISHED client packages (`nedb-engine-client` on PyPI and npm).
+  #
+  # These ship on every `v*` tag and their only verification was "it imports"
+  # (PyPI) and "it compiles" (npm). Not one request was ever made against a
+  # server before publish — the same gap this workflow closed for the engine,
+  # still open on the clients. Writing these suites found: `get()` could not
+  # fetch any id containing a double quote (returned None for a document that
+  # exists), `delete()` could not reach an id containing a slash, and the npm
+  # client abandoned response bodies on its early-return paths.
+  #
+  # Both run against the PYTHON AOF server, so this tier needs no Rust build
+  # and stays fast.
+  clients:
+    name: clients (published packages)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install httpx
+      - name: PyPI client — nedb_client against a live nedbd
+        run: python3 tests/test_client_package.py
+      - name: npm client — build the artifact that actually ships
+        run: |
+          cd client/node
+          npm install
+          npx tsc
+      - name: npm client — dist/index.js against a live nedbd
+        # Imports dist/, not src/: the compiled output is what gets published,
+        # so testing the source would not prove the artifact works.
+        run: node client/node/test/client.test.mjs
 
   # --------------------------------------------------------- python-daemon ---
   # The suites that talk HTTP to nedbd. Each one auto-spawns the daemon when
