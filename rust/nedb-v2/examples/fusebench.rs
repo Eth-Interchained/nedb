@@ -42,8 +42,8 @@ fn main() {
         let customers: Vec<Value> = (0..nc).map(|i| json!({
             "id": (i as u64) % ks, "name": format!("cust-{i}"),
             "tier": match rng.below(3) {0=>"gold",1=>"silver",_=>"bronze"}})).collect();
-        let resolve = |t: &str| -> anyhow::Result<Option<Vec<Value>>> {
-            Ok(match t { "orders" => Some(orders.clone()), "customers" => Some(customers.clone()), _ => None })
+        let resolve = |t: &str| -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> {
+            Ok(match t { "orders" => Some(nedb_engine::sqlselect::from_vec(orders.clone())), "customers" => Some(nedb_engine::sqlselect::from_vec(customers.clone())), _ => None })
         };
 
         for exec in [Strategy::NestedLoop, Strategy::Hash] {

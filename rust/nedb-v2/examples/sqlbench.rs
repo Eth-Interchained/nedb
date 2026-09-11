@@ -100,10 +100,10 @@ struct Outcome {
 
 fn time_it(sql: &str, orders: &[Value], customers: &[Value], exec: JoinExec, reps: usize) -> Outcome {
     let sel = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:#}"));
-    let resolve = |t: &str| -> anyhow::Result<Option<Vec<Value>>> {
+    let resolve = |t: &str| -> anyhow::Result<Option<Box<dyn nedb_engine::sqlselect::Relation>>> {
         Ok(match t {
-            "orders" => Some(orders.to_vec()),
-            "customers" => Some(customers.to_vec()),
+            "orders" => Some(nedb_engine::sqlselect::from_vec(orders.to_vec())),
+            "customers" => Some(nedb_engine::sqlselect::from_vec(customers.to_vec())),
             _ => None,
         })
     };
