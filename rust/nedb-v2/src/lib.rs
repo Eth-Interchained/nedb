@@ -22,6 +22,7 @@ pub mod migrate;
 pub mod db;
 pub mod exit;
 pub mod nql;
+pub mod pgwire;
 #[cfg(feature = "cast")]
 pub mod cast;
 pub mod server;

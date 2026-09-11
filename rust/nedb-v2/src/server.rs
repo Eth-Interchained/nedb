@@ -1097,6 +1097,30 @@ pub fn router(mgr: Manager) -> Router {
 }
 
 /// Start the nedbd v2 server.
+/// Lets the Postgres read endpoint share this process's already-open databases
+/// instead of opening its own handles — which the exclusive data-dir LOCK would
+/// refuse anyway, and rightly so.
+impl crate::pgwire::DbResolver for Manager {
+    fn resolve(&self, name: &str) -> Option<Arc<Db>> {
+        // A blocking read on the manager map from the pgwire task. The lock is
+        // only held across a HashMap lookup, never across I/O.
+        let inner = self.inner.blocking_read();
+        // An empty database name means the client did not send one; serve the
+        // only database when that is unambiguous, which is the common case for
+        // `psql -h host` against a single-database store.
+        if name.is_empty() {
+            if inner.dbs.len() == 1 {
+                return inner.dbs.values().next().cloned();
+            }
+            return None;
+        }
+        inner.dbs.get(name).cloned()
+    }
+    fn token(&self) -> Option<String> {
+        self.token.clone()
+    }
+}
+
 pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>, memory_mode: bool) -> anyhow::Result<()> {
     // `mut` is required by the cast block below, which assigns mgr.caster. With
     // the feature off nothing mutates it, so an unconditional `mut` warns on
@@ -1135,6 +1159,25 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
 
     let has_token = mgr.token.is_some();
     let mgr_for_shutdown = mgr.clone();
+    // ── Postgres read endpoint ────────────────────────────────────────────────
+    // Opt-in: nothing binds unless NEDBD_PG_PORT is set (or --pg-port passed).
+    // Default-off is deliberate — a second listener is a second attack surface,
+    // and it speaks cleartext, so the operator asks for it explicitly.
+    if let Ok(raw) = std::env::var("NEDBD_PG_PORT") {
+        match raw.trim().parse::<u16>() {
+            Ok(pg_port) if pg_port > 0 => {
+                let pg_host = host.to_string();
+                let resolver: Arc<dyn crate::pgwire::DbResolver> = Arc::new(mgr.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = crate::pgwire::run(&pg_host, pg_port, resolver).await {
+                        eprintln!("  [pgwire] listener stopped: {}", e);
+                    }
+                });
+            }
+            _ => eprintln!("  [pgwire] ignoring NEDBD_PG_PORT={:?} — not a valid port", raw),
+        }
+    }
+
     let app = router(mgr);
     let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
     let banner = format!(r#"
