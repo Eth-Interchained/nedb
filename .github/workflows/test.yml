@@ -99,6 +99,25 @@ jobs:
       - name: cargo test — engine library
         working-directory: rust
         run: cargo test -p nedb-engine --lib
+      # The BINS were never compiled by any job. `cargo test --lib` builds the
+      # library, the release workflow builds only `--bin nedbd`, and the
+      # binding checks do not reach this crate's binaries — so `nedb-cli` sat
+      # broken (a `use std::env;` glued onto a doc-comment line) with nothing to
+      # notice. It also broke `cargo publish`, whose tarball verification
+      # builds every target, which is why crates.io stalled at 3.1.0 while the
+      # publish job reported success.
+      #
+      # --all-targets covers bins, examples, tests and benches in one pass.
+      - name: cargo check — every target (bins included)
+        working-directory: rust
+        run: cargo check -p nedb-engine --all-targets
+      # And RUN the integration tests, which were in the same blind spot: three
+      # test targets (nedb_cli, v3_integration, cast_endpoint — 13 tests) that
+      # nothing compiled, let alone executed. nedb_cli drives the compiled CLI
+      # as a subprocess, so it needs the bin built, which --tests does.
+      - name: cargo test — integration targets
+        working-directory: rust
+        run: cargo test -p nedb-engine --tests
       # The bindings are where drift hides: they are only ever compiled by the
       # release workflow, so a signature change in the core can sit broken on
       # master for days. `check` is cheap and catches exactly that.

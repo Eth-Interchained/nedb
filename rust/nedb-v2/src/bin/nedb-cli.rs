@@ -20,7 +20,9 @@
 //!
 //! Exit code: 0 ok · 1 error/tamper/not-found · 2 usage.
 //!
-//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)use std::env;
+//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
+
+use std::env;
 use std::path::Path;
 use std::process::exit;
 use std::sync::atomic::Ordering;
