@@ -29,6 +29,7 @@ pub mod nql;
 pub mod pgwire;
 pub mod pgcatalog;
 pub mod sqlselect;
+pub mod sqljoin;
 #[cfg(feature = "cast")]
 pub mod cast;
 pub mod server;
