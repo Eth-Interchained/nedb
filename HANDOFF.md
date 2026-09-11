@@ -35,6 +35,7 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #116 | **hash join + the frozen semantic corpus** | the evaluator became a subsystem with a contract |
 | #117 | **execution plan + `EXPLAIN` + the row budget** | the engine can say why it ran a query that way; `LIMIT` stopped materialising whole joins |
 | #118 | **ambiguous bindings refused; duplicate output names fixed** | two wrong-answer surfaces closed before any further optimiser work |
+| #119 | **conservative predicate pushdown, with recorded refusals** | a selective filter no longer waits for the whole join |
 
 ### The two engines, and which one to trust
 
@@ -117,6 +118,7 @@ Both were caught again this session, and both are cheap to check for:
 | `EXPLAIN` over libpq | 15 | inside the `pg_catalog` suite, real psycopg2 |
 | bindings + duplicate names | 6 | same suite; duplicate names verified positionally |
 | plan topology | 6 | structural, not rendered text |
+| **pushdown differential** | 6 | on vs off, x both join strategies |
 | psql introspection | 44 | drives the **real `psql` binary** |
 | `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
@@ -250,36 +252,66 @@ is performance.
   column left it pointing at the wrong name. Each select item now owns an
   explicit span of output columns.
 
+**Done in #119** — conservative predicate pushdown.
+
+A `WHERE` conjunct reading exactly ONE relation is COPIED to pre-filter that
+relation before the join. The `WHERE` is retained and still runs afterwards.
+
+**Retention alone is not sufficient, and believing it was cost a wrong
+answer.** The first version argued a copy-not-move was safe for every join
+type, because newly-unmatched rows get NULL-extended and the retained filter
+then drops them. But a predicate can be SATISFIED by a synthesised NULL:
+
+```sql
+SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept_id = d.id
+ WHERE d.dname IS NULL          -- 1 row, and it became 5
+```
+
+No `dept` row has a NULL `dname`, so pre-filtering empties `dept`, every `emp`
+row becomes unmatched, and `IS NULL` is TRUE for all of them. **The semantic
+corpus caught it on the first run.** That is the corpus doing precisely the job
+it was built for.
+
+So the real rule is about NULL SYNTHESIS:
+
+> A predicate may be pre-applied to relation `R` only if `R` is never
+> NULL-synthesised in this query.
+
+`sqlpush::nullable_bindings` computes that set: a join's right binding is
+nullable under `LEFT`/`FULL`, and a LATER `RIGHT`/`FULL` join retroactively
+makes every binding accumulated before it nullable — the `FROM` relation
+included. An all-inner query can push everything, which is the common case.
+
+Refusals are **recorded on the plan**, not silent, and visible in `EXPLAIN`:
+`Filter retained above join: predicate references nullable side of an outer
+join (n)`. An optimiser that silently declines cannot be audited — you cannot
+tell "correctly refused" from "forgot to look".
+
+Measured: `join + selective pred` at 8000x1500 went 8774 -> 118ms on the
+nested loop and 27.1 -> 8.0ms on the hash join. `join + broad pred` barely
+moved, which is correct — it keeps 85% of the rows.
+
 **The next item.** Correct result first, faster execution second; never invert
 that.
 
-* **Predicate pushdown, conservatively.** Narrower than the phrase sounds: NOT
-  a generic `Filter(Join(A,B)) -> Join(Filter(A),B)` rewrite based on column
-  ownership. For each candidate predicate, prove all three: (1) which bindings
-  does it reference, (2) what join type sits above that binding, (3) does
-  moving it change NULL-synthesis semantics. `INNER JOIN` allows much more
-  freedom; for `LEFT JOIN`, left-only predicates are the interesting safe case
-  and right-side predicates are where outer-row preservation dies. The trap is
-  already pinned in the corpus. **The optimiser should record a refusal REASON
-  when it declines** (`predicate references nullable side of LEFT JOIN`) —
-  inspectable in tests before it is ever user-facing.
 * **Physical `Filter`-in-`Join` execution** — but do NOT erase the logical
   distinction between an `ON` predicate and a post-join `WHERE` predicate, even
   when one loop evaluates both. That distinction is semantic law. The physical
   join carries `join_predicate`, `post_join_filter` and `row_budget`, and
   evaluates: candidate pair -> `ON` -> NULL synthesis if the outer join
   requires it -> post-join filter -> count toward budget. That yields the
-  performance win without turning `WHERE` into `ON`. The 27ms / 64-row case is
-  where it pays off.
-* **A streaming `Resolver`.** At 6.7ms the join is no longer the bottleneck —
-  an owned `Vec<Value>` forces full materialisation before early termination
-  can exploit anything. Do not reach for a large async abstraction: the
-  smallest iterator-shaped interface that permits *next row* and *stop early*.
-  Then prove `LIMIT 20` does not load 8000 source rows to return 20.
-* **Skew benchmark, then derive the hash crossover from it.** `AUTO_HASH_MIN_PAIRS
-  = 64` is currently a guess. Measure uniform-unique, moderate duplicates, a
-  single hot key, all-same-key, and coercion-heavy numeric/string keys — the
-  threshold must come from the ugly shapes, not just the friendly ones.
+  win without turning `WHERE` into `ON`, and it is what lets the row budget
+  apply to filtered joins.
+* **A streaming `Resolver`.** The join is no longer the bottleneck — an owned
+  `Vec<Value>` forces full materialisation before early termination can
+  exploit anything. Do not reach for a large async abstraction: the smallest
+  iterator-shaped interface permitting *next row* and *stop early*. Then prove
+  `LIMIT 20` does not load 8000 source rows to return 20.
+* **Skew benchmark, then derive the hash crossover from it.**
+  `AUTO_HASH_MIN_PAIRS = 64` is a guess. Measure uniform-unique, moderate
+  duplicates, a single hot key, all-same-key, and coercion-heavy
+  numeric/string keys — the threshold must come from the ugly shapes, not just
+  the friendly ones.
 
 Then **subqueries**, one semantic class at a time, each with its own
 regression corpus: scalar uncorrelated, `IN (SELECT ...)`, `EXISTS`,

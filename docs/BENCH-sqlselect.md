@@ -5,8 +5,8 @@ SPDX-FileCopyrightText: © 2026 INTERCHAINED LLC × Claude Sonnet 4.6
 
 # SQL evaluator baselines — nested loop vs hash join
 
-Recorded at engine **4.0.0**, PRs #116 and #117, on the CI-class sandbox this
-repo is developed in (Linux x86-64). Reproduce with:
+Recorded at engine **4.0.0**, PRs #116, #117 and #119, on the CI-class sandbox
+this repo is developed in (Linux x86-64). Reproduce with:
 
 ```bash
 cargo run --release --example sqlbench
@@ -51,8 +51,8 @@ nested loop is quadratic and the largest shape has to finish. Read the
 | filtered scan | 0.68 | 0.67 | — *(no join)* | 117 |
 | equality join | 366.62 | 4.05 | **90.6x** | 1922 |
 | left join | 373.27 | 4.03 | **92.5x** | 1961 |
-| join + selective pred | 370.32 | 3.85 | **96.3x** | 14 |
-| join + broad pred | 369.51 | 6.98 | **52.9x** | 1750 |
+| join + selective pred | 3.66 | 1.02 | **3.6x** | 14 |
+| join + broad pred | 336.34 | 4.68 | **71.9x** | 1750 |
 | join + sort | 403.51 | 6.35 | **63.6x** | 1922 |
 | join + limit | 5.13 | 0.97 | **5.3x** | 20 |
 | non-equality join | 344.69 | 346.33 | — *(same path)* | 2500 |
@@ -65,8 +65,8 @@ nested loop is quadratic and the largest shape has to finish. Read the
 | filtered scan | 2.21 | 2.26 | — *(no join)* | 320 |
 | equality join | 2204.29 | 16.00 | **137.7x** | 5708 |
 | left join | 2208.46 | 17.48 | **126.3x** | 5854 |
-| join + selective pred | 2229.06 | 12.77 | **174.5x** | 56 |
-| join + broad pred | 2212.43 | 19.44 | **113.8x** | 5144 |
+| join + selective pred | 23.09 | 2.72 | **8.5x** | 56 |
+| join + broad pred | 1966.10 | 14.65 | **134.2x** | 5144 |
 | join + sort | 2202.42 | 20.90 | **105.4x** | 5708 |
 | join + limit | 10.37 | 2.57 | **4.0x** | 20 |
 | non-equality join | 2079.45 | 2125.99 | — *(same path)* | 14000 |
@@ -79,8 +79,8 @@ nested loop is quadratic and the largest shape has to finish. Read the
 | filtered scan | 6.45 | 6.27 | — *(no join)* | 781 |
 | equality join | 8776.76 | 28.77 | **305.0x** | 7578 |
 | left join | 8837.90 | 30.17 | **293.0x** | 8000 |
-| join + selective pred | 8774.78 | 27.07 | **324.1x** | 64 |
-| join + broad pred | 8929.38 | 37.50 | **238.1x** | 6816 |
+| join + selective pred | 118.55 | 8.01 | **14.8x** | 64 |
+| join + broad pred | 8145.32 | 36.81 | **221.3x** | 6816 |
 | join + sort | 8804.33 | 36.91 | **238.5x** | 7578 |
 | join + limit | 29.59 | 6.72 | **4.4x** | 20 |
 | non-equality join | 8367.82 | 8569.10 | — *(same path)* | 40500 |
@@ -124,10 +124,31 @@ The residual 6.7ms is almost entirely relation materialisation (the resolver
 hands back an owned `Vec`), not join work. Removing that needs a streaming
 resolver, not a cleverer join.
 
-**A `WHERE` clause still disqualifies the budget**, because filtering happens
-after the join here — capping the join would starve the filter. Fusing `Filter`
-into the join is the natural next step, and it is what would let
-`join + selective pred` (currently 27ms to return 64 rows) stop early too.
+**`join + selective pred` was the next gap, and #119 closed it** with
+predicate pushdown — a conjunct reading exactly one relation is pre-applied to
+that relation before the join:
+
+| shape | nested before | nested after | hash before | hash after |
+|---|---:|---:|---:|---:|
+| 1000 x 500 | 370.32 | **3.66** | 3.85 | **1.02** |
+| 3000 x 1000 | 2229.06 | **23.09** | 12.77 | **2.72** |
+| 8000 x 1500 | 8774.78 | **118.55** | 27.07 | **8.01** |
+
+**76x** off the nested loop and **3.4x** off the hash join at the largest
+shape. `join + broad pred` gains almost nothing (8929 -> 8145 nested), which is
+exactly right: the predicate keeps 85% of the rows, so there is little to
+remove. A selective predicate is where pushdown pays, and the two rows
+together show the optimiser is doing something real rather than something
+uniform.
+
+Pushdown is **refused** when the relation can be NULL-synthesised, so an
+outer-join query with a predicate on the nullable side sees no improvement —
+and the plan says why. That is not a gap to close; it is the correctness
+boundary.
+
+**A `WHERE` clause still disqualifies the row budget**, because filtering
+happens after the join. Fusing `Filter` into the join is the next step, and it
+is what would let `join + selective pred` stop early as well as start smaller.
 
 **`join + broad pred` and `join + sort` gain least**, which makes sense —
 their cost is dominated by materialising and then sorting ~5–7k output rows,
