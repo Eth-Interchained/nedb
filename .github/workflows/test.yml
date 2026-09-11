@@ -16,7 +16,7 @@ name: test
 #   node         napi addon build, then smoke + durability + wrap family
 #   python-native  maturin wheel, then the suites that need `nedb._native`
 #   clients        the PUBLISHED PyPI + npm client packages, vs a live server
-#   python-daemon  nedbd binary on PATH, then the suites that self-spawn it
+#   python-daemon  nedbd binary on PATH + the Postgres read endpoint via libpq
 #
 # Deliberately NOT a release gate: this runs the same suites the release
 # workflow runs (and more), but on every push, so a red master is visible
@@ -318,6 +318,18 @@ jobs:
             [ "$i" -eq 20 ] && { echo "daemon never came up"; exit 1; }
           done
           pkill -x nedbd-v2 || true
+      # The Postgres read endpoint, driven by a REAL libpq client.
+      #
+      # Unit tests prove the SQL→NQL translation and the message framing, but
+      # only an actual PostgreSQL client proves the protocol: one wrong length
+      # prefix desynchronises the stream and the client HANGS, which no unit
+      # test would notice. psycopg2 is libpq, so if this passes then psql,
+      # DBeaver, Metabase and Grafana can read a NEDB store too.
+      - name: Postgres read endpoint (psycopg2 / libpq)
+        run: |
+          pip install psycopg2-binary
+          python3 tests/test_pgwire.py
+
       - name: Run daemon-backed suites
         env:
           PYTHONPATH: ${{ github.workspace }}/python

@@ -98,6 +98,76 @@ identical answers.
 
 ---
 
+## Postgres wire protocol — read NEDB with the tools you already have
+
+`nedbd --pg-port 5433` opens a **read-only PostgreSQL wire-protocol endpoint**.
+`psql`, DBeaver, Metabase, Grafana, psycopg, JDBC — anything that speaks pgwire
+can now query a tamper-evident NEDB store without a bespoke client.
+
+```console
+$ nedbd --data ./data --pg-port 5433
+  pgwire   postgres READ endpoint on 127.0.0.1:5433 — psql / DBeaver / psycopg (SELECT only)
+
+$ psql -h 127.0.0.1 -p 5433 -d shop
+shop=> SELECT status, total FROM orders WHERE status IN ('paid','open') ORDER BY total DESC;
+ status | total
+--------+-------
+ paid   |   300
+ paid   |   120
+ open   |    40
+
+shop=> SELECT SUM(total) FROM orders WHERE region = 'eu';
+ sum
+-----
+ 420
+
+shop=> SELECT * FROM orders AS OF SYSTEM TIME 1;     -- time travel, in SQL
+```
+
+**`AS OF SYSTEM TIME` is the bridge worth knowing about.** It is the spelling
+Postgres and CockroachDB use, and here it reaches NEDB's permanent,
+never-garbage-collected history rather than a few hours of MVCC. A wall-clock
+timestamp is refused with the reason: NEDB's history is sequence-addressed, so
+a seq is exact where a time would be approximate.
+
+Provenance is selectable like any other column:
+
+```sql
+SELECT _id, _hash, _seq FROM audit ORDER BY _seq;
+```
+
+**This is not "NEDB speaks SQL", and the endpoint is careful to say so.** It is
+a documented subset of `SELECT` translated to NQL:
+
+| Supported | Refused, with the reason |
+| --- | --- |
+| `*`, a column list, `COUNT(*)`, `SUM`/`AVG`/`MIN`/`MAX(col)` | `JOIN` — NQL is single-collection |
+| `WHERE` — the whole NQL predicate surface | subqueries, `UNION`, window functions |
+| `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET` | expressions in the select list |
+| `AS OF SYSTEM TIME <seq>` | `INSERT`/`UPDATE`/`DELETE` — see below |
+| SQL `'literals'` and `<>`, rewritten to NQL | DDL of any kind |
+
+Every refusal names the boundary instead of saying "syntax error", and a
+grouped query that projects a column SQL would reject gets Postgres's own
+message rather than a silent `NULL`.
+
+**Writes are deliberately absent.** A NEDB write carries `caused_by`,
+valid-time bounds and idempotency; none of that has a natural SQL spelling, so
+`INSERT` points at the HTTP API rather than doing half a job.
+
+Two limits worth stating plainly: the **simple query protocol** is implemented
+(what `psql` and libpq's `PQexec` use), while the extended protocol
+(`Parse`/`Bind`/`Execute`) returns a clear error rather than hanging — so
+psycopg3's default mode is not yet supported. And the connection is
+**cleartext**, which is why the endpoint is off unless you pass `--pg-port` and
+binds to loopback by default. Put it behind a tunnel to go further.
+
+Verified in CI by `tests/test_pgwire.py` — 40 checks driven through **psycopg2,
+which is libpq**. Unit tests can prove the translation; only a real client
+proves the protocol.
+
+---
+
 ## New in 3.2.0 — wrap the databases you already run
 
 NEDB adds **tamper-evident causal provenance to a database you already have**, in one line, without
