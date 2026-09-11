@@ -271,6 +271,12 @@ db.query('FROM users WHERE status = "active" ORDER BY age ASC')
 db.query('FROM users SEARCH "rust"')
 db.query('FROM users GROUP BY status COUNT')
 
+# Full boolean predicates — IN, BETWEEN, LIKE, IS NULL, OR, NOT, parentheses
+db.query('FROM users WHERE status IN ("active", "trialing")')
+db.query('FROM users WHERE age BETWEEN 25 AND 40')
+db.query('FROM users WHERE bio LIKE "%rust%" AND NOT (status = "retired")')
+db.query('FROM users WHERE (age < 25 OR age > 60) AND bio IS NOT NULL')
+
 # Time-travel — AS OF any past sequence
 snap = db.seq
 db.put("users", "alice", {"name": "Alice", "age": 32, "status": "retired"})
@@ -495,7 +501,7 @@ redis-cli -p 6380 SELECT shop EVAL 'FROM beliefs TRACE caused_by' 0
 FROM <collection>
   [ AS OF <seq> ]                            transaction time (when was it written?)
   [ VALID AS OF "<date>" ]                   valid time (when was it true in the world?)
-  [ WHERE <field> <op> <value> (AND ...) ]   op: = != < <= > >=
+  [ WHERE <predicate> ]                      full boolean predicate, see below
   [ SEARCH "<text>" ]                        full-text search
   [ ORDER BY <field> [ASC|DESC] ]
   [ TRAVERSE <relation> ]                    graph traversal
@@ -503,6 +509,71 @@ FROM <collection>
   [ LIMIT <n> ]
   [ GROUP BY <field> [COUNT|SUM f|AVG f|MIN f|MAX f] ]
 ```
+
+### Predicates
+
+`WHERE` takes a full boolean expression. `AND` binds tighter than `OR`;
+parentheses override, and nest to any depth.
+
+```
+<predicate> := <or>
+<or>        := <and> [OR <and>]*
+<and>       := <not> [AND <not>]*
+<not>       := [NOT] <primary>
+<primary>   := "(" <predicate> ")" | <comparison>
+```
+
+| Comparison | Example |
+| --- | --- |
+| `= != < <= > >=` | `WHERE height > 600000` |
+| `IN (…)` / `NOT IN (…)` | `WHERE status IN ("open", "pending")` |
+| `BETWEEN a AND b` | `WHERE height BETWEEN 100 AND 200` — inclusive, as in SQL |
+| `NOT BETWEEN a AND b` | `WHERE fee NOT BETWEEN 10 AND 20` |
+| `LIKE` / `NOT LIKE` | `WHERE miner LIKE "Acme%"` — `%` any run, `_` any one char |
+| `ILIKE` | `WHERE miner ILIKE "acme%"` — case-insensitive |
+| `IS NULL` / `IS NOT NULL` | `WHERE miner IS NULL` — matches absent **and** explicitly-null |
+
+```python
+db.query('''FROM jobs
+            WHERE (status IN ("open", "pending") OR fee > 100)
+              AND miner IS NOT NULL
+              AND NOT (region LIKE "eu-%")
+            ORDER BY fee DESC LIMIT 20''')
+```
+
+Filterable metadata fields: `_id`, `_coll`, `_hash`, `_seq`.
+
+`_id = "x"` is an O(1) index lookup rather than a scan — but only when it is a
+genuine conjunct. Under an `OR` it cannot constrain the result set, so the
+planner correctly declines the fast path there.
+
+> **Predicates over NULL follow SQL's three-valued logic.** `LIKE` on a
+> missing or null field is false in *both* polarities, so a null row appears in
+> neither `LIKE` nor `NOT LIKE`. Use `IS NULL` to select those rows explicitly.
+
+### Unknown clauses are errors
+
+A query containing a clause the engine does not implement is **rejected**, not
+silently reinterpreted. Before 3.3.0 the parser skipped tokens it did not
+recognise, so `FROM jobs OFFSET 2` returned un-offset rows with HTTP 200 and a
+misspelled `ORDRE BY fee` returned unsorted rows — the engine answered a
+*different query* than the one asked, and said nothing. Both now return
+HTTP 400 with the offending token.
+
+### Aggregates
+
+`SUM`/`AVG`/`MIN`/`MAX` take the field to aggregate; `COUNT` (the default when
+no aggregate is given) takes none.
+
+```python
+db.query('FROM items GROUP BY cat MAX price')
+# → [{"cat": "x", "count": 3, "max_price": 10.0, "value": 10.0}, …]
+```
+
+`count` is the group size. The aggregate only considers rows whose target field
+is numeric, so a group of 5 where 2 carry a numeric `price` reports `count: 5`
+and averages over 2. An aggregate with no numeric input is `null`, never `0`.
+The `value` key is a back-compatible alias for the aggregate result.
 
 Combine both time axes:
 ```python
