@@ -317,6 +317,53 @@ def run_explain_suite(cur):
     check("two different queries get two different plans", a != bq)
 
 
+def run_binding_suite(cur):
+    def q(sql):
+        cur.execute(sql)
+        return cur.fetchall()
+
+    section("duplicate output names, and ambiguous bindings")
+
+    # PostgreSQL permits two output columns with the same name, and generated
+    # SQL relies on it. Rows here are JSON objects, so two columns sharing a
+    # name shared a KEY — the second write silently overwrote the first, and
+    # this query returned the same value twice while reporting two columns.
+    cur.execute("SELECT c.relname, n.nspname AS relname FROM pg_class c "
+                "LEFT JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "ORDER BY 1 LIMIT 1")
+    row = cur.fetchone()
+    names = [d.name for d in cur.description]
+    check("two columns may share a name over the wire",
+          names == ["relname", "relname"], f"{names}")
+    check("and they carry DIFFERENT values, positionally",
+          row == ("drivers", "public"), f"{row}")
+
+    # A silently empty answer is indistinguishable from "there is no such
+    # data", which is why this is refused rather than answered.
+    for sql, why in [
+        ("SELECT c.relname FROM pg_class c JOIN pg_class c ON c.oid = c.oid",
+         "the same alias twice"),
+        ("SELECT relname FROM pg_class JOIN pg_class ON 1 = 1",
+         "the same bare relation twice"),
+    ]:
+        try:
+            q(sql)
+            check(f"{why} is refused", False, "it answered")
+        except Exception as e:                                      # noqa: BLE001
+            check(f"{why} is refused", "ambiguous relation binding" in str(e),
+                  str(e)[:110])
+
+    # The supported spelling still works.
+    got = q("SELECT a.nspname, b.nspname FROM pg_namespace a "
+            "JOIN pg_namespace b ON a.oid = b.oid ORDER BY 1 LIMIT 1")
+    check("aliasing the second use is the supported spelling",
+          len(got) == 1 and got[0][0] == got[0][1], f"{got}")
+
+    # An ordinary single-use query must be untouched by the guard.
+    check("a relation used once is unaffected",
+          len(q("SELECT relname FROM pg_class ORDER BY 1")) == 3)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="nedb-pgcat-")
     http_port, pg_port = free_port(), free_port()
@@ -356,6 +403,7 @@ def main():
         cur = conn.cursor()
         run_suite(cur)
         run_explain_suite(cur)
+        run_binding_suite(cur)
         cur.close()
         conn.close()
     finally:

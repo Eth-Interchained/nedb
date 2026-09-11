@@ -1613,6 +1613,64 @@ fn eval_func(name: &str, args: &[Expr], row: &Bound) -> Result<Value> {
 // Phase 4 — execution
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Every relation in a query must be addressable by a DISTINCT name.
+///
+/// PostgreSQL rejects `FROM a JOIN a` with "table name a specified more than
+/// once". This engine used to accept it and answer WRONGLY: a qualified
+/// reference scans the bindings in order and takes the first match, so both
+/// `a.x` and `a.y` read the same row, and `FROM emp JOIN emp ON emp.mgr =
+/// emp.id` compared every row to ITSELF and returned no rows at all.
+///
+/// A silently empty result is the worst possible answer — it is
+/// indistinguishable from "there is no such data". Refusing is strictly
+/// better, and the supported spelling is one alias per relation.
+fn validate_bindings(sel: &Select) -> Result<()> {
+    let mut seen: Vec<String> = vec![];
+    if let Some(f) = &sel.from {
+        seen.push(f.binding());
+    }
+    for j in &sel.joins {
+        seen.push(j.table.binding());
+    }
+    for (i, b) in seen.iter().enumerate() {
+        if let Some(prev) = seen[..i].iter().find(|p| p.eq_ignore_ascii_case(b)) {
+            bail!(
+                "ambiguous relation binding: {:?} appears more than once; use \
+                 aliases (for example `FROM {} JOIN {} AS {}2 ...`)",
+                prev, prev, prev, prev
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One output column: the key it is stored under, and the name the client sees.
+///
+/// These are NOT always the same, and that is the whole point. PostgreSQL
+/// permits duplicate output names — `SELECT e.name, e2.name` legitimately
+/// returns two columns both called `name`, and generated SQL relies on it.
+/// Rows here are JSON objects, so two columns sharing a key would share a
+/// VALUE: the second write silently overwrote the first, and the query above
+/// returned the same value twice while reporting two columns.
+///
+/// So the key is made unique and the display name is left alone. Renaming the
+/// column instead would be worse — generated SQL asks for the name it wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutCol {
+    pub key: String,
+    pub name: String,
+}
+
+/// A key no user field can collide with, for the second and later columns
+/// sharing a display name. `\u{1}` is not producible in a JSON field name by
+/// any sane writer, and the index disambiguates even if one managed it.
+fn unique_key(taken: &[OutCol], name: &str) -> String {
+    if !taken.iter().any(|c| c.key == name) {
+        return name.to_string();
+    }
+    format!("{name}\u{1}{}", taken.len())
+}
+
 /// A joined row, owned: `(binding, row-or-NULL)` per source table.
 type JoinedRow = Vec<(String, Option<Value>)>;
 
@@ -1650,9 +1708,9 @@ pub type Resolver<'r> = dyn Fn(&str) -> Result<Option<Vec<Value>>> + 'r;
 ///
 /// Rows come back as JSON objects keyed by output column name, which is the
 /// shape the wire encoder already consumes.
-pub fn execute(sel: &Select, resolve: &Resolver) -> Result<(Vec<String>, Vec<Value>)> {
-    let (names, rows, _) = execute_explain(sel, resolve, JoinExec::Auto)?;
-    Ok((names, rows))
+pub fn execute(sel: &Select, resolve: &Resolver) -> Result<(Vec<OutCol>, Vec<Value>)> {
+    let (cols, rows, _) = execute_explain(sel, resolve, JoinExec::Auto)?;
+    Ok((cols, rows))
 }
 
 /// Run a parsed `SELECT`, also reporting how each join was executed.
@@ -1665,8 +1723,11 @@ pub fn execute_explain(
     sel: &Select,
     resolve: &Resolver,
     exec: JoinExec,
-) -> Result<(Vec<String>, Vec<Value>, Plan)> {
+) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
     let mut plan = Plan::default();
+
+    // ── 0a. semantic validation, before any work ────────────────────────────
+    validate_bindings(sel)?;
 
     // ── 0. the row budget ───────────────────────────────────────────────────
     //
@@ -1790,14 +1851,23 @@ pub fn execute_explain(
     // Resolved from the FIRST row when the select list contains a `*`,
     // because only a row knows what columns a schemaless source has. With no
     // rows at all a `*` yields no columns, which is the honest answer.
-    let mut names: Vec<String> = vec![];
+    //
+    // `spans` records which output columns each select ITEM owns, so the
+    // projection below never has to guess. The previous version walked a
+    // single counter through both stages, and a `*` that skipped an
+    // already-named column left the counter pointing at the wrong name — a
+    // drift that happened to be masked by a fallback.
+    let mut cols: Vec<OutCol> = vec![];
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(sel.items.len());
     for item in &sel.items {
+        let start = cols.len();
         match &item.expr {
             Expr::Star => {
                 if let Some(first) = rows.first() {
                     for (n, _) in bind(first).flatten() {
-                        if !names.contains(&n) {
-                            names.push(n);
+                        // A star never emits the same column twice.
+                        if !cols.iter().any(|c| c.name == n) {
+                            cols.push(OutCol { key: n.clone(), name: n });
                         }
                     }
                 }
@@ -1805,8 +1875,8 @@ pub fn execute_explain(
             Expr::QualifiedStar(q) => {
                 if let Some(first) = rows.first() {
                     for (n, _) in bind(first).flatten_binding(q) {
-                        if !names.contains(&n) {
-                            names.push(n);
+                        if !cols.iter().any(|c| c.name == n) {
+                            cols.push(OutCol { key: n.clone(), name: n });
                         }
                     }
                 }
@@ -1817,10 +1887,12 @@ pub fn execute_explain(
                 // positionally as well as by name, so a collision is NOT
                 // renamed — silently renaming a column is worse than a
                 // duplicate, because generated SQL looks for the name it asked
-                // for.
-                names.push(name);
+                // for. Only the internal KEY is disambiguated.
+                let key = unique_key(&cols, &name);
+                cols.push(OutCol { key, name });
             }
         }
+        spans.push((start, cols.len()));
     }
 
     // ── 4. project ──────────────────────────────────────────────────────────
@@ -1830,35 +1902,35 @@ pub fn execute_explain(
     for r in rows {
         let b = bind(&r);
         let mut obj = Map::new();
-        let mut idx = 0usize;
-        for item in &sel.items {
+        for (i, item) in sel.items.iter().enumerate() {
+            let (start, end) = spans[i];
             match &item.expr {
                 Expr::Star => {
                     for (n, v) in b.flatten() {
-                        obj.entry(n).or_insert(v);
-                        idx += 1;
+                        if let Some(c) = cols[start..end].iter().find(|c| c.name == n) {
+                            obj.entry(c.key.clone()).or_insert(v);
+                        }
                     }
                 }
                 Expr::QualifiedStar(q) => {
                     for (n, v) in b.flatten_binding(q) {
-                        obj.entry(n).or_insert(v);
-                        idx += 1;
+                        if let Some(c) = cols[start..end].iter().find(|c| c.name == n) {
+                            obj.entry(c.key.clone()).or_insert(v);
+                        }
                     }
                 }
                 _ => {
                     let v = eval(&item.expr, &b)?;
-                    let name = names.get(idx).cloned().unwrap_or_else(|| {
-                        item.alias.clone().unwrap_or_else(|| derived_name(&item.expr))
-                    });
-                    obj.insert(name, v);
-                    idx += 1;
+                    if let Some(c) = cols.get(start) {
+                        obj.insert(c.key.clone(), v);
+                    }
                 }
             }
         }
         projected.push((obj, r));
     }
 
-    plan.push(Stage::Project { columns: names.len(), out_rows: projected.len() });
+    plan.push(Stage::Project { columns: cols.len(), out_rows: projected.len() });
 
     // ── 5. DISTINCT ─────────────────────────────────────────────────────────
     if sel.distinct {
@@ -1868,9 +1940,9 @@ pub fn execute_explain(
         for (obj, src) in projected {
             // Keyed on the PROJECTED values in output order, which is what
             // DISTINCT means — not on the source rows.
-            let key = names
+            let key = cols
                 .iter()
-                .map(|n| format!("{:?}", obj.get(n).unwrap_or(&Value::Null)))
+                .map(|c| format!("{:?}", obj.get(&c.key).unwrap_or(&Value::Null)))
                 .collect::<Vec<_>>()
                 .join("\u{1}");
             if !seen.contains(&key) {
@@ -1893,12 +1965,12 @@ pub fn execute_explain(
             for ob in &sel.order_by {
                 let v = match (ob.ordinal, &ob.expr) {
                     (Some(n), _) => {
-                        let name = names.get(n - 1).ok_or_else(|| {
+                        let c = cols.get(n - 1).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "ORDER BY {} is out of range: the select list has {} \
-                                 column(s)", n, names.len())
+                                 column(s)", n, cols.len())
                         })?;
-                        obj.get(name).cloned().unwrap_or(Value::Null)
+                        obj.get(&c.key).cloned().unwrap_or(Value::Null)
                     }
                     (None, Some(e)) => {
                         // An ORDER BY expression may name a column that is not
@@ -1970,7 +2042,7 @@ pub fn execute_explain(
         });
     }
 
-    Ok((names, out, plan))
+    Ok((cols, out, plan))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2161,7 +2233,7 @@ fn fetch(name: &str, resolve: &Resolver) -> Result<Vec<Value>> {
 }
 
 /// Parse and run in one call.
-pub fn run(sql: &str, resolve: &Resolver) -> Result<(Vec<String>, Vec<Value>)> {
+pub fn run(sql: &str, resolve: &Resolver) -> Result<(Vec<OutCol>, Vec<Value>)> {
     let sel = parse(sql)?;
     execute(&sel, resolve)
 }
@@ -2967,7 +3039,8 @@ mod exec_tests {
     }
 
     fn go(sql: &str, r: &Resolver) -> (Vec<String>, Vec<Value>) {
-        run(sql, r).unwrap_or_else(|e| panic!("{}\n  -> {}", sql, e))
+        let (cols, rows) = run(sql, r).unwrap_or_else(|e| panic!("{}\n  -> {}", sql, e));
+        (cols.into_iter().map(|c| c.name).collect(), rows)
     }
 
     fn col(rows: &[Value], name: &str) -> Vec<Value> {

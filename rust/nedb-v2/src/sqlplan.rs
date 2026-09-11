@@ -92,6 +92,61 @@ pub enum Stage {
     },
 }
 
+/// The pipeline as a TREE, which is what it actually is.
+///
+/// Every stage has one input except a join, which has two. Tests assert over
+/// this rather than over rendered text, because the bug that shipped in the
+/// first `EXPLAIN` was a TOPOLOGY bug: a join's two scans were printed at
+/// different depths, so `pg_class` read as a child of the scan of
+/// `pg_namespace`. Every assertion at the time checked content — which
+/// relation, how many rows — and content was correct. Structure was not.
+///
+/// ```text
+///   Join            is NOT        Join
+///   ├── Scan A                    └── Scan A
+///   └── Scan B                        └── Scan B
+/// ```
+///
+/// A string assertion can be made to pass by either shape. A tree assertion
+/// cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanTree {
+    Leaf(Stage),
+    Unary { stage: Stage, input: Box<PlanTree> },
+    Binary { stage: Stage, left: Box<PlanTree>, right: Box<PlanTree> },
+}
+
+impl PlanTree {
+    pub fn stage(&self) -> &Stage {
+        match self {
+            PlanTree::Leaf(s) => s,
+            PlanTree::Unary { stage, .. } => stage,
+            PlanTree::Binary { stage, .. } => stage,
+        }
+    }
+
+    /// Inputs, in the order PostgreSQL prints them: outer side first.
+    pub fn children(&self) -> Vec<&PlanTree> {
+        match self {
+            PlanTree::Leaf(_) => vec![],
+            PlanTree::Unary { input, .. } => vec![input],
+            PlanTree::Binary { left, right, .. } => vec![left, right],
+        }
+    }
+
+    /// Total node count, so a test can assert nothing was dropped.
+    pub fn size(&self) -> usize {
+        1 + self.children().iter().map(|c| c.size()).sum::<usize>()
+    }
+
+    /// The deepest path length, which is what distinguishes siblings from
+    /// nesting: two scans under a join give depth 2, one nested under the
+    /// other gives depth 3.
+    pub fn depth(&self) -> usize {
+        1 + self.children().iter().map(|c| c.depth()).max().unwrap_or(0)
+    }
+}
+
 /// What ran, in the order it ran.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -143,6 +198,37 @@ impl Plan {
         }
     }
 
+    /// The pipeline as a tree. `None` when nothing ran (`SELECT 1`).
+    ///
+    /// Stages are recorded as: the base scan, then per join its right-hand
+    /// scan followed by the join itself, then the postfix stages. That shape
+    /// is what makes the reconstruction unambiguous.
+    pub fn tree(&self) -> Option<PlanTree> {
+        let mut it = self.stages.iter();
+        let mut node = PlanTree::Leaf(it.next()?.clone());
+        let rest: Vec<&Stage> = it.collect();
+        let mut i = 0usize;
+        while i < rest.len() {
+            let is_join_pair = matches!(rest.get(i), Some(Stage::Scan { .. }))
+                && matches!(rest.get(i + 1), Some(Stage::Join { .. }));
+            if is_join_pair {
+                node = PlanTree::Binary {
+                    stage: rest[i + 1].clone(),
+                    left: Box::new(node),
+                    right: Box::new(PlanTree::Leaf(rest[i].clone())),
+                };
+                i += 2;
+            } else {
+                node = PlanTree::Unary {
+                    stage: rest[i].clone(),
+                    input: Box::new(node),
+                };
+                i += 1;
+            }
+        }
+        Some(node)
+    }
+
     /// Render as `EXPLAIN` output: one string per line, innermost first, the
     /// way PostgreSQL nests its plan tree.
     ///
@@ -151,108 +237,8 @@ impl Plan {
     /// is not still sees the order things happened in.
     pub fn render(&self) -> Vec<String> {
         let mut out = vec![];
-        let mut depth = 0usize;
-
-        // Walked BACKWARDS: the last stage to run is the outermost operation,
-        // which is what PostgreSQL prints first and least indented. Assigning
-        // depth in execution order and reversing afterwards gets the
-        // indentation exactly inside out.
-        //
-        // A join is the one stage with TWO inputs, so it is the one place the
-        // pipeline is really a tree. Its right-hand scan is emitted at the SAME
-        // depth as its left input rather than one deeper, because they are
-        // siblings — printing them at different depths reads as "pg_class was
-        // scanned inside the scan of pg_namespace", which is not what happened.
-        //
-        // The two inputs are listed inner-side-first, where PostgreSQL lists
-        // the outer side first. The indentation and the relation names make it
-        // unambiguous, and matching PostgreSQL's ordering would need a real
-        // tree walk for no gain in clarity.
-        let rev: Vec<&Stage> = self.stages.iter().rev().collect();
-        let mut i = 0usize;
-        while i < rev.len() {
-            let stage = rev[i];
-            i += 1;
-            let indent = "  ".repeat(depth);
-            let arrow = if depth == 0 { String::new() } else { format!("{indent}-> ") };
-            let line = match stage {
-                Stage::Scan { table, binding, rows } => {
-                    let as_ = if binding == table {
-                        String::new()
-                    } else {
-                        format!(" {binding}")
-                    };
-                    format!("{arrow}Seq Scan on {table}{as_}  (actual rows={rows})")
-                }
-                Stage::Join {
-                    kind,
-                    table,
-                    binding,
-                    strategy,
-                    keys,
-                    left_rows,
-                    right_rows,
-                    out_rows,
-                    early_stopped,
-                } => {
-                    let as_ = if binding == table {
-                        String::new()
-                    } else {
-                        format!(" {binding}")
-                    };
-                    let k = match keys {
-                        0 => "no equality key".to_string(),
-                        1 => "1 hash key".to_string(),
-                        n => format!("{n} hash keys"),
-                    };
-                    let stop = if *early_stopped { ", stopped early" } else { "" };
-                    format!(
-                        "{arrow}{strategy} {} Join on {table}{as_} \
-                         ({k}, left={left_rows}, right={right_rows}{stop}) \
-                         (actual rows={out_rows})",
-                        kind_name(*kind)
-                    )
-                }
-                Stage::Filter { in_rows, out_rows } => {
-                    format!("{arrow}Filter  (removed {}) (actual rows={out_rows})",
-                        in_rows.saturating_sub(*out_rows))
-                }
-                Stage::Project { columns, out_rows } => {
-                    format!("{arrow}Project  ({columns} columns) (actual rows={out_rows})")
-                }
-                Stage::Distinct { in_rows, out_rows } => {
-                    format!("{arrow}Unique  (removed {}) (actual rows={out_rows})",
-                        in_rows.saturating_sub(*out_rows))
-                }
-                Stage::Sort { keys, rows } => {
-                    format!("{arrow}Sort  ({keys} key(s)) (actual rows={rows})")
-                }
-                Stage::Limit { limit, offset, in_rows, out_rows } => {
-                    let l = limit.map(|n| n.to_string()).unwrap_or_else(|| "ALL".into());
-                    let o = offset.map(|n| format!(", offset {n}")).unwrap_or_default();
-                    format!("{arrow}Limit  ({l}{o}, from {in_rows}) (actual rows={out_rows})")
-                }
-            };
-            out.push(line);
-            depth += 1;
-
-            // A join's two inputs are siblings. The stage immediately before
-            // a join in execution order is its right-hand scan, so emit that
-            // now at the depth the LEFT input will also get.
-            if matches!(stage, Stage::Join { .. }) {
-                if let Some(Stage::Scan { table, binding, rows }) = rev.get(i).copied() {
-                    let as_ = if binding == table {
-                        String::new()
-                    } else {
-                        format!(" {binding}")
-                    };
-                    out.push(format!(
-                        "{}-> Seq Scan on {table}{as_}  (actual rows={rows})",
-                        "  ".repeat(depth)
-                    ));
-                    i += 1;
-                }
-            }
+        if let Some(t) = self.tree() {
+            render_node(&t, 0, &mut out);
         }
 
         if let Some(b) = self.budget {
@@ -267,6 +253,81 @@ impl Plan {
                 .to_string(),
         );
         out
+    }
+}
+
+/// Walk the tree, outermost first, each input indented under the stage that
+/// consumes it.
+///
+/// Recursing over the tree is what makes a join's two inputs siblings without
+/// a special case: they are children of the same node, so they get the same
+/// depth by construction. The first version of this walked a flat list and
+/// tried to patch the sibling case by hand, which is how it got the topology
+/// wrong.
+fn render_node(n: &PlanTree, depth: usize, out: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    let arrow = if depth == 0 { String::new() } else { format!("{indent}-> ") };
+    let line = match n.stage() {
+        Stage::Scan { table, binding, rows } => {
+            format!("{arrow}Seq Scan on {}  (actual rows={rows})", named(table, binding))
+        }
+        Stage::Join {
+            kind,
+            table,
+            binding,
+            strategy,
+            keys,
+            left_rows,
+            right_rows,
+            out_rows,
+            early_stopped,
+        } => {
+            let k = match keys {
+                0 => "no equality key".to_string(),
+                1 => "1 hash key".to_string(),
+                n => format!("{n} hash keys"),
+            };
+            let stop = if *early_stopped { ", stopped early" } else { "" };
+            format!(
+                "{arrow}{strategy} {} Join on {} \
+                 ({k}, left={left_rows}, right={right_rows}{stop}) \
+                 (actual rows={out_rows})",
+                kind_name(*kind),
+                named(table, binding)
+            )
+        }
+        Stage::Filter { in_rows, out_rows } => format!(
+            "{arrow}Filter  (removed {}) (actual rows={out_rows})",
+            in_rows.saturating_sub(*out_rows)
+        ),
+        Stage::Project { columns, out_rows } => {
+            format!("{arrow}Project  ({columns} columns) (actual rows={out_rows})")
+        }
+        Stage::Distinct { in_rows, out_rows } => format!(
+            "{arrow}Unique  (removed {}) (actual rows={out_rows})",
+            in_rows.saturating_sub(*out_rows)
+        ),
+        Stage::Sort { keys, rows } => {
+            format!("{arrow}Sort  ({keys} key(s)) (actual rows={rows})")
+        }
+        Stage::Limit { limit, offset, in_rows, out_rows } => {
+            let l = limit.map(|n| n.to_string()).unwrap_or_else(|| "ALL".into());
+            let o = offset.map(|n| format!(", offset {n}")).unwrap_or_default();
+            format!("{arrow}Limit  ({l}{o}, from {in_rows}) (actual rows={out_rows})")
+        }
+    };
+    out.push(line);
+    for c in n.children() {
+        render_node(c, depth + 1, out);
+    }
+}
+
+/// `orders` or `orders o` — a redundant alias is not repeated.
+fn named(table: &str, binding: &str) -> String {
+    if table == binding {
+        table.to_string()
+    } else {
+        format!("{table} {binding}")
     }
 }
 
@@ -429,6 +490,133 @@ mod tests {
             "the two inputs of a join must be at the same depth\n{r:#?}"
         );
         assert!(depth(orders) > depth(&r[0]), "both are nested under the join");
+    }
+
+    // ── structural assertions: topology, not rendered text ──────────────────
+
+    fn join_stage(table: &str) -> Stage {
+        Stage::Join {
+            kind: JoinKind::Inner,
+            table: table.into(),
+            binding: table.into(),
+            strategy: Strategy::Hash,
+            keys: 1,
+            left_rows: 1,
+            right_rows: 1,
+            out_rows: 1,
+            early_stopped: false,
+        }
+    }
+
+    #[test]
+    fn a_join_node_has_exactly_two_children() {
+        // The distinction the rendered text could not express:
+        //   Join            is NOT     Join
+        //   ├── Scan a                 └── Scan a
+        //   └── Scan b                     └── Scan b
+        let mut p = Plan::default();
+        p.push(scan("a", 1));
+        p.push(scan("b", 1));
+        p.push(join_stage("b"));
+
+        let t = p.tree().expect("a tree");
+        assert!(matches!(t, PlanTree::Binary { .. }), "a join is binary");
+        assert_eq!(t.children().len(), 2, "two inputs, not one nested in the other");
+        assert_eq!(t.size(), 3, "join + two scans");
+        // Two scans as SIBLINGS is depth 2. One nested under the other is 3.
+        assert_eq!(t.depth(), 2, "the inputs are siblings\n{t:#?}");
+        for c in t.children() {
+            assert!(matches!(c, PlanTree::Leaf(Stage::Scan { .. })));
+            assert_eq!(c.children().len(), 0, "a scan consumes nothing");
+        }
+    }
+
+    #[test]
+    fn the_outer_side_is_the_left_child() {
+        // `a` is the FROM relation, `b` is joined to it. Getting these the
+        // wrong way round would make EXPLAIN describe the build and probe
+        // sides backwards.
+        let mut p = Plan::default();
+        p.push(scan("a", 10));
+        p.push(scan("b", 5));
+        p.push(join_stage("b"));
+        let t = p.tree().unwrap();
+        let kids = t.children();
+        assert_eq!(kids[0].stage(), &scan("a", 10), "outer side first");
+        assert_eq!(kids[1].stage(), &scan("b", 5), "inner side second");
+    }
+
+    #[test]
+    fn a_chained_join_nests_on_the_left() {
+        // `FROM a JOIN b JOIN c` — the second join's outer side is the FIRST
+        // join, so the tree leans left and depth grows by one per join.
+        let mut p = Plan::default();
+        p.push(scan("a", 1));
+        p.push(scan("b", 1));
+        p.push(join_stage("b"));
+        p.push(scan("c", 1));
+        p.push(join_stage("c"));
+
+        let t = p.tree().unwrap();
+        assert_eq!(t.size(), 5, "3 scans + 2 joins");
+        assert_eq!(t.depth(), 3, "left-deep: join -> join -> scan");
+        let kids = t.children();
+        assert!(matches!(kids[0], PlanTree::Binary { .. }), "outer side is the first join");
+        assert!(matches!(kids[1], PlanTree::Leaf(_)), "inner side is c");
+        assert_eq!(kids[0].children().len(), 2);
+    }
+
+    #[test]
+    fn unary_stages_wrap_the_whole_tree_below_them() {
+        let mut p = Plan::default();
+        p.push(scan("a", 100));
+        p.push(scan("b", 5));
+        p.push(join_stage("b"));
+        p.push(Stage::Filter { in_rows: 100, out_rows: 7 });
+        p.push(Stage::Limit { limit: Some(2), offset: None, in_rows: 7, out_rows: 2 });
+
+        let t = p.tree().unwrap();
+        assert!(matches!(t.stage(), Stage::Limit { .. }), "the last stage is outermost");
+        assert_eq!(t.children().len(), 1, "a unary stage has one input");
+        let filter = t.children()[0];
+        assert!(matches!(filter.stage(), Stage::Filter { .. }));
+        assert_eq!(filter.children().len(), 1);
+        let join = filter.children()[0];
+        assert_eq!(join.children().len(), 2, "and the join below still has two");
+        assert_eq!(t.size(), 5);
+    }
+
+    #[test]
+    fn a_plan_with_no_stages_has_no_tree() {
+        // `SELECT 1` touches no relation.
+        assert_eq!(Plan::default().tree(), None);
+    }
+
+    #[test]
+    fn the_rendered_depth_agrees_with_the_tree_depth() {
+        // Ties the text back to the structure, so the two cannot drift: if the
+        // renderer ever flattens the tree again, this fails.
+        let mut p = Plan::default();
+        p.push(scan("a", 1));
+        p.push(scan("b", 1));
+        p.push(join_stage("b"));
+        p.push(scan("c", 1));
+        p.push(join_stage("c"));
+        let t = p.tree().unwrap();
+
+        let lines = p.render();
+        let plan_lines: Vec<&String> = lines
+            .iter()
+            .filter(|l| !l.starts_with("NEDB reports") && !l.starts_with("Row budget"))
+            .collect();
+        assert_eq!(plan_lines.len(), t.size(), "every node is rendered once");
+
+        let max_indent = plan_lines
+            .iter()
+            .map(|l| (l.len() - l.trim_start().len()) / 2)
+            .max()
+            .unwrap();
+        assert_eq!(max_indent + 1, t.depth(), "rendered nesting matches the tree");
     }
 
     #[test]
