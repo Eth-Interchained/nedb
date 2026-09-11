@@ -61,9 +61,14 @@ def check(name, cond, detail=""):
 # `miner` is absent on row 4 and explicitly null on row 5, so IS NULL and the
 # LIKE-over-null corner are both exercised.
 
+# `miner` is sparse on purpose (absent on row 4, explicitly null on row 5), and
+# `bonus` is sparse too (present ONLY on rows 1 and 2) so an ordering
+# comparison against a missing numeric field is directly assertable.
 ROWS = [
-    ("1", {"status": "open",    "miner": "Acme Pool", "fee": 10, "region": "eu-west"}),
-    ("2", {"status": "pending", "miner": "acme solo", "fee": 20, "region": "us-east"}),
+    ("1", {"status": "open",    "miner": "Acme Pool", "fee": 10, "region": "eu-west",
+           "bonus": 5}),
+    ("2", {"status": "pending", "miner": "acme solo", "fee": 20, "region": "us-east",
+           "bonus": 50}),
     ("3", {"status": "closed",  "miner": "Zenith",    "fee": 30, "region": "eu-north"}),
     ("4", {"status": "open",                          "fee": 40, "region": "us-west"}),
     ("5", {"status": "voided",  "miner": None,        "fee": 50, "region": "ap-south"}),
@@ -101,6 +106,33 @@ CASES = [
      'FROM jobs WHERE region LIKE "eu-%" OR NOT (fee < 50)',
      ["1", "3", "5"]),
     ("_id metadata",      'FROM jobs WHERE _id IN ("1","2")',                    ["1", "2"]),
+
+    # ── ordering comparisons against a MISSING or NULL field ────────────────
+    #
+    # The gap that let a real divergence through. The fixture has a sparse
+    # `miner` column (absent on row 4, explicitly null on row 5) but it was
+    # only ever exercised with LIKE and IS NULL — never with < <= > >=. The
+    # Rust engine's OrderedValue sorts Null below every number, so `<` and
+    # `<=` reported that a row with NO miner satisfied the comparison, while
+    # `>` and `>=` excluded it. The Python reference excluded it in all four.
+    #
+    # A sparse numeric column makes it directly assertable: `bonus` is present
+    # only on rows 1 and 2.
+    ("< skips a missing field",   "FROM jobs WHERE bonus < 100",        ["1", "2"]),
+    ("<= skips a missing field",  "FROM jobs WHERE bonus <= 100",       ["1", "2"]),
+    ("> skips a missing field",   "FROM jobs WHERE bonus > 0",          ["1", "2"]),
+    (">= skips a missing field",  "FROM jobs WHERE bonus >= 0",         ["1", "2"]),
+    ("BETWEEN skips it too",      "FROM jobs WHERE bonus BETWEEN 0 AND 100", ["1", "2"]),
+    # = and != still operate on null, matching the reference exactly: its
+    # None guard sits deliberately AFTER those two arms.
+    ("!= still matches a missing field",
+     "FROM jobs WHERE bonus != 5", ["2", "3", "4", "5"]),
+    ("= NULL matches absent and explicit null",
+     "FROM jobs WHERE bonus = NULL", ["3", "4", "5"]),
+    ("ordering on a sparse string column",
+     'FROM jobs WHERE miner > "A"', ["1", "2", "3"]),
+    ("ordering on a sparse string column, other direction",
+     'FROM jobs WHERE miner < "zzz"', ["1", "2", "3"]),
 ]
 
 # Queries that MUST be rejected. Each one previously either parsed into a
@@ -220,7 +252,8 @@ if nedb.__has_native__:
             except Exception as e:                              # noqa: BLE001
                 check(f"parity: {name}", False, f"raised {type(e).__name__}: {e}")
                 continue
-            check(f"parity: {name}", a == b, f"python {a} != rust {b}")
+            check(f"parity: {name}", a == b,
+                  "" if a == b else f"python {a} vs rust {b}")
 
         native_results = True
         del core

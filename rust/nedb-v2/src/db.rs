@@ -866,6 +866,77 @@ impl Db {
             .collect()
     }
 
+    /// Candidate nodes whose `field` falls in the given range, via the sorted
+    /// index. `None` when no index covers (coll, field) — the caller must then
+    /// fall back to a scan.
+    ///
+    /// Returns CURRENT versions only (the index drops a superseded hash on
+    /// overwrite), so this must not be used to serve an `AS OF` query.
+    pub fn range_scan(
+        &self,
+        coll: &str,
+        field: &str,
+        low: Option<&Value>,
+        high: Option<&Value>,
+        low_incl: bool,
+        high_incl: bool,
+    ) -> Option<Vec<Node>> {
+        if !self.sorted_indexes.has(coll, field) {
+            return None;
+        }
+        Some(
+            self.sorted_indexes
+                .range(coll, field, low, high, low_incl, high_incl)
+                .into_iter()
+                .filter_map(|h| self.objects.read(&h).ok())
+                .collect(),
+        )
+    }
+
+    /// Candidate nodes whose `field` equals any of `values` — the indexed path
+    /// for `=` and for `IN (...)`. `None` when no index covers the field.
+    pub fn index_lookup(&self, coll: &str, field: &str, values: &[Value]) -> Option<Vec<Node>> {
+        if !self.sorted_indexes.has(coll, field) {
+            return None;
+        }
+        // A value may legitimately appear in several arms of an IN list, and a
+        // hash must not be returned twice.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = vec![];
+        for v in values {
+            for h in self.sorted_indexes.exact(coll, field, v) {
+                if seen.insert(h.clone()) {
+                    if let Ok(node) = self.objects.read(&h) {
+                        out.push(node);
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// How many rows an indexed range covers, without reading any of them.
+    /// `None` when no index covers the field.
+    pub fn range_cardinality(
+        &self,
+        coll: &str,
+        field: &str,
+        low: Option<&Value>,
+        high: Option<&Value>,
+        low_incl: bool,
+        high_incl: bool,
+    ) -> Option<usize> {
+        if !self.sorted_indexes.has(coll, field) {
+            return None;
+        }
+        Some(self.sorted_indexes.range_len(coll, field, low, high, low_incl, high_incl))
+    }
+
+    /// True when a sorted index covers (coll, field).
+    pub fn has_sorted_index(&self, coll: &str, field: &str) -> bool {
+        self.sorted_indexes.has(coll, field)
+    }
+
     /// ORDER BY field ASC LIMIT n — uses sorted index if available, else falls back to full scan.
     pub fn order_by_asc(&self, coll: &str, field: &str, limit: usize) -> Vec<Node> {
         if self.sorted_indexes.has(coll, field) {
