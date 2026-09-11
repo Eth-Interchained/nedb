@@ -383,23 +383,41 @@ if nedb.__has_native__:
             (SPREAD, False, "FROM t WHERE fee >= 9 ORDER BY fee OFFSET 1"),
         ]
 
-        def norm(rows):
+        def norm(rows, nql=""):
             """Compare on sorted key/value pairs.
 
             The engines legitimately differ on incidental metadata (the Rust
             core injects _hash/_seq/_coll), so compare the fields the QUERY is
             about: everything not prefixed with `_`, plus `_id`.
+
+            ROW ORDER is only compared when the query ASKED for an order. A
+            result set with no ORDER BY is unordered by definition — NQL makes
+            no promise there, and the two engines legitimately arrive at
+            different orders (`FROM t AS OF 2` returned the same two rows as
+            `[keep, a]` from Python and `[a, keep]` from Rust).
+
+            Comparing those as ordered lists made this harness assert a
+            guarantee the engines do not give, which is a FLAKY TEST: it passed
+            locally and failed in CI on identical data. A flaky parity gate is
+            worse than none, because the next real divergence gets dismissed as
+            "just the flaky one".
             """
             out = []
             for r in rows:
                 keep = {k: v for k, v in r.items()
                         if not k.startswith("_") or k == "_id"}
                 out.append(tuple(sorted((k, str(v)) for k, v in keep.items())))
-            return out
+            # Ordering is part of the assertion only when the query requested
+            # it. GROUP BY is included: both engines document a deterministic
+            # group order, so a difference there IS a divergence.
+            up = nql.upper()
+            if "ORDER BY" in up or "GROUP BY" in up:
+                return out
+            return sorted(out)
 
         for rows, valid, nql in CASES:
-            a = norm(py_mk(rows, valid=valid)(nql))
-            b = norm(rust_mk(rows, valid=valid)(nql))
+            a = norm(py_mk(rows, valid=valid)(nql), nql)
+            b = norm(rust_mk(rows, valid=valid)(nql), nql)
             check(f"parity: {nql}", a == b,
                   "" if a == b else f"\n      python {a}\n      rust   {b}")
 
@@ -459,7 +477,7 @@ if nedb.__has_native__:
         pq, rq = py_delete_case(), rust_delete_case()
         for nql in ["FROM t", "FROM t AS OF 0", "FROM t AS OF 1",
                     "FROM t AS OF 2", "FROM t AS OF 3"]:
-            a, b = norm(pq(nql)), norm(rq(nql))
+            a, b = norm(pq(nql), nql), norm(rq(nql), nql)
             check(f"parity after a delete: {nql}", a == b,
                   "" if a == b else f"\n      python {a}\n      rust   {b}")
 

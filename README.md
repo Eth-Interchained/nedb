@@ -264,30 +264,64 @@ SQL `UPDATE`, the prior value is still readable at its original sequence.
 NEDB adds **tamper-evident causal provenance to a database you already have**, in one line, without
 rip-and-replace. Five adapters, one surface:
 
+**One flag. No table list, no registration, no per-write calls.**
+
 ```python
-from nedb import wrap_redis, wrap_sqlite, wrap_mysql, wrap_mongo, wrap_postgresql
+from nedb import wrap_postgresql
+import psycopg2
 
-r = wrap_redis(redis.Redis())        # or wrap_sqlite(sqlite3.connect("app.db")), ...
-r.nedb.register("driver:*", "driver")   # teach NEDB the host's shape
-r.nedb.backfill()                       # import what is already there
-r.nedb.shadow_writes = True             # every future write is chained
+conn = wrap_postgresql(psycopg2.connect("dbname=app"), db_name="app")
+conn.nedb.shadow_writes = True          # ← that is the whole setup
 
-r.set("driver:d1", json.dumps({"name": "Bob", "status": "active"}))
+# Your app runs UNCHANGED.
+cur = conn.cursor()
+cur.execute("INSERT INTO drivers (name, status) VALUES (%s, %s)", ("Bob", "active"))
+cur.execute("UPDATE drivers SET status = %s WHERE name = %s", ("off", "Bob"))
+conn.commit()
 
-r.nedb.query('FROM driver WHERE status = "active"')   # NQL over your Redis data
-r.nedb.query('FROM driver AS OF 41')                  # what it looked like at seq 41
-r.nedb.verify()                                       # True — BLAKE2b chain intact
+conn.nedb.query('FROM drivers WHERE status = "off"')   # NQL over your Postgres data
+conn.nedb.query('FROM drivers AS OF 0')                # → status "active", the prior value
+conn.nedb.verify()                                     # True — BLAKE2b chain intact
 ```
+
+Setting the flag reads the host's own catalogue and mirrors **every table**, with its
+real primary key. Coverage is **opt-out**, because opt-in auditing has a worse failure
+mode than none: three tables registered out of twelve looks exactly like a complete
+audit trail until the day you need it.
+
+```python
+conn.nedb.exclude = {"sessions", "audit_log_*"}        # tables to leave alone
+conn.nedb.exclude_columns = {"password_hash", "ssn"}   # columns that must NEVER be mirrored
+assert not conn.nedb.unmirrored_tables                 # a real check, not a hope
+```
+
+`exclude_columns` is the one setting that is about correctness rather than convenience.
+**NEDB cannot forget** — that is the product, and it is exactly wrong for a secret or for
+a row somebody has a right to erase. Nothing is excluded by default; guessing which of
+your columns are sensitive would be its own silent wrong answer.
 
 | wrapper | host | shadowing |
 |---|---|---|
-| `wrap_redis` | `redis.Redis` / compatible | automatic — every write command intercepted |
-| `wrap_sqlite` | `sqlite3.Connection` | automatic — `execute()` intercepted post-write |
+| `wrap_redis` | `redis.Redis` / compatible | **automatic** — every write command intercepted |
+| `wrap_sqlite` | `sqlite3.Connection` | **automatic** — `conn.execute`, `cursor.execute`, `executemany` |
+| `wrap_postgresql` | DB-API 2.0 (psycopg2, psycopg 3) | **automatic** — every cursor write, via `RETURNING` |
 | `wrap_mysql` | DB-API 2.0 (mysql-connector, PyMySQL) | explicit `shadow_row()` |
 | `wrap_mongo` | `pymongo.MongoClient` | explicit `shadow_row()` |
-| `wrap_postgresql` | DB-API 2.0 (psycopg2, psycopg 3) | explicit `shadow_row()` |
 
 **NEDB never writes into the host database's namespace.** Shadow data lives only in the NEDB engine.
+
+### The limit, stated plainly
+
+Interception sees writes made **through this connection**. Your production Postgres is
+also written by `psql`, cron jobs, migration tools, and other services — and none of
+those pass through here. For whole-database coverage independent of the client, the right
+mechanism is Postgres **logical replication** (a replication slot decoded with the
+built-in `pgoutput`), which observes every committed change whatever made it. That needs
+`wal_level = logical` and a replication role, and it is not implemented yet.
+
+So this covers your application's writes completely, and it does not pretend to cover
+writes it cannot see. A write to a table that could not be mirrored lands in
+`nedb.unmirrored_tables` rather than vanishing.
 
 Three backends behind the same surface, selected by `backend="auto"`: **nedbd over HTTP** (`nedbd_url=`),
 **embedded v2/v3 DAG** (the Rust core, in-process, no server — `dag_path=` for a durable store,
