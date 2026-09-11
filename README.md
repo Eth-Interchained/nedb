@@ -26,6 +26,78 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
+## New in 3.3.0 — the query language grew up
+
+`WHERE` was six operators wide (`= != > < >= <=`) joined by an implicit `AND`.
+It now takes a full boolean expression, in **both** engines, and the clauses
+around it run in SQL's order.
+
+```sql
+FROM jobs
+WHERE (status IN ("open", "pending") OR fee > 100)
+  AND miner IS NOT NULL
+  AND NOT (region LIKE "eu-%")
+GROUP BY region SUM fee
+HAVING sum_fee > 10000
+ORDER BY sum_fee DESC
+LIMIT 20 OFFSET 40
+```
+
+| added | |
+| --- | --- |
+| `IN (…)` / `NOT IN (…)` | set membership |
+| `BETWEEN a AND b` / `NOT BETWEEN` | inclusive both ends, as in SQL |
+| `LIKE` / `NOT LIKE` / `ILIKE` | `%` any run, `_` any one char |
+| `IS NULL` / `IS NOT NULL` | matches absent **and** explicitly-null |
+| `AND` / `OR` / `NOT` / `(…)` | `AND` binds tighter; parens nest to any depth |
+| `OFFSET n` | pagination; pairs with `LIMIT` |
+| `ORDER BY a, b DESC` | multi-key, per-key direction |
+| `HAVING <predicate>` | filters the aggregated rows |
+| `COUNT` / `SUM f` / `AVG f` / `MIN f` / `MAX f` | whole-result aggregate, one row |
+
+**Indexed range scans.** `=`, `IN`, `BETWEEN` and the inequalities are served
+from a sorted index when one covers the field — a point lookup on 20,000 rows
+goes from 137 ms to 0.01 ms, a 1%-selective `BETWEEN` from 186 ms to 1.1 ms.
+See [**Indexes**](#indexes) for the measured table and the three cases that
+deliberately decline the index.
+
+**Nine silent defects fixed.** None of them crashed; they all returned a
+confident wrong answer with HTTP 200. The worst:
+
+- `GROUP BY status MAX fee` aggregated the *group* field, not the target —
+  answering `1.0` where the real maxima were 40 and 30.
+- `LIMIT 2 GROUP BY status COUNT` truncated the aggregate's **input**, so
+  twelve rows across three statuses reported counts summing to 2.
+- `ORDER BY count DESC` on grouped rows sorted the raw documents on a field
+  that only exists after grouping — silently inert.
+- `FROM jobs OFFSET 2` and a misspelled `ORDRE BY fee` were silently **dropped**
+  and a different query answered. Unknown clauses are now a parse error.
+- `SUM` ran through `f64`, losing integer precision above 2^53 — a real problem
+  for satoshi amounts and block heights. Integer inputs now stay in `i64`.
+- An ordering comparison against a missing field was true in the Rust engine
+  (`WHERE fee < 5` returned rows with no `fee` at all) and false in the Python
+  reference. Now false in both, matching SQL.
+- A field named like a keyword (`count`, `min`, `value`, `status`) was
+  unaddressable, because both lexers canonicalised case at field positions.
+
+**Compatibility.** Verified by building a `nedbd` from the released v3.2.2 tag
+and diffing every answer: **40 of 45 legacy queries byte-identical, zero
+regressions.** The differences are the three bug fixes above, each documented
+in `tests/test_backcompat.py`. `scripts/compare_engine_answers.py` reproduces
+the comparison against any released binary.
+
+**The DAG is untouched.** `tests/test_dag_preserved.py` runs the entire new
+query surface against a live chain and asserts head, seq and `verify()` are
+unchanged afterwards — and that `verify()` still returns *false* when the log
+is tampered with. Reads are reads.
+
+**Cross-engine parity is now gated.** Nothing previously checked that the
+Python reference and the Rust core agreed, which is how they had drifted apart
+in five places. Two suites now run the same battery through both and assert
+identical answers.
+
+---
+
 ## New in 3.2.0 — wrap the databases you already run
 
 NEDB adds **tamper-evident causal provenance to a database you already have**, in one line, without
