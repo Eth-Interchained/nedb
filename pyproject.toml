@@ -10,11 +10,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nedb-engine"
-version = "3.3.1"
+version = "4.0.0"
 description = "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable) with durable AOF persistence and a server daemon (nedbd)."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { text = "BUSL-1.1" }
 authors = [{ name = "Eth-Interchained" }]
 keywords = ["database", "embedded", "mvcc", "time-travel", "versioning",
             "compression", "dedup", "graph", "search", "redis", "git", "persistence", "server"]
