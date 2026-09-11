@@ -548,14 +548,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Smoke test
+      # Was an IMPORT CHECK. The package shipped to PyPI on every tag without
+      # a single request ever being made against a server, which is how a
+      # `get()` that could not fetch any id containing a double quote — and
+      # returned None, meaning "no such document", for a document that exists —
+      # shipped unnoticed. This runs the real suite against a live nedbd.
+      - name: Verify against a live nedbd
         run: |
           pip install httpx
-          python3 -c "
-          import sys; sys.path.insert(0, 'client/python')
-          from nedb_client import NedbClient, NedbError
-          print('nedb_client import OK:', NedbClient(url='http://127.0.0.1:7070', db='test'))
-          "
+          python3 tests/test_client_package.py
       - name: Build
         run: |
           pip install --upgrade build twine
@@ -579,6 +580,9 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Build TypeScript
         run: |
           cd client/node
@@ -588,6 +592,13 @@ jobs:
           cp dist/index.js dist/index.esm.js
           sed -i 's/^"use strict";//' dist/index.esm.js
           echo "Build complete:"; ls -lh dist/
+      # Was ONLY the build above — "it compiles" was the entire gate, so a
+      # client that abandoned response bodies (leaking a socket per call on a
+      # documented resilient path) and could not reach an id containing a slash
+      # shipped clean. This exercises dist/index.js, the artifact that actually
+      # gets published, against a live nedbd.
+      - name: Verify dist/ against a live nedbd
+        run: node client/node/test/client.test.mjs
       - name: Publish to npm
         if: startsWith(github.ref, 'refs/tags/')
         env:

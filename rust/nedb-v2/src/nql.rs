@@ -1164,7 +1164,10 @@ fn node_contains_text(node: &Node, text: &str) -> bool {
     s.contains(&text.to_lowercase())
 }
 
-fn node_to_json(node: &Node) -> Value {
+/// A node as a flat query row: data fields at the top level plus the `_`-prefixed
+/// metadata. Public so the HTTP single-row GET returns the SAME shape a query row
+/// has — one definition, so the two surfaces cannot drift apart.
+pub fn node_to_json(node: &Node) -> Value {
     let mut obj = if let Value::Object(m) = &node.data {
         m.clone()
     } else {
