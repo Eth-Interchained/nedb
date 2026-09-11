@@ -106,8 +106,11 @@ CASES = [
 # Queries that MUST be rejected. Each one previously either parsed into a
 # different query (Rust) or is genuinely malformed.
 REJECT = [
-    "FROM jobs OFFSET 2",                    # unimplemented clause, silently skipped before
     "FROM jobs ORDRE BY fee",                # typo, silently skipped before
+    "FROM jobs LIMIT",                       # missing count
+    "FROM jobs OFFSET",                      # missing count
+    "FROM jobs ORDER BY",                    # missing sort key
+    "FROM jobs HAVING count > 1",            # HAVING with no aggregate
     "FROM jobs SELECT fee",                  # wrong dialect
     "FROM jobs WHERE fee > 3 JUNK",          # trailing garbage
     "FROM jobs WHERE fee >",                 # missing value
