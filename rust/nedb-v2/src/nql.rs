@@ -861,6 +861,27 @@ fn regex_match(value: &str, pattern: &str, ci: bool) -> bool {
     }
 }
 
+/// Public aliases so the SQL `SELECT` engine matches patterns with EXACTLY
+/// the same code NQL does.
+///
+/// Two implementations of `LIKE` or of the regex subset would be two chances
+/// for the SQL surface and the NQL surface to disagree about the same
+/// operator on the same data — and a filter that disagrees with itself is the
+/// silent-wrong-row class this engine keeps having to remove.
+pub fn regex_match_pub(value: &str, pattern: &str, ci: bool) -> bool {
+    regex_match(value, pattern, ci)
+}
+
+/// The first unsupported regex metacharacter, or `None`. See `Pred::Regex`.
+pub fn unsupported_regex_char_pub(pattern: &str) -> Option<char> {
+    unsupported_regex_char(pattern)
+}
+
+/// SQL `LIKE` matching — `%` any run, `_` exactly one char.
+pub fn like_match_pub(value: &str, pattern: &str, ci: bool) -> bool {
+    like_match(value, pattern, ci)
+}
+
 /// Evaluate a predicate against anything that can resolve a field name.
 ///
 /// Generic over the row source so ONE implementation serves both `WHERE`

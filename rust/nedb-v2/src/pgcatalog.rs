@@ -159,6 +159,12 @@ fn columns_of(db: Option<&Arc<Db>>, coll: &str) -> Vec<(String, i32)> {
 
 /// The Postgres type name for an OID we hand out — the `data_type` a client
 /// reads in `information_schema.columns`.
+/// Public alias so `format_type()` in the SQL engine names a type the same
+/// way `information_schema.columns` does.
+pub fn type_name_pub(oid: i32) -> &'static str {
+    type_name(oid)
+}
+
 fn type_name(oid: i32) -> &'static str {
     match oid {
         16 => "boolean",
