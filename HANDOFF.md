@@ -36,6 +36,7 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #117 | **execution plan + `EXPLAIN` + the row budget** | the engine can say why it ran a query that way; `LIMIT` stopped materialising whole joins |
 | #118 | **ambiguous bindings refused; duplicate output names fixed** | two wrong-answer surfaces closed before any further optimiser work |
 | #119 | **conservative predicate pushdown, with recorded refusals** | a selective filter no longer waits for the whole join |
+| #120 | **physical `Filter`-in-`Join`** | `WHERE ... LIMIT n` stops early; `ON` and `WHERE` stay logically distinct |
 
 ### The two engines, and which one to trust
 
@@ -119,6 +120,7 @@ Both were caught again this session, and both are cheap to check for:
 | bindings + duplicate names | 6 | same suite; duplicate names verified positionally |
 | plan topology | 6 | structural, not rendered text |
 | **pushdown differential** | 6 | on vs off, x both join strategies |
+| **fusion differential** | 9 | fused vs unfused, x both join strategies |
 | psql introspection | 44 | drives the **real `psql` binary** |
 | `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
@@ -291,27 +293,52 @@ Measured: `join + selective pred` at 8000x1500 went 8774 -> 118ms on the
 nested loop and 27.1 -> 8.0ms on the hash join. `join + broad pred` barely
 moved, which is correct — it keeps 85% of the rows.
 
-**The next item.** Correct result first, faster execution second; never invert
-that.
+**Done in #120** — physical `Filter`-in-`Join`.
 
-* **Physical `Filter`-in-`Join` execution** — but do NOT erase the logical
-  distinction between an `ON` predicate and a post-join `WHERE` predicate, even
-  when one loop evaluates both. That distinction is semantic law. The physical
-  join carries `join_predicate`, `post_join_filter` and `row_budget`, and
-  evaluates: candidate pair -> `ON` -> NULL synthesis if the outer join
-  requires it -> post-join filter -> count toward budget. That yields the
-  win without turning `WHERE` into `ON`, and it is what lets the row budget
-  apply to filtered joins.
-* **A streaming `Resolver`.** The join is no longer the bottleneck — an owned
-  `Vec<Value>` forces full materialisation before early termination can
-  exploit anything. Do not reach for a large async abstraction: the smallest
-  iterator-shaped interface permitting *next row* and *stop early*. Then prove
-  `LIMIT 20` does not load 8000 source rows to return 20.
+The `WHERE` clause is evaluated inside the final join's loop rather than as a
+separate pass. It is a PHYSICAL change only, and one rule keeps it that way:
+
+> Whether a row counts as MATCHED is decided by `ON` alone.
+
+That is semantic law, not a preference. An `ON` predicate and a post-join
+`WHERE` predicate mean different things:
+
+```sql
+LEFT JOIN ... ON a.k = b.k AND b.tag = 'q'     -- keeps every left row
+LEFT JOIN ... ON a.k = b.k WHERE b.tag = 'q'   -- discards the outer rows
+```
+
+If the filter were allowed to influence `matched`, a left row whose only
+partner fails the filter would be NULL-extended — and `WHERE b.tag IS NULL`
+would then ACCEPT that synthesised row, inventing output the unfused pipeline
+never produces. Same trap as the pushdown mistake, in a different place.
+Evaluation order is fixed: candidate pair -> `ON` -> NULL synthesis if the
+outer join requires it -> post-join filter -> count toward the row budget.
+
+The plan reports the fused filter as its own number
+(`post-join filter removed N`) rather than folding it into the join's row
+count, so the two remain distinguishable in `EXPLAIN`.
+
+The payoff: a `WHERE` no longer disqualifies the row budget. Measured by
+`examples/fusebench` at 8000x1500 returning 20 rows — nested 4657 -> 34.2ms
+(136x), hash 19.9 -> 11.2ms (1.8x).
+
+**Read that hash number as a signal, not a disappointment.** The hash gain
+SHRINKS with size (2.7x -> 3.2x -> 1.8x) because at that shape the hash path
+is dominated by materialising relations, not probing them. Stopping the probe
+early cannot recover time already spent cloning 9500 rows.
+
+**The next item, and the measurement above is the argument for it.**
+
+* **A streaming `Resolver`.** The contract hands back an owned `Vec<Value>`,
+  so every execution materialises whole relations before any work. Do NOT
+  reach for a large async abstraction: the smallest iterator-shaped interface
+  permitting *next row* and *stop early*. Then prove `LIMIT 20` does not load
+  8000 source rows to return 20.
 * **Skew benchmark, then derive the hash crossover from it.**
   `AUTO_HASH_MIN_PAIRS = 64` is a guess. Measure uniform-unique, moderate
   duplicates, a single hot key, all-same-key, and coercion-heavy
-  numeric/string keys — the threshold must come from the ugly shapes, not just
-  the friendly ones.
+  numeric/string keys — the threshold must come from the ugly shapes.
 
 Then **subqueries**, one semantic class at a time, each with its own
 regression corpus: scalar uncorrelated, `IN (SELECT ...)`, `EXISTS`,

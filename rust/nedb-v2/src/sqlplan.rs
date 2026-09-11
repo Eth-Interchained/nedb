@@ -74,6 +74,15 @@ pub enum Stage {
         out_rows: usize,
         /// The join stopped early because the row budget was already met.
         early_stopped: bool,
+        /// Rows this join produced and then discarded because the `WHERE`
+        /// clause was evaluated inside it. `None` means the filter ran as a
+        /// separate stage.
+        ///
+        /// Reported separately from the join's own row count precisely so the
+        /// two stay distinguishable: an `ON` predicate and a post-join
+        /// `WHERE` predicate mean different things, and the plan should not
+        /// blur them just because one loop evaluates both.
+        post_filter_removed: Option<usize>,
     },
     /// A `WHERE` clause was applied.
     Filter { in_rows: usize, out_rows: usize },
@@ -317,6 +326,7 @@ fn render_node(n: &PlanTree, depth: usize, out: &mut Vec<String>) {
             right_rows,
             out_rows,
             early_stopped,
+            post_filter_removed,
         } => {
             let k = match keys {
                 0 => "no equality key".to_string(),
@@ -324,9 +334,13 @@ fn render_node(n: &PlanTree, depth: usize, out: &mut Vec<String>) {
                 n => format!("{n} hash keys"),
             };
             let stop = if *early_stopped { ", stopped early" } else { "" };
+            let filt = match post_filter_removed {
+                Some(n) => format!(", post-join filter removed {n}"),
+                None => String::new(),
+            };
             format!(
                 "{arrow}{strategy} {} Join on {} \
-                 ({k}, left={left_rows}, right={right_rows}{stop}) \
+                 ({k}, left={left_rows}, right={right_rows}{stop}{filt}) \
                  (actual rows={out_rows})",
                 kind_name(*kind),
                 named(table, binding)
@@ -444,6 +458,7 @@ mod tests {
             right_rows: 500,
             out_rows: 1922,
             early_stopped: false,
+            post_filter_removed: None,
         });
         let r = p.render();
         assert!(r[0].contains("Hash Join"), "{:?}", r[0]);
@@ -466,6 +481,7 @@ mod tests {
             right_rows: 500,
             out_rows: 2500,
             early_stopped: false,
+            post_filter_removed: None,
         });
         let r = p.render();
         assert!(r[0].contains("Nested Loop"));
@@ -485,6 +501,7 @@ mod tests {
             right_rows: 500,
             out_rows: 20,
             early_stopped: true,
+            post_filter_removed: None,
         });
         p.budget = Some(20);
         let r = p.render();
@@ -520,6 +537,7 @@ mod tests {
             right_rows: 5,
             out_rows: 7,
             early_stopped: false,
+            post_filter_removed: None,
         });
         let r = p.render();
         assert!(r[0].contains("Hash Join"), "{r:?}");
@@ -546,6 +564,7 @@ mod tests {
             right_rows: 1,
             out_rows: 1,
             early_stopped: false,
+            post_filter_removed: None,
         }
     }
 
@@ -675,6 +694,7 @@ mod tests {
                 right_rows: 1,
                 out_rows: 1,
                 early_stopped: false,
+            post_filter_removed: None,
             });
         }
         assert_eq!(p.joins().len(), 2);
