@@ -46,7 +46,12 @@ and asserts exit 0. Two exit 1 on a fresh Postgres too (`\\dx+`, `\\dRp+`:
 psql's own "Did not find any ..." when a `+` listing is empty) and are
 asserted as exactly that, not skipped.
 
-What is still refused, by name: `GROUP BY` on the catalogue path.
+`GROUP BY`, `HAVING` and `array_agg(x ORDER BY y)` landed with SQLAlchemy's
+reflection, which is built on all three. What remains refused, by name: set
+operations and window functions on the user-collection path, and a derived
+table in `FROM` unless it is the `count(*)` shape every ORM writes for
+`.count()` — which is rewritten to a flat count only when the two counts must
+provably agree.
 
 Run: python3 tests/test_psql_introspection.py
 """
@@ -340,18 +345,69 @@ def main():
 
         # And the BOUNDARY, asserted rather than implied. A user table on its
         # own stays on the NQL path, which has the index pushdown, AS OF and
-        # TRACE — and which has no table aliases. Routing every query through
-        # the nested-loop engine to gain aliases would trade a real planner
-        # for a cosmetic feature, so the limit is deliberate.
+        # TRACE. Routing every query through the nested-loop engine would trade
+        # a real planner for a cosmetic feature, so the limit is deliberate.
         check("a plain user-collection query still works (the NQL path)",
               sorted(q("SELECT status FROM orders")) == [("open",), ("paid",)])
+
+        # ── qualifiers and aliases on the NQL path ──────────────────────────
+        # This block used to assert that an alias was REFUSED. It is now
+        # handled, and the reason matters: NQL looks a field up FLAT, so
+        # `WHERE orders.status = 'paid'` asked for a field literally named
+        # "orders.status", found none, and returned ZERO ROWS — silently. Every
+        # ORM qualifies its predicates, so every filtered query answered empty
+        # and read exactly like "you have no data".
+        check("a QUALIFIED column in WHERE finds its field (was: silently zero rows)",
+              q("SELECT _id FROM orders WHERE orders.status = 'paid'") == [("1",)],
+              str(q("SELECT _id FROM orders WHERE orders.status = 'paid'")))
+        check("a table ALIAS works as a qualifier",
+              q("SELECT o.status FROM orders o WHERE o.total > 100") == [("paid",)],
+              str(q("SELECT o.status FROM orders o WHERE o.total > 100")))
+        check("`AS alias` works too",
+              q("SELECT o.status FROM orders AS o WHERE o.total > 100") == [("paid",)])
+        check("a qualified ORDER BY sorts on the field",
+              q("SELECT orders.total FROM orders ORDER BY orders.total DESC")
+              == [(120,), (40,)])
+        # A dot inside a LITERAL is data, not a qualifier.
+        check("a dot inside a string literal is left alone",
+              q("SELECT _id FROM orders WHERE status = 'pa.id'") == [])
+        # A qualifier naming neither the collection nor its alias is an ERROR.
+        # Stripping it would answer from the one relation that IS present —
+        # a different wrong answer in the same empty-looking clothes.
         try:
-            q("SELECT t.status FROM orders t")
-            check("a user table ALIAS is refused, not silently mishandled",
-                  False, "it answered — the NQL path gained aliases?")
+            q("SELECT _id FROM orders WHERE nosuch.status = 'paid'")
+            check("an unknown qualifier is refused, not answered from the wrong relation",
+                  False, "it answered")
         except Exception as e:                                      # noqa: BLE001
-            check("a user table ALIAS is refused, not silently mishandled",
-                  "unexpected" in str(e).lower(), str(e).strip()[:100])
+            check("an unknown qualifier is refused, not answered from the wrong relation",
+                  "no table or alias named" in str(e), str(e).strip()[:110])
+
+        # ── what an ORM actually emits ──────────────────────────────────────
+        # A grouped query with a mixed select list, and `.count()`'s derived
+        # table. Both were refused until the select list was parsed item by
+        # item and the aggregate was placed where NQL wants it.
+        check("a grouped query with a MIXED select list works",
+              sorted(q("SELECT orders.status, count(*) AS n FROM orders "
+                       "GROUP BY orders.status")) == [("open", 1), ("paid", 1)],
+              str(q("SELECT orders.status, count(*) AS n FROM orders GROUP BY orders.status")))
+        check("a named aggregate rides along with count",
+              sorted(q("SELECT status, count(*) AS n, sum(total) AS t FROM orders "
+                       "GROUP BY status")) == [("open", 1, 40), ("paid", 1, 120)],
+              str(q("SELECT status, count(*) AS n, sum(total) AS t FROM orders GROUP BY status")))
+        check("count(*) over a derived table is flattened (every ORM's .count())",
+              q("SELECT count(*) AS count_1 FROM "
+                "(SELECT orders._id FROM orders WHERE orders.status = 'paid') AS anon_1")
+              == [(1,)],
+              str(q("SELECT count(*) AS count_1 FROM (SELECT orders._id FROM orders "
+                    "WHERE orders.status = 'paid') AS anon_1")))
+        # ...but only when the two counts MUST agree. A LIMIT inside would make
+        # them different numbers, so it is refused rather than flattened.
+        try:
+            q("SELECT count(*) FROM (SELECT _id FROM orders LIMIT 1) AS a")
+            check("a derived table whose count would DIFFER is refused", False, "it answered")
+        except Exception as e:                                      # noqa: BLE001
+            check("a derived table whose count would DIFFER is refused",
+                  "subqueries in FROM" in str(e), str(e).strip()[:110])
 
         # The engine refuses rather than guessing — asserted through the wire,
         # because an error that never reaches the client is not a boundary.

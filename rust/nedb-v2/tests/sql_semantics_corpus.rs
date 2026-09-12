@@ -984,10 +984,96 @@ fn star_column_order_follows_the_document() {
 // Explicit refusals — an honest error beats a plausible answer
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `GROUP BY` and `HAVING`, across every join strategy.
+///
+/// These two were in the refusal list above until SQLAlchemy's reflection
+/// turned out to be built on both — `get_columns`, `get_pk_constraint` and
+/// `get_indexes` each send one or the other, so without them no Python ORM
+/// could describe a table at all.
+///
+/// They belong in the CORPUS rather than in a unit test because grouping runs
+/// after the join, and `run_all_strategies` is what proves the hash path and
+/// the nested loop feed it the same rows. A grouped answer that depended on
+/// which join strategy the planner chose would be the worst possible bug in
+/// this engine, and nothing else in the suite would catch it.
+#[test]
+fn grouping_reduces_each_group_and_agrees_across_strategies() {
+    // emp: dept_id 10 twice (100, 200), 20 once (150), 4 once (125), and one
+    // NULL (175). NULLs form their OWN group — GROUP BY treats them as equal
+    // even though `NULL = NULL` is unknown — so five rows become four groups.
+    let (names, rows) = run_all_strategies(
+        "SELECT dept_id, count(*) AS n, sum(salary) AS total \
+         FROM emp GROUP BY dept_id ORDER BY n DESC, dept_id");
+    assert_eq!(names, ["dept_id", "n", "total"]);
+    assert_eq!(rows.len(), 4, "four distinct dept_id values including NULL: {rows:?}");
+    assert_eq!(rows[0]["dept_id"], json!(10), "the only group with two rows sorts first");
+    assert_eq!(rows[0]["n"], json!(2));
+    assert_eq!(rows[0]["total"], json!(300));
+    // The NULL group is present and counted, not dropped.
+    let null_group = rows.iter().find(|r| r["dept_id"].is_null())
+        .expect("the NULL dept_id forms its own group");
+    assert_eq!(null_group["n"], json!(1));
+    assert_eq!(null_group["total"], json!(175));
+
+    // HAVING filters GROUPS, after the aggregates are reduced — which is what
+    // makes it different from WHERE rather than a synonym for it.
+    let (_, rows) = run_all_strategies(
+        "SELECT dept_id, count(*) AS n FROM emp GROUP BY dept_id HAVING count(*) > 1");
+    assert_eq!(rows.len(), 1, "only dept_id 10 has more than one row: {rows:?}");
+    assert_eq!(rows[0]["dept_id"], json!(10));
+
+    // WHERE filters ROWS first, so the groups it leaves behind are different.
+    let (_, rows) = run_all_strategies(
+        "SELECT dept_id, count(*) AS n FROM emp WHERE salary > 130 GROUP BY dept_id \
+         ORDER BY dept_id");
+    assert_eq!(rows.len(), 3, "dept 10 (200), dept 20 (150), NULL (175): {rows:?}");
+
+    // Grouping over a JOIN: the group key comes from one relation and the
+    // aggregate from the other, so this only answers correctly if both join
+    // strategies hand grouping the same rows.
+    let (_, rows) = run_all_strategies(
+        "SELECT d.dname, count(*) AS n FROM emp e JOIN dept d ON e.dept_id = d.id \
+         GROUP BY d.dname ORDER BY d.dname");
+    assert_eq!(rows.len(), 3, "eng (2), legal (1), ops (1): {rows:?}");
+    assert_eq!(rows[0]["dname"], json!("eng"));
+    assert_eq!(rows[0]["n"], json!(2));
+
+    // An aggregate with NO grouping is the single-group case, and over an
+    // empty input it must still produce ONE row — count 0, everything else
+    // NULL. Producing no row at all is the classic off-by-one here.
+    let (_, rows) = run_all_strategies(
+        "SELECT count(*) AS n, sum(salary) AS total FROM emp WHERE salary > 99999");
+    assert_eq!(rows.len(), 1, "one row, not zero: {rows:?}");
+    assert_eq!(rows[0]["n"], json!(0));
+    assert!(rows[0]["total"].is_null(), "sum over no rows is NULL, not 0");
+
+    // ...but a GROUPED query over an empty input produces NO rows, because
+    // there are no groups. The two are easy to conflate and mean the opposite.
+    let (_, rows) = run_all_strategies(
+        "SELECT dept_id, count(*) FROM emp WHERE salary > 99999 GROUP BY dept_id");
+    assert!(rows.is_empty(), "no groups means no rows: {rows:?}");
+
+    // `array_agg(x ORDER BY y)` — the aggregate's OWN ordering, which is the
+    // whole point of it in SQLAlchemy's primary-key reflection: the array is
+    // the column list and its ORDER is the answer.
+    let (_, rows) = run_all_strategies(
+        "SELECT dept_id, array_agg(name ORDER BY salary DESC) AS who \
+         FROM emp GROUP BY dept_id HAVING count(*) > 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["who"], json!(["grace", "ada"]), "salary DESC: 200 then 100");
+
+    // A column that is neither a group key nor inside an aggregate has no
+    // single value for its group, and Postgres's own message is the one worth
+    // reproducing — picking an arbitrary row is how a grouped query returns a
+    // confidently wrong answer.
+    expect_refused("SELECT name, count(*) FROM emp GROUP BY dept_id",
+                   "must appear in the GROUP BY clause");
+}
+
 #[test]
 fn unsupported_constructs_are_refused_by_name() {
-    expect_refused("SELECT count(*) FROM emp GROUP BY dept_id", "GROUP BY");
-    expect_refused("SELECT 1 FROM emp HAVING 1 = 1", "HAVING");
+    expect_refused("SELECT 1 FROM emp HAVING 1 = 1", "HAVING needs a GROUP BY");
+    expect_refused("SELECT a, count(*) FROM emp GROUP BY ROLLUP (a)", "ROLLUP");
     expect_refused("SELECT DISTINCT ON (id) id FROM emp", "DISTINCT ON");
     expect_refused("SELECT 1 FROM emp e JOIN dept d USING (id)", "USING");
     expect_refused("SELECT 1 FROM emp e LEFT JOIN dept d", "ON clause");

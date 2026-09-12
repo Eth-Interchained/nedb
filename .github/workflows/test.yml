@@ -284,6 +284,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Node is here for the pgwire harness's node-pg leg. The engine ships to
+      # npm, so a Node client is part of the contract — and pinning the version
+      # beats relying on whatever the runner image happens to carry.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -383,6 +389,48 @@ jobs:
         run: |
           pip install 'psycopg[binary]' asyncpg
           python3 tests/test_pgwire_extended.py
+
+      # ── the client ecosystem, in one harness ────────────────────────────
+      #
+      # "psql works" is not "your framework works", and the gap is where the
+      # expensive defects live. Every one of these was invisible to psql:
+      #
+      #   * SQLAlchemy could not CONNECT — its dialect opens with
+      #     `select pg_catalog.version()`, which the endpoint refused, so no
+      #     SQLAlchemy application got past initialisation.
+      #   * a QUALIFIED column in WHERE returned ZERO ROWS, silently, because
+      #     NQL looks a field up flat and `orders.status` matched no field.
+      #     Every ORM qualifies its predicates, so every filtered query lied.
+      #   * asyncpg refused integer parameters against catalogue columns
+      #     client-side, because the server advertised text for pg_type.oid.
+      #
+      # Node is installed and `pg` with it, because the engine SHIPS to npm and
+      # inferring that the wire works from Node because it works from Python is
+      # exactly the inference this repo does not make.
+      #
+      # NEDB_REQUIRE_ALL=1 turns a missing driver from a skip into a FAILURE.
+      # Without it a dependency that quietly failed to install would leave a
+      # reduced suite reporting success — and a self-skipping test is
+      # indistinguishable from a passing one.
+      - name: Postgres endpoint — client ecosystem (asyncpg · SQLAlchemy · node-pg)
+        env:
+          NEDB_REQUIRE_ALL: "1"
+          NEDBD_BIN: rust/target/release/nedbd
+        run: |
+          pip install 'psycopg[binary]' asyncpg sqlalchemy psycopg2-binary
+          # --no-save leaves package.json and the lockfile untouched;
+          # --ignore-scripts stops a plain install from trying to build this
+          # repo's own native addon as a side effect of adding a test client.
+          #
+          # A failed install is ANNOTATED rather than left to surface as a bare
+          # exit code: the harness then reports "pg is not installed", which is
+          # true but describes the symptom instead of the cause, and the job
+          # log needs a scope the release token does not carry.
+          if ! npm install --no-save --ignore-scripts pg 2>/tmp/npm.err; then
+            echo "::error title=npm install pg failed::$(tr '\n' ' ' </tmp/npm.err | tail -c 400)"
+            exit 1
+          fi
+          python3 tests/pgwire_suite.py
 
       - name: Run daemon-backed suites
         env:

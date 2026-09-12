@@ -184,6 +184,10 @@ fn walk(e: &Expr, known: &[String], seen: &mut Vec<String>, why: &mut Option<&'s
                 walk(a, known, seen, why);
             }
         }
+        // An aggregate is reduced over a GROUP, so it has no value for the
+        // single row a pre-filter sees. Pushing one below the join would
+        // evaluate it against the wrong set of rows entirely.
+        Expr::Agg { .. } => *why = Some("contains an aggregate"),
         Expr::Case { operand, whens, else_ } => {
             if let Some(o) = operand {
                 walk(o, known, seen, why);

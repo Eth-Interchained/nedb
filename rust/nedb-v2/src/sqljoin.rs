@@ -286,6 +286,8 @@ fn walk(
                 walk(a, left, right, saw_left, saw_right, usable);
             }
         }
+        // An aggregate has no per-row value, so it can never be a hash key.
+        Expr::Agg { .. } => *usable = false,
         Expr::Case { operand, whens, else_ } => {
             if let Some(o) = operand {
                 walk(o, left, right, saw_left, saw_right, usable);
