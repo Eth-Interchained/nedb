@@ -33,6 +33,11 @@ vMAJOR.MINOR.PATCH (patch may be any integer, e.g. v2.4.468).
 Safety:
   * Never force-pushes master and never commits to master directly -- every
     change lands through a branch + PR + merge.
+  * The tag goes on the sha the MERGE API returned, never on a fresh read of
+    refs/heads/master -- and before the tag ref is created, the commit is
+    checked to actually declare TO. Idempotency does not help here: re-running
+    leaves an existing wrong tag in place, so the wrong tag has to be
+    prevented rather than repaired.
   * After bumping, asserts the load-bearing version fields (npm version, PyPI
     version, the rust workspace + nedb-engine engine crate, and each wrapper's
     nedb-engine path-dep) all equal TO -- catching a stranded straggler (the
@@ -44,7 +49,7 @@ Intended to be run through the `nedb-release` skill so the token is injected:
 
 (c) Interchained LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
 """
-import os, sys, re, json, time, subprocess, urllib.request, urllib.error
+import os, sys, re, json, time, base64, subprocess, urllib.request, urllib.error
 
 FLAGSHIP = "Eth-Interchained/nedb"
 # (fork repo, distro name) -- distro name == wrapper crate dir == submodule dir == npm/crate name
@@ -182,8 +187,12 @@ def open_and_merge_pr(repo, branch, title, body, method="squash"):
         if s == 200 and info.get("mergeable_state") == "dirty": sys.exit("!! PR #%d is dirty" % num)
         time.sleep(3)
     s, mr = api("PUT", "/repos/%s/pulls/%d/merge" % (repo, num), {"merge_method": method, "commit_title": "%s (#%d)" % (title, num)})
-    print("  merge #%d -> HTTP %d merged=%s" % (num, s, mr.get("merged")))
+    print("  merge #%d -> HTTP %d merged=%s sha=%s" % (num, s, mr.get("merged"), (mr.get("sha") or "")[:12]))
     if not (s == 200 and mr.get("merged")): sys.exit("!! merge failed: %s" % str(mr)[:160])
+    # The merge RESPONSE carries the merge commit sha, and it comes from the
+    # write path -- so it is the only answer that cannot be stale. Callers that
+    # need to act on "what is master now" must use this and never re-ask.
+    return mr.get("sha") or ""
 
 def release_fork(repo, distro, frm, to, vto):
     print("\n== fork %s (%s): %s -> %s ==" % (repo, distro, frm, to))
@@ -216,19 +225,72 @@ def release_flagship(frm, to, vto):
     assert_all_to(d, to)
     repoint_submodules(d)
     if git(d, "status", "--porcelain").stdout.strip() == "":
-        print("  flagship already at %s and submodules current -- no PR needed" % to); return
+        print("  flagship already at %s and submodules current -- no PR needed" % to); return ""
     print(scrub(git(d, "diff", "--stat", "HEAD").stdout))
     commit_push_branch(d, FLAGSHIP, "release/%s-flagship" % vto,
         "release: NEDB %s -- flagship bump + submodule repoint\n\nFlagship to %s; submodules repointed to the %s fork masters so all three\nproducts ship aligned on %s.\n\nCo-Authored-By: Vex (Interchained AI fleet) <vex@interchained.org>" % (to, to, to, vto))
-    open_and_merge_pr(FLAGSHIP, "release/%s-flagship" % vto, "release: NEDB %s tri-distribution" % vto,
+    return open_and_merge_pr(FLAGSHIP, "release/%s-flagship" % vto, "release: NEDB %s tri-distribution" % vto,
         "Flagship to **%s**; submodules repointed to the %s fork masters. Ships nedb-engine + crypto-database + aof-db aligned on **%s**." % (to, to, vto), method="merge")
 
-def tag_flagship(vto, to):
+def declared_version_at(sha):
+    """The version `rust/crates/nedb-py/pyproject.toml` declares AT one commit.
+
+    Read from the tree rather than the working copy, because the question being
+    asked is "what will CI build when it checks this sha out" -- and CI checks
+    out the tag, not this machine.
+    """
+    s, c = api("GET", "/repos/%s/contents/rust/crates/nedb-py/pyproject.toml?ref=%s" % (FLAGSHIP, sha))
+    if s != 200: return None
+    try: txt = base64.b64decode(c.get("content", "")).decode()
+    except Exception: return None
+    m = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', txt)
+    return m.group(1) if m else None
+
+def verify_tag_target(sha, to, vto):
+    """Why this commit may carry this version's name. Returns None, or refuses.
+
+    Pure and side-effect free ON PURPOSE: it is the whole safety property, so
+    it has to be testable without any code path that can create a tag. An
+    earlier version of the test drove `tag_flagship` directly and the "this
+    commit is fine" case sailed past the check and POSTed a real tag ref, which
+    fired the publish matrix on a junk version. A gate you cannot exercise
+    without arming it is not a gate.
+    """
+    if not sha: return "!! no commit to tag"
+    got = declared_version_at(sha)
+    if got is None:
+        return "!! cannot read rust/crates/nedb-py/pyproject.toml at %s -- refusing to tag blind" % sha[:12]
+    if got != to:
+        return ("!! REFUSING TO TAG: %s declares version %s, but this release is %s.\n"
+                "   Tagging it would publish %s under the name %s on npm/PyPI/crates.\n"
+                "   The bump commit is probably one commit ahead -- re-run once master settles."
+                % (sha[:12], got, to, got, vto))
+    return None
+
+def tag_flagship(vto, to, sha=""):
     s, _ = api("GET", "/repos/%s/git/ref/tags/%s" % (FLAGSHIP, vto))
     if s == 200:
         print("\n== tag %s already exists -- leaving it (CI not re-fired) ==" % vto); return
-    s, ref = api("GET", "/repos/%s/git/ref/heads/master" % FLAGSHIP)
-    sha = ref.get("object", {}).get("sha", "")
+    if sha:
+        # Handed down from the merge response. NEVER re-read refs/heads/master
+        # here: that read is served from a replica and is routinely one commit
+        # stale a second after a merge. It is how v4.3.0 and v4.3.1 were both
+        # tagged onto the PREVIOUS commit -- which still declared the OLD
+        # version -- so each tag fired CI and published the wrong number while
+        # reporting success. v4.1.1 and v4.2.0 are not evidence the read works;
+        # they are two coin flips that landed heads.
+        print("  tagging the merge commit reported by the merge API: %s" % sha[:12])
+    else:
+        s, ref = api("GET", "/repos/%s/git/ref/heads/master" % FLAGSHIP)
+        sha = ref.get("object", {}).get("sha", "")
+        print("  no merge sha (nothing to bump) -- falling back to refs/heads/master: %s" % sha[:12])
+    # The gate. A tag whose commit declares a different version publishes that
+    # other version under this name, on every registry, irreversibly. Refusing
+    # here costs a re-run; not refusing costs a version that can never be
+    # reused. Either answer to "which commit" is checked the same way.
+    bad = verify_tag_target(sha, to, vto)
+    if bad: sys.exit(bad)
+    print("  verified %s declares %s" % (sha[:12], to))
     msg = "NEDB %s -- aligned tri-distribution: nedb-engine + crypto-database + aof-db at one version across npm/PyPI/crates + macOS wheels. (c) Interchained LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)" % to
     s, to_obj = api("POST", "/repos/%s/git/tags" % FLAGSHIP, {"tag": vto, "message": msg, "object": sha, "type": "commit", "tagger": {"name": "Vex", "email": "vex@interchained.org"}})
     if s not in (200, 201): sys.exit("!! tag object failed HTTP %d %s" % (s, str(to_obj)[:160]))
@@ -247,8 +309,8 @@ def main():
     os.makedirs(WORK, exist_ok=True)
     for repo, distro in FORKS:
         release_fork(repo, distro, frm, to, vto)
-    release_flagship(frm, to, vto)
-    tag_flagship(vto, to)
+    sha = release_flagship(frm, to, vto)
+    tag_flagship(vto, to, sha)
     print("\nDONE %s -> %s" % (vfrm, vto))
 
 if __name__ == "__main__":
