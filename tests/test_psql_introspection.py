@@ -35,14 +35,18 @@ versions, and it is full of constructs nobody would write by hand
 (`OPERATOR(pg_catalog.~)`, `COLLATE pg_catalog."C"`, `E'\\n'`). So the binary
 runs, and its exit status and output are the verdict.
 
-# What is NOT supported, asserted as such
+# The whole `\\d` family
 
-`\\dp`, `\\dT` and `\\d <table>` need the `ARRAY(...)` constructor, subqueries,
-and regex groups. Each is refused with an error NAMING the construct — checked
-below, because the error a developer reads is part of the product. They were
-previously told "JOIN is not supported", which stopped being true the moment
-joins started working: a wrong explanation is worse than a blunt one, because
-it sends the reader to fix the wrong thing.
+`\\dp`, `\\dT` and `\\d <table>` used to be refused by name — they need the
+`ARRAY(...)` constructor, correlated subqueries, `EXISTS`, `= ANY(...)` and
+regex groups (`^(orders)$`). All of that now runs, along with `UNION ALL` over
+a derived table (`\\dd`), `LATERAL` (`\\dP+`), `IS DISTINCT FROM` (`\\dconfig`)
+and aggregates. So the suite drives EVERY psql 17 backslash-describe command
+and asserts exit 0. Two exit 1 on a fresh Postgres too (`\\dx+`, `\\dRp+`:
+psql's own "Did not find any ..." when a `+` listing is empty) and are
+asserted as exactly that, not skipped.
+
+What is still refused, by name: `GROUP BY` on the catalogue path.
 
 Run: python3 tests/test_psql_introspection.py
 """
@@ -210,24 +214,62 @@ def main():
             ok, out, err = run_psql(pg_port, cmd)
             check(f"psql {cmd} exits 0 — {why}", ok, err.strip()[:110])
 
-        # ── the boundaries, and the QUALITY of the refusal ──────────────────
-        section("what is refused, and whether the message is true")
+        # ── the three that used to be refused ───────────────────────────────
+        section(r"\dp, \dT and \d <table> — subqueries, ARRAY(), regex groups")
 
-        for cmd, needle in [
-            (r"\dp", "ARRAY"),
-            (r"\dT", "subquery"),
-            (r"\d orders", "regex"),
+        ok, out, err = run_psql(pg_port, r"\d orders")
+        check(r"psql \d orders exits 0 (regex ^(orders)$, three scalar subqueries)",
+              ok, err.strip()[:150])
+        check(r"\d orders lists the observed fields as columns",
+              "status" in out and "total" in out, out.strip()[:200])
+        check(r"\d orders types them the way the wire does (total is bigint)",
+              "bigint" in out, out.strip()[:200])
+        check(r"\d orders shows engine metadata columns too (_seq)",
+              "_seq" in out, out.strip()[:200])
+        # psql exits 1 for a relation it cannot find, on Postgres too — the
+        # point is that the message is psql's own, not an engine ERROR.
+        ok, out, err = run_psql(pg_port, r"\d nosuch")
+        check(r"\d nosuch is psql's own 'Did not find', not an engine error",
+              not ok and "Did not find any relation" in (out + err) and "ERROR" not in err,
+              (out + err).strip()[:150])
+
+        ok, out, err = run_psql(pg_port, r"\dp")
+        check(r"psql \dp exits 0 (two ARRAY(SELECT ...) columns, = ANY)", ok, err.strip()[:150])
+        check(r"\dp lists both tables with empty privileges",
+              "orders" in out and "drivers" in out and "(2 rows)" in out, out.strip()[:200])
+
+        ok, out, err = run_psql(pg_port, r"\dT")
+        check(r"psql \dT exits 0 (correlated subquery + NOT EXISTS)", ok, err.strip()[:150])
+        # Every type NEDB advertises lives in pg_catalog, which psql filters
+        # out — so the honest listing is empty, not a fabricated user type.
+        check(r"\dT lists no user-defined types", "(0 rows)" in out, out.strip()[:200])
+
+        # ── the whole describe family ───────────────────────────────────────
+        section("every psql 17 backslash-describe command exits 0")
+
+        for cmd in [
+            r"\d", r"\d+", r"\d+ orders", r"\dp orders", r"\dT+", r"\dd", r"\dD",
+            r"\ds", r"\dE", r"\dc", r"\dC", r"\do", r"\dO", r"\dL", r"\dy", r"\dF",
+            r"\dA", r"\db", r"\dl", r"\dP", r"\dP+", r"\dRp", r"\dRs", r"\drds",
+            r"\dX", r"\dt+", r"\df+", r"\l+", r"\dn+", r"\du+", r"\dconfig", r"\z",
+            r"\dS+", r"\dt public.*", r"\d *ord*", r"\dg+", r"\dD+", r"\des", r"\det",
+            r"\deu", r"\dew", r"\dL+", r"\dm+", r"\di+", r"\ds+", r"\dv+", r"\dy+",
+            r"\dX+", r"\dl+", r"\dA+", r"\dd+", r"\dFp", r"\dFd", r"\dFt",
+            r"\dAc", r"\dAf", r"\dAo", r"\dAp",
         ]:
             ok, out, err = run_psql(pg_port, cmd)
-            check(f"psql {cmd} is refused rather than answered wrongly", not ok,
-                  out.strip()[:100])
-            # The error a developer reads is part of the product. These were
-            # previously told "JOIN is not supported", which stopped being
-            # true the moment joins started working.
-            check(f"…and the error NAMES the real construct ({needle})",
-                  needle.lower() in err.lower(), err.strip()[:150])
-            check(f"…and no longer blames JOIN, which now works",
-                  "JOIN is not supported" not in err, err.strip()[:150])
+            check(f"psql {cmd} exits 0", ok, err.strip()[:120])
+
+        # psql itself exits 1 when a `+` listing finds nothing to describe —
+        # identical against a fresh Postgres. Asserted as psql's message, so a
+        # real error here could never hide behind "expected to fail".
+        for cmd, msg in [(r"\dx+", "Did not find any extensions"),
+                         (r"\dRp+", "Did not find any publications"),
+                         (r"\dF+", "Did not find any text search configurations")]:
+            ok, out, err = run_psql(pg_port, cmd)
+            check(f"psql {cmd} is psql's own empty-listing exit, not an engine error",
+                  not ok and msg in (out + err) and "ERROR" not in err,
+                  (out + err).strip()[:150])
 
         # ── the SQL features themselves, through a driver ───────────────────
         try:
@@ -316,7 +358,7 @@ def main():
         for sql, needle in [
             ("SELECT nosuchfn(1) FROM pg_class", "not implemented"),
             ("SELECT relname FROM pg_class ORDER BY 9", "out of range"),
-            ("SELECT relname FROM pg_class WHERE relname ~ 'a+b'", "does not implement"),
+            ("SELECT relname FROM pg_class WHERE relname ~ 'a{2}'", "interval"),
         ]:
             try:
                 q(sql)
