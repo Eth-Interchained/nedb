@@ -344,6 +344,26 @@ pub enum Expr {
     Index { expr: Box<Expr>, index: Box<Expr> },
     /// `ARRAY[a, b, c]` — an array literal.
     ArrayLit(Vec<Expr>),
+    /// An aggregate call: `count(*)`, `array_agg(x ORDER BY y)`,
+    /// `string_agg(DISTINCT s, ',')`.
+    ///
+    /// A variant of its own rather than a `Func` whose name happens to be in a
+    /// list. "Is this an aggregate?" was a string comparison repeated at five
+    /// sites — the select-list check, the pushdown walker, the join-key
+    /// walker, the folder and the evaluator — and five copies of one rule is
+    /// five chances to disagree about it. It is now a question about SHAPE.
+    ///
+    /// It also carries the two modifiers only an aggregate has, and which
+    /// SQLAlchemy's primary-key reflection depends on:
+    /// `array_agg(CAST(attname AS TEXT) ORDER BY ord)` is meaningless without
+    /// the ordering — the array IS the column list, in key order.
+    Agg {
+        name: String,
+        args: Vec<Expr>,
+        /// Sorts the rows of the GROUP before the values are collected.
+        order_by: Vec<OrderBy>,
+        distinct: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -439,6 +459,12 @@ pub struct Select {
     pub from: Option<TableRef>,
     pub joins: Vec<Join>,
     pub where_: Option<Expr>,
+    /// `GROUP BY` keys. Empty means "one group of everything" when the select
+    /// list aggregates, and no grouping at all when it does not.
+    pub group_by: Vec<Expr>,
+    /// `HAVING` — a predicate over each GROUP, evaluated after its aggregates
+    /// are reduced. Distinct from `WHERE`, which filters rows before grouping.
+    pub having: Option<Expr>,
     /// `ORDER BY` / `LIMIT` / `OFFSET`. On a compound query (`set_ops`
     /// non-empty) these apply to the COMBINED result, as SQL says, and every
     /// arm carries none of its own.
@@ -506,6 +532,16 @@ impl Select {
                         expr(a, out);
                     }
                 }
+                Expr::Agg { args, order_by, .. } => {
+                    for a in args {
+                        expr(a, out);
+                    }
+                    for ob in order_by {
+                        if let Some(e) = &ob.expr {
+                            expr(e, out);
+                        }
+                    }
+                }
                 Expr::Case { operand, whens, else_ } => {
                     if let Some(o) = operand {
                         expr(o, out);
@@ -542,6 +578,12 @@ impl Select {
         }
         if let Some(w) = &self.where_ {
             expr(w, out);
+        }
+        for g in &self.group_by {
+            expr(g, out);
+        }
+        if let Some(h) = &self.having {
+            expr(h, out);
         }
         for ob in &self.order_by {
             if let Some(e) = &ob.expr {
@@ -1093,7 +1135,11 @@ impl Parser {
         if matches!(self.peek(), Tok::Punct('(')) {
             self.pos += 1;
             let name = parts.pop().unwrap_or_default().to_lowercase();
+            let agg = is_aggregate(&name);
+            // `count(DISTINCT x)` — only legal on an aggregate.
+            let distinct = agg && self.eat_kw("DISTINCT");
             let mut args = vec![];
+            let mut order_by = vec![];
             if !self.eat_punct(')') {
                 loop {
                     // `count(*)`
@@ -1105,9 +1151,20 @@ impl Parser {
                     if self.eat_punct(',') {
                         continue;
                     }
+                    // `array_agg(x ORDER BY y DESC)` — the aggregate's own
+                    // ordering, INSIDE the call. Without it SQLAlchemy's
+                    // primary-key reflection does not parse.
+                    if agg && self.peek().is_kw("ORDER") {
+                        self.pos += 1;
+                        self.expect_kw("BY")?;
+                        order_by = self.parse_sort_list()?;
+                    }
                     self.expect_punct(')')?;
                     break;
                 }
+            }
+            if agg {
+                return Ok(Expr::Agg { name, args, order_by, distinct });
             }
             return Ok(Expr::Func { name, args });
         }
@@ -1290,48 +1347,57 @@ impl Parser {
         Ok(first)
     }
 
+    /// A comma-separated sort list — shared by the query tail and by an
+    /// aggregate's own `ORDER BY`, so the two cannot disagree about how a
+    /// sort key, a direction or a NULLS placement is spelled.
+    fn parse_sort_list(&mut self) -> Result<Vec<OrderBy>> {
+        let mut out = vec![];
+        loop {
+            // `ORDER BY 1` is an ORDINAL into the select list, not the
+            // literal 1. Reading it as a constant sorts every row equally
+            // and silently yields an unordered result.
+            let (ordinal, expr) = match self.peek().clone() {
+                Tok::Num(n)
+                    if n.fract() == 0.0
+                        && n >= 1.0
+                        && !matches!(self.peek_at(1), Tok::Op(_)) =>
+                {
+                    self.pos += 1;
+                    (Some(n as usize), None)
+                }
+                _ => (None, Some(self.parse_expr()?)),
+            };
+            let dir = if self.eat_kw("DESC") {
+                Dir::Desc
+            } else {
+                let _ = self.eat_kw("ASC");
+                Dir::Asc
+            };
+            // Postgres defaults NULLS LAST for ASC, NULLS FIRST for DESC.
+            let mut nulls_first = matches!(dir, Dir::Desc);
+            if self.eat_kw("NULLS") {
+                if self.eat_kw("FIRST") {
+                    nulls_first = true;
+                } else if self.eat_kw("LAST") {
+                    nulls_first = false;
+                } else {
+                    bail!("expected FIRST or LAST after NULLS, got {:?}", self.peek());
+                }
+            }
+            out.push(OrderBy { ordinal, expr, dir, nulls_first });
+            if self.eat_punct(',') {
+                continue;
+            }
+            break;
+        }
+        Ok(out)
+    }
+
     fn parse_query_tail(&mut self, sel: &mut Select) -> Result<()> {
         let mut order_by = vec![];
         if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
-            loop {
-                // `ORDER BY 1` is an ORDINAL into the select list, not the
-                // literal 1. Reading it as a constant sorts every row equally
-                // and silently yields an unordered result.
-                let (ordinal, expr) = match self.peek().clone() {
-                    Tok::Num(n)
-                        if n.fract() == 0.0
-                            && n >= 1.0
-                            && !matches!(self.peek_at(1), Tok::Op(_)) =>
-                    {
-                        self.pos += 1;
-                        (Some(n as usize), None)
-                    }
-                    _ => (None, Some(self.parse_expr()?)),
-                };
-                let dir = if self.eat_kw("DESC") {
-                    Dir::Desc
-                } else {
-                    let _ = self.eat_kw("ASC");
-                    Dir::Asc
-                };
-                // Postgres defaults NULLS LAST for ASC, NULLS FIRST for DESC.
-                let mut nulls_first = matches!(dir, Dir::Desc);
-                if self.eat_kw("NULLS") {
-                    if self.eat_kw("FIRST") {
-                        nulls_first = true;
-                    } else if self.eat_kw("LAST") {
-                        nulls_first = false;
-                    } else {
-                        bail!("expected FIRST or LAST after NULLS, got {:?}", self.peek());
-                    }
-                }
-                order_by.push(OrderBy { ordinal, expr, dir, nulls_first });
-                if self.eat_punct(',') {
-                    continue;
-                }
-                break;
-            }
+            order_by = self.parse_sort_list()?;
         }
 
         let mut limit = None;
@@ -1461,11 +1527,36 @@ impl Parser {
             None
         };
 
-        if self.peek().is_kw("GROUP") {
-            bail!("GROUP BY is not supported by this SELECT path");
+        let mut group_by = vec![];
+        if self.eat_kw("GROUP") {
+            self.expect_kw("BY")?;
+            if self.eat_kw("ALL") || self.eat_kw("DISTINCT") {
+                bail!("GROUP BY ALL / DISTINCT is not supported — list the keys");
+            }
+            loop {
+                if self.peek().is_kw("ROLLUP")
+                    || self.peek().is_kw("CUBE")
+                    || self.peek().is_kw("GROUPING")
+                {
+                    bail!("GROUP BY ROLLUP / CUBE / GROUPING SETS is not supported");
+                }
+                group_by.push(self.parse_expr()?);
+                if self.eat_punct(',') {
+                    continue;
+                }
+                break;
+            }
         }
-        if self.peek().is_kw("HAVING") {
-            bail!("HAVING is not supported by this SELECT path");
+
+        let having = if self.eat_kw("HAVING") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        if having.is_some() && group_by.is_empty() && !items.iter().any(|i| has_aggregate(&i.expr))
+        {
+            bail!("HAVING needs a GROUP BY or an aggregate — it filters groups, not rows; \
+                   use WHERE to filter rows");
         }
 
         Ok(Select {
@@ -1474,6 +1565,8 @@ impl Parser {
             from,
             joins,
             where_,
+            group_by,
+            having,
             order_by: vec![],
             limit: None,
             offset: None,
@@ -1981,6 +2074,18 @@ pub fn eval(e: &Expr, row: &Bound) -> Result<Value> {
         }
 
         Expr::Func { name, args } => eval_func(name, args, row)?,
+
+        // An aggregate has no value for a single row — it is reduced over a
+        // GROUP by the executor and replaced with a literal before the rest of
+        // the expression is evaluated. Reaching here means a grouped statement
+        // took an ungrouped path, which is a bug in this engine rather than in
+        // the query, so it says so instead of inventing a number.
+        Expr::Agg { name, .. } => bail!(
+            "{}() is an aggregate and has no value for one row — it is reduced \
+             over a GROUP. Reaching this point is an engine bug, not a problem \
+             with the query",
+            name
+        ),
     })
 }
 
@@ -2407,7 +2512,8 @@ fn is_aggregate(name: &str) -> bool {
 /// subquery, whose aggregates belong to the subquery?
 pub fn has_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::Func { name, args } => is_aggregate(name) || args.iter().any(has_aggregate),
+        Expr::Agg { .. } => true,
+        Expr::Func { args, .. } => args.iter().any(has_aggregate),
         Expr::Binary { left, right, .. } => has_aggregate(left) || has_aggregate(right),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
             has_aggregate(expr)
@@ -2427,9 +2533,51 @@ pub fn has_aggregate(e: &Expr) -> bool {
     }
 }
 
-/// Reduce one aggregate call over every row.
-fn aggregate(name: &str, args: &[Expr], rows: &[JoinedRow], ctx: EvalCtx) -> Result<Value> {
+/// Reduce one aggregate call over the rows of ONE group.
+///
+/// `order_by` sorts the group's rows before the values are collected, which is
+/// the whole point of `array_agg(col ORDER BY ord)`: the array is a column
+/// list and its ORDER is the answer. `distinct` de-duplicates the collected
+/// values, not the rows.
+fn aggregate(
+    name: &str,
+    args: &[Expr],
+    order_by: &[OrderBy],
+    distinct: bool,
+    rows: &[JoinedRow],
+    ctx: EvalCtx,
+) -> Result<Value> {
     let lname = name.to_lowercase();
+
+    // The aggregate's own ORDER BY. Keys are precomputed so the comparator
+    // cannot fail halfway through and leave a half-sorted group behind.
+    let ordered: Vec<JoinedRow> = if order_by.is_empty() {
+        rows.to_vec()
+    } else {
+        let mut keyed: Vec<(Vec<Value>, JoinedRow)> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let b = bind(r, ctx);
+            let mut key = vec![];
+            for ob in order_by {
+                // An ordinal inside an aggregate has no select list to index,
+                // so it is refused rather than silently ignored.
+                match (&ob.expr, ob.ordinal) {
+                    (Some(e), _) => key.push(eval(e, &b)?),
+                    (None, Some(n)) => bail!(
+                        "ORDER BY {} inside an aggregate refers to a select-list \
+                         position, which an aggregate does not have — name the \
+                         column instead", n
+                    ),
+                    (None, None) => key.push(Value::Null),
+                }
+            }
+            keyed.push((key, r.clone()));
+        }
+        keyed.sort_by(|a, b| sort_keys(&a.0, &b.0, order_by));
+        keyed.into_iter().map(|(_, r)| r).collect()
+    };
+    let rows: &[JoinedRow] = &ordered;
+
     // `count(*)` and a bare `count()` count rows; everything else evaluates
     // its first argument per row and skips NULLs, as SQL aggregates do.
     if lname == "count" && (args.is_empty() || matches!(args[0], Expr::Star)) {
@@ -2446,6 +2594,18 @@ fn aggregate(name: &str, args: &[Expr], rows: &[JoinedRow], ctx: EvalCtx) -> Res
             vals.push(v.clone());
         }
         all_vals.push(v);
+    }
+    if distinct {
+        let mut seen: Vec<String> = vec![];
+        vals.retain(|v| {
+            let k = format!("{:?}", v);
+            if seen.contains(&k) { false } else { seen.push(k); true }
+        });
+        let mut seen2: Vec<String> = vec![];
+        all_vals.retain(|v| {
+            let k = format!("{:?}", v);
+            if seen2.contains(&k) { false } else { seen2.push(k); true }
+        });
     }
     Ok(match lname.as_str() {
         "count" => from_f64(vals.len() as f64),
@@ -2517,15 +2677,27 @@ fn aggregate(name: &str, args: &[Expr], rows: &[JoinedRow], ctx: EvalCtx) -> Res
 /// A column outside an aggregate has no single value across the result set,
 /// and Postgres refuses it with the message reproduced here rather than
 /// picking a row arbitrarily.
-fn fold_aggregates(e: &Expr, rows: &[JoinedRow], ctx: EvalCtx) -> Result<Expr> {
+fn fold_aggregates(
+    e: &Expr,
+    rows: &[JoinedRow],
+    ctx: EvalCtx,
+    keys: &[Expr],
+) -> Result<Expr> {
+    let fold = |x: &Expr| fold_aggregates(x, rows, ctx, keys);
     Ok(match e {
-        Expr::Func { name, args } if is_aggregate(name) => {
-            Expr::Literal(aggregate(name, args, rows, ctx)?)
+        Expr::Agg { name, args, order_by, distinct } => {
+            Expr::Literal(aggregate(name, args, order_by, *distinct, rows, ctx)?)
         }
         Expr::Func { name, args } => Expr::Func {
             name: name.clone(),
-            args: args.iter().map(|a| fold_aggregates(a, rows, ctx)).collect::<Result<_>>()?,
+            args: args.iter().map(&fold).collect::<Result<_>>()?,
         },
+        // A GROUP BY key is constant within its group, so it is left alone and
+        // evaluated against any row of the group. A column that is NOT a key
+        // has no single value there, and Postgres's own message is the one
+        // worth reproducing — picking an arbitrary row instead is how a
+        // grouped query returns a confidently wrong answer.
+        Expr::Column { .. } if keys.iter().any(|k| k == e) => e.clone(),
         Expr::Column { qual, name } => bail!(
             "column \"{}{}\" must appear in the GROUP BY clause or be used in an \
              aggregate function",
@@ -2534,58 +2706,60 @@ fn fold_aggregates(e: &Expr, rows: &[JoinedRow], ctx: EvalCtx) -> Result<Expr> {
         ),
         Expr::Binary { op, left, right } => Expr::Binary {
             op: op.clone(),
-            left: Box::new(fold_aggregates(left, rows, ctx)?),
-            right: Box::new(fold_aggregates(right, rows, ctx)?),
+            left: Box::new(fold(left)?),
+            right: Box::new(fold(right)?),
         },
         Expr::Unary { op, expr } => Expr::Unary {
             op: op.clone(),
-            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            expr: Box::new(fold(expr)?),
         },
         Expr::Cast { expr, ty } => Expr::Cast {
-            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            expr: Box::new(fold(expr)?),
             ty: ty.clone(),
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
-            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            expr: Box::new(fold(expr)?),
             negated: *negated,
         },
         Expr::InList { expr, list, negated } => Expr::InList {
-            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
-            list: list.iter().map(|i| fold_aggregates(i, rows, ctx)).collect::<Result<_>>()?,
+            expr: Box::new(fold(expr)?),
+            list: list.iter().map(&fold).collect::<Result<_>>()?,
             negated: *negated,
         },
         Expr::Case { operand, whens, else_ } => Expr::Case {
             operand: match operand {
-                Some(o) => Some(Box::new(fold_aggregates(o, rows, ctx)?)),
+                Some(o) => Some(Box::new(fold(o)?)),
                 None => None,
             },
             whens: whens
                 .iter()
-                .map(|(c, t)| Ok((fold_aggregates(c, rows, ctx)?, fold_aggregates(t, rows, ctx)?)))
+                .map(|(c, t)| Ok((fold(c)?, fold(t)?)))
                 .collect::<Result<_>>()?,
             else_: match else_ {
-                Some(x) => Some(Box::new(fold_aggregates(x, rows, ctx)?)),
+                Some(x) => Some(Box::new(fold(x)?)),
                 None => None,
             },
         },
         Expr::Quantified { op, left, all, right } => Expr::Quantified {
             op: op.clone(),
-            left: Box::new(fold_aggregates(left, rows, ctx)?),
+            left: Box::new(fold(left)?),
             all: *all,
-            right: Box::new(fold_aggregates(right, rows, ctx)?),
+            right: Box::new(fold(right)?),
         },
         Expr::Index { expr, index } => Expr::Index {
-            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
-            index: Box::new(fold_aggregates(index, rows, ctx)?),
+            expr: Box::new(fold(expr)?),
+            index: Box::new(fold(index)?),
         },
         Expr::ArrayLit(items) => Expr::ArrayLit(
-            items.iter().map(|i| fold_aggregates(i, rows, ctx)).collect::<Result<_>>()?,
+            items.iter().map(&fold).collect::<Result<_>>()?,
         ),
         Expr::InSubquery { expr, query, negated } => Expr::InSubquery {
-            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            expr: Box::new(fold(expr)?),
             query: query.clone(),
             negated: *negated,
         },
+        // A bare `*` in a grouped select list is the same error as a bare
+        // column: it names every column, none of which is a key.
         Expr::Star | Expr::QualifiedStar(_) => {
             bail!("`*` cannot be mixed with an aggregate outside count(*)")
         }
@@ -2678,7 +2852,7 @@ fn bind<'a>(row: &'a JoinedRow, ctx: EvalCtx<'a>) -> Bound<'a> {
 fn derived_name(e: &Expr) -> String {
     match e {
         Expr::Column { name, .. } => name.clone(),
-        Expr::Func { name, .. } => name.clone(),
+        Expr::Func { name, .. } | Expr::Agg { name, .. } => name.clone(),
         Expr::Cast { expr, .. } => derived_name(expr),
         Expr::Case { .. } => "case".to_string(),
         Expr::ArrayQuery(_) | Expr::ArrayLit(_) => "array".to_string(),
@@ -3194,27 +3368,108 @@ fn execute_inner<'a>(
         plan.push(Stage::Filter { in_rows, out_rows: rows.len() });
     }
 
-    // ── 2b. aggregates ──────────────────────────────────────────────────────
-    // A select list with an aggregate and no GROUP BY collapses every row into
-    // ONE. `count(*)`, `string_agg(...)` and friends are what psql's
-    // publication and subscription queries write; each call is reduced over
-    // the rows first, then the remainder of the expression is evaluated with
-    // the reductions in place.
-    if sel.items.iter().any(|i| has_aggregate(&i.expr)) {
-        let mut cols: Vec<OutCol> = vec![];
-        let mut obj = Map::new();
-        let empty: JoinedRow = vec![];
-        for item in &sel.items {
-            let folded = fold_aggregates(&item.expr, &rows, ctx)?;
-            let name = item.alias.clone().unwrap_or_else(|| derived_name(&item.expr));
-            let key = unique_key(&cols, &name);
-            let v = eval(&folded, &bind(&empty, ctx))?;
-            obj.insert(key.clone(), v);
-            cols.push(OutCol { key, name });
+    // ── 2b. GROUP BY and aggregates ─────────────────────────────────────────
+    //
+    // One path serves both shapes, because an aggregate with no `GROUP BY` IS
+    // the single-group case — `SELECT count(*) FROM t` is one group holding
+    // every row. Writing them separately is how the two drift into disagreeing
+    // about an empty input: `count(*)` over no rows must be 0 for the whole
+    // table and must produce NO row at all per group when there are no groups.
+    //
+    // Each call is reduced over its group's rows first, then the remainder of
+    // the expression is evaluated with those reductions already in place — so
+    // `sum(total) / count(*)` is ordinary arithmetic over two literals by the
+    // time it is evaluated.
+    let grouping = !sel.group_by.is_empty();
+    let aggregating = grouping
+        || sel.items.iter().any(|i| has_aggregate(&i.expr))
+        || sel.having.as_ref().is_some_and(has_aggregate);
+    if aggregating {
+        // Partition. First-seen order is kept so a run is reproducible; SQL
+        // promises no group order without `ORDER BY`, and a HashMap's would
+        // change between runs of the same query on the same data.
+        let mut groups: Vec<(Vec<Value>, Vec<JoinedRow>)> = vec![];
+        if grouping {
+            for r in rows {
+                let b = bind(&r, ctx);
+                let mut key = Vec::with_capacity(sel.group_by.len());
+                for g in &sel.group_by {
+                    key.push(eval(g, &b)?);
+                }
+                match groups.iter_mut().find(|(k, _)| {
+                    k.len() == key.len()
+                        && k.iter().zip(&key).all(|(a, b)| {
+                            // NULLs group TOGETHER, which is what GROUP BY
+                            // does even though `NULL = NULL` is UNKNOWN.
+                            (a.is_null() && b.is_null())
+                                || matches!(cmp_values(a, b), Some(std::cmp::Ordering::Equal))
+                        })
+                }) {
+                    Some((_, bucket)) => bucket.push(r),
+                    None => groups.push((key, vec![r])),
+                }
+            }
+        } else {
+            // No GROUP BY: exactly one group, even when it is empty. That is
+            // what makes `count(*)` answer 0 rather than returning no row.
+            groups.push((vec![], rows));
         }
-        plan.notes.push(format!("Aggregate over {} rows -> 1 row", rows.len()));
-        plan.push(Stage::Project { columns: cols.len(), out_rows: 1 });
-        let projected = vec![(obj, empty)];
+
+        let n_groups = groups.len();
+        let mut cols: Vec<OutCol> = vec![];
+        let mut projected: Vec<(Map<String, Value>, JoinedRow)> = vec![];
+        let empty: JoinedRow = vec![];
+
+        for (gi, (_key, grows)) in groups.iter().enumerate() {
+            // Every non-aggregate expression left after folding is a GROUP BY
+            // key, which is constant across the group — so any row of it is
+            // the right scope, and the folder has already refused anything
+            // that is not.
+            let scope = grows.first().unwrap_or(&empty);
+
+            if let Some(h) = &sel.having {
+                let folded = fold_aggregates(h, grows, ctx, &sel.group_by)?;
+                if truthy(&eval(&folded, &bind(scope, ctx))?) != Some(true) {
+                    continue;
+                }
+            }
+
+            let mut obj = Map::new();
+            for item in &sel.items {
+                let folded = fold_aggregates(&item.expr, grows, ctx, &sel.group_by)?;
+                let v = eval(&folded, &bind(scope, ctx))?;
+                // Output columns are named once, from the first group.
+                if gi == 0 {
+                    let name = item.alias.clone().unwrap_or_else(|| derived_name(&item.expr));
+                    let key = unique_key(&cols, &name);
+                    obj.insert(key.clone(), v);
+                    cols.push(OutCol { key, name });
+                } else {
+                    let idx = obj.len();
+                    if let Some(c) = cols.get(idx) {
+                        obj.insert(c.key.clone(), v);
+                    }
+                }
+            }
+            projected.push((obj, scope.clone()));
+        }
+
+        plan.notes.push(if grouping {
+            format!(
+                "GroupAggregate on {} key(s): {} rows -> {} group(s){}",
+                sel.group_by.len(),
+                n_rows_before_group(&plan),
+                n_groups,
+                if sel.having.is_some() {
+                    format!(", HAVING kept {}", projected.len())
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            format!("Aggregate over {} row(s) -> 1 row", groups[0].1.len())
+        });
+        plan.push(Stage::Project { columns: cols.len(), out_rows: projected.len() });
         let out = finish(sel, &cols, projected, ctx, &mut plan)?;
         return Ok((cols, out, plan));
     }
@@ -3318,6 +3573,60 @@ fn execute_inner<'a>(
     Ok((cols, out, plan))
 }
 
+/// The row count the last stage reported, for the group note. Read back from
+/// the plan rather than tracked separately, so the number in the note and the
+/// number in the plan cannot disagree.
+fn n_rows_before_group(plan: &Plan) -> usize {
+    plan.stages
+        .iter()
+        .rev()
+        .find_map(|st| match st {
+            Stage::Filter { out_rows, .. } => Some(*out_rows),
+            Stage::Join { out_rows, .. } => Some(*out_rows),
+            Stage::Prefilter { out_rows, .. } => Some(*out_rows),
+            Stage::Scan { rows, .. } => Some(*rows),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// Compare two precomputed sort-key tuples under a sort list.
+///
+/// One comparator for the query's `ORDER BY` and for an aggregate's own, so
+/// `array_agg(x ORDER BY y DESC NULLS LAST)` and
+/// `SELECT ... ORDER BY y DESC NULLS LAST` cannot order the same values
+/// differently.
+fn sort_keys(a: &[Value], b: &[Value], order_by: &[OrderBy]) -> std::cmp::Ordering {
+    for (i, ob) in order_by.iter().enumerate() {
+        let (Some(x), Some(y)) = (a.get(i), b.get(i)) else { continue };
+        let ord = match (x.is_null(), y.is_null()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            // NULL placement is a direction-independent choice, so it is
+            // applied BEFORE the DESC reversal rather than being flipped by it.
+            (true, false) => {
+                return if ob.nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                return if ob.nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (false, false) => cmp_values(x, y).unwrap_or(std::cmp::Ordering::Equal),
+        };
+        let ord = if matches!(ob.dir, Dir::Desc) { ord.reverse() } else { ord };
+        if !ord.is_eq() {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// `ORDER BY`, then `OFFSET` / `LIMIT` — the tail every query shape shares.
 fn finish(
     sel: &Select,
@@ -3367,37 +3676,7 @@ fn finish(
             keyed.push((key, (obj, src)));
         }
 
-        keyed.sort_by(|a, b| {
-            for (i, ob) in sel.order_by.iter().enumerate() {
-                let (x, y) = (&a.0[i], &b.0[i]);
-                let ord = match (x.is_null(), y.is_null()) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    // NULL placement is a direction-independent choice, so it
-                    // is applied BEFORE the DESC reversal rather than being
-                    // flipped by it.
-                    (true, false) => {
-                        return if ob.nulls_first {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Greater
-                        }
-                    }
-                    (false, true) => {
-                        return if ob.nulls_first {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Less
-                        }
-                    }
-                    (false, false) => cmp_values(x, y).unwrap_or(std::cmp::Ordering::Equal),
-                };
-                let ord = if matches!(ob.dir, Dir::Desc) { ord.reverse() } else { ord };
-                if !ord.is_eq() {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        keyed.sort_by(|a, b| sort_keys(&a.0, &b.0, &sel.order_by));
 
         projected = keyed.into_iter().map(|(_, row)| row).collect();
         plan.push(Stage::Sort { keys: sel.order_by.len(), rows: projected.len() });
@@ -3885,6 +4164,29 @@ fn fetch(t: &TableRef, resolve: &Resolver, ctx: EvalCtx) -> Result<Box<dyn Relat
                 // unnest(NULL) is no rows.
                 _ => vec![],
             },
+            // `generate_subscripts(arr, 1)` — the 1-based positions of an
+            // array, which is how SQLAlchemy numbers the columns of a primary
+            // key. An empty or non-array argument yields no rows, as Postgres
+            // answers.
+            "generate_subscripts" => {
+                let dim = match args.get(1) {
+                    Some(e) => num(&eval(e, &scope)?).unwrap_or(1.0),
+                    None => 1.0,
+                };
+                match eval(args.first().ok_or_else(|| anyhow::anyhow!("generate_subscripts() needs an array"))?, &scope)? {
+                    // Only one dimension is representable here: a JSON array
+                    // is a list, not a matrix. Asking for dimension 2 is
+                    // therefore genuinely empty rather than an error.
+                    Value::Array(items) if dim == 1.0 => (1..=items.len())
+                        .map(|i| {
+                            let mut m = Map::new();
+                            m.insert(col(0, "generate_subscripts"), from_f64(i as f64));
+                            Value::Object(m)
+                        })
+                        .collect(),
+                    _ => vec![],
+                }
+            }
             // NEDB has no partitioning, so a partition tree is empty for every
             // relation — the truthful answer, and what lets `\dP+` run.
             "pg_partition_tree" | "pg_partition_ancestors" => vec![],
@@ -4406,13 +4708,56 @@ mod parser_tests {
         assert_eq!(parse("SELECT * FROM t").unwrap().items[0].expr, Expr::Star);
         assert_eq!(parse("SELECT c.* FROM t c").unwrap().items[0].expr,
                    Expr::QualifiedStar("c".into()));
+        // An aggregate is its OWN variant, not a Func whose name happens to
+        // be in a list — so "is this an aggregate?" is a question about shape.
         match &parse("SELECT count(*) FROM t").unwrap().items[0].expr {
-            Expr::Func { name, args } => {
+            Expr::Agg { name, args, order_by, distinct } => {
                 assert_eq!(name, "count");
                 assert_eq!(args, &vec![Expr::Star]);
+                assert!(order_by.is_empty());
+                assert!(!distinct);
             }
             other => panic!("{:?}", other),
         }
+        // ...while an ordinary call stays a Func.
+        assert!(matches!(
+            &parse("SELECT lower(s) FROM t").unwrap().items[0].expr,
+            Expr::Func { name, .. } if name == "lower"
+        ));
+    }
+
+    #[test]
+    fn an_aggregate_carries_its_own_DISTINCT_and_ORDER_BY() {
+        // `array_agg(CAST(attname AS TEXT) ORDER BY ord)` is how SQLAlchemy
+        // reflects a primary key: the array IS the column list and its ORDER
+        // is the answer, so the ordering cannot be dropped.
+        match &parse("SELECT array_agg(a.attname ORDER BY a.ord) FROM t a").unwrap().items[0].expr {
+            Expr::Agg { name, args, order_by, distinct } => {
+                assert_eq!(name, "array_agg");
+                assert_eq!(args.len(), 1);
+                assert_eq!(order_by.len(), 1);
+                assert!(matches!(order_by[0].dir, Dir::Asc));
+                assert!(!distinct);
+            }
+            other => panic!("{:?}", other),
+        }
+        // Direction, NULLS placement and multiple keys all parse the same way
+        // the query's own ORDER BY does — one shared sort-list parser.
+        match &parse("SELECT string_agg(DISTINCT s, ',' ORDER BY b DESC NULLS LAST, c) FROM t").unwrap().items[0].expr {
+            Expr::Agg { name, args, order_by, distinct } => {
+                assert_eq!(name, "string_agg");
+                assert_eq!(args.len(), 2, "the separator is an argument, not a sort key");
+                assert_eq!(order_by.len(), 2);
+                assert!(matches!(order_by[0].dir, Dir::Desc));
+                assert!(!order_by[0].nulls_first, "NULLS LAST overrides the DESC default");
+                assert!(matches!(order_by[1].dir, Dir::Asc));
+                assert!(distinct);
+            }
+            other => panic!("{:?}", other),
+        }
+        // DISTINCT is an aggregate-only modifier; on a plain call it is not
+        // consumed, so the call fails to parse rather than silently dropping it.
+        assert!(parse("SELECT lower(DISTINCT s) FROM t").is_err());
     }
 
     #[test]
@@ -4428,11 +4773,27 @@ mod parser_tests {
     }
 
     #[test]
-    fn unsupported_clauses_are_refused_by_name() {
+    fn GROUP_BY_and_HAVING_parse_and_what_remains_is_refused_by_name() {
+        // GROUP BY and HAVING used to be refused here. SQLAlchemy's column
+        // and index reflection are built on both, so they now parse.
+        let s = parse("SELECT a, count(*) FROM t GROUP BY a").unwrap();
+        assert_eq!(s.group_by, vec![Expr::Column { qual: None, name: "a".into() }]);
+        assert!(s.having.is_none());
+
+        let s = parse("SELECT a, b, count(*) FROM t GROUP BY a, b HAVING count(*) > 1").unwrap();
+        assert_eq!(s.group_by.len(), 2);
+        assert!(s.having.is_some());
+
+        // HAVING is a filter over GROUPS. With neither a GROUP BY nor an
+        // aggregate there are no groups to filter, and silently treating it
+        // as a WHERE would answer a different question than the one asked.
+        let e = parse("SELECT a FROM t HAVING a > 1").unwrap_err().to_string();
+        assert!(e.contains("HAVING needs a GROUP BY"), "{}", e);
+
         for (sql, needle) in [
-            ("SELECT a FROM t GROUP BY a", "GROUP BY"),
-            ("SELECT a FROM t HAVING count(*) > 1", "HAVING"),
             ("SELECT DISTINCT ON (a) a FROM t", "DISTINCT ON"),
+            ("SELECT a, count(*) FROM t GROUP BY ROLLUP (a)", "ROLLUP"),
+            ("SELECT a, count(*) FROM t GROUP BY CUBE (a)", "CUBE"),
         ] {
             let e = parse(sql).unwrap_err().to_string();
             assert!(e.contains(needle), "{} -> {}", sql, e);
