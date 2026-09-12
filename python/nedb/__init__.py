@@ -106,4 +106,4 @@ __all__ = [
     "verify_proof", "fold_head",
     "_native", "__has_native__",
 ]
-__version__ = "4.2.0"
+__version__ = "4.3.0"
