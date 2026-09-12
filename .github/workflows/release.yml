@@ -185,15 +185,7 @@ jobs:
       - name: Stage Python source + binary into maturin layout
         shell: bash
         run: |
-          rm -rf rust/crates/nedb-py/python
-          mkdir -p rust/crates/nedb-py/python
-          cp -r python/nedb rust/crates/nedb-py/python/nedb
-          # maturin cannot read a readme outside its project root, and the
-          # native wheels are uploaded first, so PyPI takes the whole
-          # release's description from them. Stage it or the project page is
-          # blank.
-          cp README.md rust/crates/nedb-py/README.md
-          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \; || true
+          bash scripts/stage_maturin.sh
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
           if ls rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null; then
             echo "nedbd-v2 binary confirmed in staging area"

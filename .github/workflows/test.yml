@@ -193,11 +193,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: Stage Python source into the maturin layout
-        run: |
-          rm -rf rust/crates/nedb-py/python
-          mkdir -p rust/crates/nedb-py/python
-          cp -r python/nedb rust/crates/nedb-py/python/nedb
+      - name: Stage Python source + README into the maturin layout
+        run: bash scripts/stage_maturin.sh
       - name: Build + install the native wheel
         run: |
           pip install --upgrade maturin
