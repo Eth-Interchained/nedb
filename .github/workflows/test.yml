@@ -421,7 +421,15 @@ jobs:
           # --no-save leaves package.json and the lockfile untouched;
           # --ignore-scripts stops a plain install from trying to build this
           # repo's own native addon as a side effect of adding a test client.
-          npm install --no-save --ignore-scripts pg
+          #
+          # A failed install is ANNOTATED rather than left to surface as a bare
+          # exit code: the harness then reports "pg is not installed", which is
+          # true but describes the symptom instead of the cause, and the job
+          # log needs a scope the release token does not carry.
+          if ! npm install --no-save --ignore-scripts pg 2>/tmp/npm.err; then
+            echo "::error title=npm install pg failed::$(tr '\n' ' ' </tmp/npm.err | tail -c 400)"
+            exit 1
+          fi
           python3 tests/pgwire_suite.py
 
       - name: Run daemon-backed suites

@@ -53,8 +53,11 @@ def run(fx, c):
         cwd=str(ROOT), capture_output=True, text=True, timeout=300,
     )
     if r.returncode != 0:
-        c.ok("the node runner exited cleanly", False,
-             (r.stderr or r.stdout).strip()[:300])
+        # Both streams, because a Node crash puts the stack on stderr while a
+        # module-resolution failure can land on stdout — and reporting only one
+        # of them is how a red check ends up saying nothing.
+        detail = ((r.stderr or "") + " | " + (r.stdout or "")).strip()
+        c.ok("the node runner exited cleanly", False, detail[:400])
         return
 
     saw_any = False

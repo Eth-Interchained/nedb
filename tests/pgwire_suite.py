@@ -60,6 +60,23 @@ import urllib.request
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 
+# GitHub surfaces `::error` lines as check-run ANNOTATIONS, which are readable
+# through the API without the `actions:read` scope a job log needs. That is not
+# a cosmetic difference: with only the log, a red check on this job says
+# "Process completed with exit code 1" and nothing else, and diagnosing it
+# means guessing. Every failure here is therefore also emitted as an
+# annotation, so the reason travels with the result.
+_GHA = os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def _annotate(level: str, title: str, message: str) -> None:
+    if not _GHA:
+        return
+    # Annotations are one line: newlines and the `::` delimiter are escaped
+    # rather than dropped, or a multi-line refusal would truncate to nothing.
+    flat = message.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+    print(f"::{level} title={title}::{flat}", flush=True)
+
 
 # ── the fixture ─────────────────────────────────────────────────────────────
 class PgFixture:
@@ -179,7 +196,7 @@ class Checks:
         self.failed: list[str] = []
         self.skipped: str | None = None
 
-    def skip(self, reason: str) -> None:
+    def skip(self, reason: str) -> None:                             # noqa: D401
         """Declare this suite unrunnable, with the reason.
 
         A suite that cannot run is NOT a suite that passed, and it is not a
@@ -199,6 +216,7 @@ class Checks:
         else:
             self.failed.append(f"{name}: {detail}")
             print(f"      FAIL  {name}  — {detail}")
+            _annotate("error", f"{self.label}: {name}", detail or "assertion failed")
 
     def raises(self, name, fn, needle):
         """Assert a refusal, and that its message NAMES the boundary.
@@ -301,6 +319,10 @@ def main() -> None:
                 if require_all:
                     failed.append(name)
                     print(f"  FAIL  {name:<14} {c.skipped} (NEDB_REQUIRE_ALL=1)")
+                    _annotate("error", f"{name} did not run",
+                              f"{c.skipped} — NEDB_REQUIRE_ALL=1 makes a skipped "
+                              f"driver a failure, because a self-skipping test is "
+                              f"indistinguishable from a passing one")
                 else:
                     skipped.append(name)
                     print(f"  skip  {name:<14} {c.skipped}")
@@ -316,7 +338,12 @@ def main() -> None:
           + (f", {len(skipped)} skipped" if skipped else ""))
     if failed:
         print("FAILED: " + ", ".join(failed))
+        _annotate("error", "pgwire drivers",
+                  "failed suites: " + ", ".join(failed))
         sys.exit(1)
+    _annotate("notice", "pgwire drivers",
+              f"{len(passed)} suites, {total_checks} checks passed"
+              + (f", skipped: {', '.join(skipped)}" if skipped else ""))
     if skipped and require_all:
         print("FAILED: suites skipped under NEDB_REQUIRE_ALL=1")
         sys.exit(1)
