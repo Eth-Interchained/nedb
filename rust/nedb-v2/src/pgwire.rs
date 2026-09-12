@@ -1240,6 +1240,67 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
             .to_string();
     }
 
+    // ── ORDER BY <ordinal> → ORDER BY <that select-list column> ─────────────
+    //
+    // SQL lets a sort key be a POSITION in the select list, and clients write
+    // it constantly — `ORDER BY 1, 2` is how psql's own catalogue queries sort,
+    // and node-postgres sent `GROUP BY status ORDER BY 1` in the very first
+    // run of the driver harness. NQL has no ordinals: it read the `1` as a
+    // literal and refused with "expected field name, got Num(1.0)".
+    //
+    // The projection is already parsed here, so the position resolves to a
+    // real field name. An ordinal past the end of the select list, or one used
+    // with `SELECT *` where there is no list to index, is refused with the
+    // reason — guessing a column would sort by something the query never named.
+    let tu_ord = tail.to_uppercase();
+    if let Some(ob_at) = find_kw(&tu_ord, "ORDER BY") {
+        let start = ob_at + "ORDER BY".len();
+        // The clause runs to the next one, or to the end of the tail.
+        let end = ["LIMIT", "OFFSET", "GROUP BY", "TRACE", "TRAVERSE", "SEARCH"]
+            .iter()
+            .filter_map(|k| find_kw(&tu_ord[start..], k).map(|at| start + at))
+            .min()
+            .unwrap_or(tail.len());
+        let mut keys = vec![];
+        for item in split_top_level(&tail[start..end], ',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let mut parts = item.split_whitespace();
+            let first = parts.next().unwrap_or("");
+            let rest: Vec<&str> = parts.collect();
+            match first.parse::<usize>() {
+                Ok(n) if n >= 1 => {
+                    let col = project.get(n - 1).ok_or_else(|| {
+                        if project.is_empty() {
+                            format!(
+                                "ORDER BY {} is a select-list POSITION, and `SELECT *` \
+                                 has no list to index — name the column instead", n)
+                        } else {
+                            format!(
+                                "ORDER BY {} is out of range: the select list has {} \
+                                 column(s)", n, project.len())
+                        }
+                    })?;
+                    keys.push(
+                        std::iter::once(col.src.as_str())
+                            .chain(rest.iter().copied())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+                // Not an ordinal — a named column, or `1 + 1`, which NQL will
+                // judge for itself.
+                _ => keys.push(item.to_string()),
+            }
+        }
+        tail = format!("{} ORDER BY {} {}", &tail[..ob_at], keys.join(", "), &tail[end..])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+
     // ── GROUP BY: refuse a bare column that SQL would refuse ─────────────────
     //
     // A grouped NQL row holds only the group key, `count` and the aggregate —
@@ -3636,6 +3697,46 @@ mod tests {
         let e = translate("SELECT status, total, count(*) FROM orders GROUP BY status")
             .unwrap_err();
         assert!(e.contains("must appear in the GROUP BY clause"), "{}", e);
+    }
+
+    #[test]
+    fn ORDER_BY_an_ordinal_resolves_to_that_select_list_column() {
+        // SQL lets a sort key be a POSITION, and clients write it constantly.
+        // NQL has no ordinals — it read the `1` as a literal and refused with
+        // "expected field name, got Num(1.0)". node-postgres sent
+        // `GROUP BY status ORDER BY 1` in the harness's first run.
+        assert_eq!(q("SELECT status, total FROM orders ORDER BY 1"),
+                   "FROM orders ORDER BY status");
+        assert_eq!(q("SELECT status, total FROM orders ORDER BY 2 DESC"),
+                   "FROM orders ORDER BY total DESC");
+        // Several keys, mixing ordinals with names, and a direction on each.
+        assert_eq!(q("SELECT status, total FROM orders ORDER BY 2 DESC, 1"),
+                   "FROM orders ORDER BY total DESC, status");
+        assert_eq!(q("SELECT status, total FROM orders ORDER BY 1, total DESC"),
+                   "FROM orders ORDER BY status, total DESC");
+        // An ordinal survives the GROUP BY splice, and resolves to the group
+        // key rather than to the literal 1 — which is the exact shape that
+        // failed in CI.
+        assert_eq!(q("SELECT status, count(*) AS n FROM orders GROUP BY status ORDER BY 1"),
+                   "FROM orders GROUP BY status COUNT ORDER BY status");
+        // An ordinal may name the AGGREGATE column too.
+        assert_eq!(q("SELECT status, count(*) AS n FROM orders GROUP BY status ORDER BY 2 DESC"),
+                   "FROM orders GROUP BY status COUNT ORDER BY count DESC");
+        // The clause boundary is respected: a following LIMIT is not swallowed
+        // into the sort list, and `LIMIT 1` is not mistaken for an ordinal.
+        assert_eq!(q("SELECT status, total FROM orders ORDER BY 2 LIMIT 1"),
+                   "FROM orders ORDER BY total LIMIT 1");
+        // A `1` anywhere else stays a literal.
+        assert_eq!(q("SELECT status FROM orders WHERE total > 1 ORDER BY 1"),
+                   "FROM orders WHERE total > 1 ORDER BY status");
+
+        // Out of range, and `SELECT *` where there is no list to index, are
+        // both refused with the reason — guessing a column would sort by
+        // something the query never named.
+        let e = translate("SELECT status FROM orders ORDER BY 4").unwrap_err();
+        assert!(e.contains("out of range") && e.contains("1 column"), "{}", e);
+        let e = translate("SELECT * FROM orders ORDER BY 1").unwrap_err();
+        assert!(e.contains("no list to index"), "{}", e);
     }
 
     #[test]
