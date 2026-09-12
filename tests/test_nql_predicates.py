@@ -165,6 +165,18 @@ CASES = [
                                      'FROM jobs WHERE nosuch !~ "x"',     []),
     ("a lone $ is an END ANCHOR, matching every non-null value",
                                      'FROM jobs WHERE miner ~ "$"',       ["1", "2", "3"]),
+    # The wider ERE subset, added for psql's `\d <table>` (`^(orders)$`).
+    # Groups, alternation, classes and quantifiers — identical algorithm in
+    # both engines, so identical answers on identical rows.
+    ("~ a group with anchors",       'FROM jobs WHERE miner ~ "^(Acme)$"',   []),
+    ("~ group + dot-star (\\d ord*)",  'FROM jobs WHERE miner ~ "^(Ac.*)$"',  ["1"]),
+    ("~ alternation",                'FROM jobs WHERE miner ~ "^(Acme|Zenith)"', ["1", "3"]),
+    ("~ plus is one-or-more",        'FROM jobs WHERE miner ~ "^Acm+e"',     ["1"]),
+    ("~ optional",                   'FROM jobs WHERE miner ~ "^Acmee?"',    ["1"]),
+    ("~ a character class",          'FROM jobs WHERE miner ~ "^[AZ]"',      ["1", "3"]),
+    ("~ a negated class",            'FROM jobs WHERE miner ~ "^[^AZ]"',     ["2"]),
+    ("~ an escaped dot is literal",  'FROM jobs WHERE miner ~ "acme\\.solo"', []),
+    ("~ an unescaped dot is any",    'FROM jobs WHERE miner ~ "acme.solo"',   ["2"]),
     ("~ composes with AND",
      'FROM jobs WHERE miner ~ "^Acme" AND fee > 5',                       ["1"]),
 ]
@@ -188,14 +200,15 @@ REJECT = [
     "FROM jobs WHERE fee NOT = 1",           # infix NOT before a comparison op
     "FROM jobs WHERE fee LIKE",              # missing pattern
     "FROM jobs GROUP BY status SUM",         # aggregate without a target field
-    # An unsupported regex metacharacter must be REFUSED, not approximated —
-    # in BOTH engines. Matching `a+b` loosely would silently include or
+    # An unsupported regex construct must be REFUSED, not approximated —
+    # in BOTH engines. Matching `a{2}` loosely would silently include or
     # exclude rows, and a wrong filter result looks exactly like a right one.
-    'FROM jobs WHERE miner ~ "a+b"',         # + not implemented
-    'FROM jobs WHERE miner ~ "a*b"',         # * not implemented
-    'FROM jobs WHERE miner ~ "[ab]"',        # character class not implemented
-    'FROM jobs WHERE miner ~ "(a|b)"',       # alternation not implemented
-    r'FROM jobs WHERE miner ~ "a\\.b"',        # escape not implemented
+    'FROM jobs WHERE miner ~ "a{2}"',        # interval not implemented
+    'FROM jobs WHERE miner ~ "[[:alpha:]]"', # POSIX class not implemented
+    # NQL strings keep backslashes RAW, so one backslash here is one in the pattern.
+    'FROM jobs WHERE miner ~ "(a)\\1"',        # back-reference not implemented
+    'FROM jobs WHERE miner ~ "\\d+"',          # shorthand class not implemented
+    'FROM jobs WHERE miner ~ "(ab"',         # unmatched paren
     "FROM jobs WHERE miner ~",               # missing pattern
 ]
 
