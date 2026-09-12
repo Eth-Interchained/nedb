@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "nedb-engine"
-version = "4.1.1"
+version = "4.2.0"
 description = "NEDB — versioned, self-compressing, time-traveling embedded database with Rust native core"
 # The NATIVE wheels are uploaded BEFORE the universal wheel, and PyPI takes a
 # release's description from the FIRST file uploaded. Without this the project
