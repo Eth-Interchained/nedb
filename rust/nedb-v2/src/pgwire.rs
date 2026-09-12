@@ -120,9 +120,23 @@
 //! must equal it; otherwise any connection is accepted.
 //!
 //! Still outside the boundary, and refused by name: SQL-level cursors
-//! (`DECLARE`/`FETCH`), `GROUP BY` on the catalogue path, and binary *result*
-//! format for a column whose stored values disagree about their type across
-//! documents.
+//! (`DECLARE`/`FETCH`), window functions, set operations on the
+//! user-collection path, and binary *result* format for a column whose stored
+//! values disagree about their type across documents.
+//!
+//! # What an ORM needs, and what it cost to learn
+//!
+//! Speaking psql is not speaking to a framework, and the difference was three
+//! defects deep. SQLAlchemy could not CONNECT (its dialect opens with
+//! `select pg_catalog.version()`, which a table of exact spellings missed); its
+//! reflection needed `GROUP BY` and `array_agg(x ORDER BY y)`; and a QUALIFIED
+//! column in a `WHERE` clause returned ZERO ROWS — silently — because NQL
+//! looks a field up flat and no document has a field named `orders.status`.
+//! Every ORM qualifies its predicates, so every filtered query lied.
+//!
+//! None of that was visible to psql, which is why
+//! `tests/pgwire_suite.py` drives asyncpg, SQLAlchemy and node-postgres
+//! against a live daemon on every push.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -322,6 +336,339 @@ fn normalise(sql: &str) -> String {
 /// regex so a quote inside a string cannot be mistaken for a delimiter: SQL
 /// escapes an embedded quote by doubling it (`'it''s'`), and that has to become
 /// a single character inside the NQL string rather than terminating it.
+/// Drop the table qualifier from every column reference in a clause tail.
+///
+/// # The silent wrong answer this removes
+///
+/// NQL has no notion of a qualifier: `field_value` looks a field up FLAT, in
+/// one map. So `WHERE orders.status = 'paid'` asked for a field literally
+/// named `orders.status`, no document had one, and the query returned ZERO
+/// ROWS — with no error and no warning, an empty result that reads exactly
+/// like "you have no paid orders".
+///
+/// Every ORM qualifies its predicates. SQLAlchemy emits
+/// `SELECT orders._id FROM orders WHERE orders.status = 'paid'` for the most
+/// ordinary filter there is, so EVERY filtered query answered empty, `.get(pk)`
+/// answered `None`, and `filter_by` answered nothing. The select list had
+/// always stripped qualifiers; the tail was "handed to the NQL parser
+/// unchanged", which is right for the clause GRAMMAR and wrong for a name NQL
+/// cannot interpret.
+///
+/// # Why a mismatched qualifier is an ERROR, not a strip
+///
+/// A qualifier naming something other than this statement's own collection
+/// means the query referenced a relation that is not in its FROM clause.
+/// Stripping it would answer with rows from the one relation that IS there —
+/// a different wrong answer wearing the same empty-looking clothes. Aliases
+/// are refused on this path already, so the collection's own name is the only
+/// qualifier that can be correct.
+///
+/// Runs BEFORE `sql_literals_to_nql`, so only SQL's single-quoted strings have
+/// to be skipped — the rewrite to NQL's double-quoted form has not happened
+/// yet, and a qualifier can never appear inside a literal.
+fn strip_column_qualifiers(
+    tail: &str,
+    coll: &str,
+    alias: Option<&str>,
+) -> Result<String, String> {
+    let bare = coll.rsplit('.').next().unwrap_or(coll);
+    let b: Vec<char> = tail.chars().collect();
+    let mut out = String::with_capacity(tail.len());
+    let mut i = 0usize;
+    let ident_start = |c: char| c.is_alphabetic() || c == '_';
+    let ident_char = |c: char| c.is_alphanumeric() || c == '_';
+
+    while i < b.len() {
+        // A single-quoted literal is copied through untouched.
+        if b[i] == '\'' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '\'' {
+                    // A doubled '' is one literal quote, not a close.
+                    if b.get(i + 1) == Some(&'\'') {
+                        out.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // A double-quoted run is copied through too. NQL reads double quotes
+        // as a STRING delimiter rather than an identifier one, so a SQL
+        // delimited identifier is a genuine divergence — but it already fails
+        // LOUDLY in the NQL parser ("expected field name, got Str"), and a
+        // loud failure is not this function's problem to solve quietly.
+        if b[i] == '"' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == '"' { i += 1; break; }
+                i += 1;
+            }
+            continue;
+        }
+        if !ident_start(b[i]) {
+            // A number like `1.5` starts with a digit, so it never enters the
+            // identifier branch and its dot is never touched.
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        while i < b.len() && ident_char(b[i]) {
+            i += 1;
+        }
+        let word: String = b[start..i].iter().collect();
+
+        // `qual.field` — a dot followed immediately by another identifier.
+        if b.get(i) == Some(&'.') && b.get(i + 1).is_some_and(|c| ident_start(*c)) {
+            let fstart = i + 1;
+            let mut j = fstart;
+            while j < b.len() && ident_char(b[j]) {
+                j += 1;
+            }
+            let field: String = b[fstart..j].iter().collect();
+            // A qualified FUNCTION call (`pg_catalog.something(`) is left
+            // exactly as written: this path does not implement functions at
+            // all, and NQL's own refusal names the function, which is more use
+            // to the reader than a claim about relations.
+            let is_call = b[j..].iter().find(|c| !c.is_whitespace()) == Some(&'(');
+            if is_call {
+                out.push_str(&word);
+                out.push('.');
+                out.push_str(&field);
+                i = j;
+                continue;
+            }
+            let matches_alias = alias.is_some_and(|a| word.eq_ignore_ascii_case(a));
+            if matches_alias || word.eq_ignore_ascii_case(bare) || word.eq_ignore_ascii_case(coll) {
+                out.push_str(&field);
+                i = j;
+                continue;
+            }
+            return Err(format!(
+                "no table or alias named {:?} in this query — this statement reads \
+                 {:?}{}, and a qualifier naming anything else would have to be \
+                 answered from a relation that is not in its FROM clause",
+                word,
+                bare,
+                alias.map(|a| format!(" (aliased {:?})", a)).unwrap_or_default()
+            ));
+        }
+        out.push_str(&word);
+    }
+    Ok(out)
+}
+
+/// Rewrite `SELECT count(*) FROM (<inner>) [AS] alias` into a flat count over
+/// the inner query's own collection and predicate — or `None` when the shapes
+/// do not permit it.
+///
+/// `None` is a REFUSAL, never a fallback: every caller reports the boundary
+/// rather than trying something else, because the alternative to an exact
+/// count is a wrong one.
+fn flatten_count_of_subquery(projection: &str, rest: &str) -> Option<String> {
+    // The outer select list must be nothing but `count(*)`, optionally
+    // aliased. Any other column would have to come from the derived table's
+    // output, which a flat count does not produce.
+    let (outer_expr, outer_alias) = split_output_alias(projection.trim());
+    let ou = outer_expr.to_uppercase().replace(' ', "");
+    if ou != "COUNT(*)" {
+        return None;
+    }
+
+    // Take the balanced parenthesised span, honouring literals so a `)` inside
+    // a string cannot close it early.
+    let b: Vec<char> = rest.chars().collect();
+    let mut depth = 0i32;
+    let mut in_s = false;
+    let mut end = None;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            '\'' => in_s = !in_s,
+            '(' if !in_s => depth += 1,
+            ')' if !in_s => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let inner = b[1..end].iter().collect::<String>().trim().to_string();
+
+    // Nothing may follow the derived table but its alias — a join or a second
+    // FROM item changes what is being counted.
+    let trailing = b[end + 1..].iter().collect::<String>();
+    let (_alias, after) = split_table_alias(trailing.trim());
+    if !after.trim().is_empty() {
+        return None;
+    }
+
+    let iu = inner.to_uppercase();
+    if !iu.starts_with("SELECT") {
+        return None;
+    }
+    // Each of these would make the inner row count differ from the flat one.
+    for kw in ["LIMIT", "OFFSET", "GROUP BY", "HAVING", "UNION", "INTERSECT", "EXCEPT", "JOIN"] {
+        if find_kw(&iu, kw).is_some() {
+            return None;
+        }
+    }
+    if find_kw(&iu, "DISTINCT").is_some() {
+        return None;
+    }
+    // An inner aggregate already reduced the rows to one.
+    let inner_from = find_kw(&iu, "FROM")?;
+    let inner_list = inner[..inner_from].to_uppercase();
+    for agg in ["COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "ARRAY_AGG(", "STRING_AGG("] {
+        if inner_list.contains(agg) {
+            return None;
+        }
+    }
+    // A nested derived table is not walked — one level is the claim.
+    let inner_rest = inner[inner_from + 4..].trim();
+    if inner_rest.starts_with('(') {
+        return None;
+    }
+
+    // `ORDER BY` cannot change a count, so it is dropped rather than refused.
+    let mut tail = inner_rest.to_string();
+    let tu = tail.to_uppercase();
+    if let Some(ob) = find_kw(&tu, "ORDER BY") {
+        tail = tail[..ob].trim_end().to_string();
+    }
+    Some(format!(
+        "SELECT count(*){} FROM {}",
+        outer_alias.map(|a| format!(" AS {}", a)).unwrap_or_default(),
+        tail
+    ))
+}
+
+/// Words that begin a clause and can therefore never be a bare table alias.
+///
+/// `AS` is absent on purpose: it introduces an alias, and `AS OF` is
+/// disambiguated by looking at the word after it.
+const CLAUSE_WORDS: &[&str] = &[
+    "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "FOR", "VALID",
+    "TRACE", "TRAVERSE", "SEARCH", "RETURNING", "UNION", "INTERSECT", "EXCEPT",
+    "JOIN", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "ON", "USING", "SET",
+];
+
+/// Take a table alias off the front of a clause tail: `FROM orders o WHERE …`.
+///
+/// Returns the alias and the rest of the tail. The alias is REMOVED because
+/// NQL has no table-alias syntax and would report an "unexpected token" on it
+/// — which is how `FROM orders o` used to fail. Removing it here and teaching
+/// `strip_column_qualifiers` to accept it is what makes `SELECT o.status FROM
+/// orders o` work at all.
+///
+/// `AS OF SYSTEM TIME` also starts with `AS`, so the word AFTER `AS` decides:
+/// `AS OF` is a time-travel clause, anything else is an alias.
+fn split_table_alias(tail: &str) -> (Option<String>, &str) {
+    let t = tail.trim_start();
+    let first_end = t.find(char::is_whitespace).unwrap_or(t.len());
+    let first = &t[..first_end];
+    let fu = first.to_uppercase();
+
+    if fu == "AS" {
+        let rest = t[first_end..].trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        if word.eq_ignore_ascii_case("OF") {
+            return (None, t); // `AS OF …`, not an alias
+        }
+        if word.is_empty() {
+            return (None, t);
+        }
+        return (Some(word.trim_matches('"').to_string()), rest[end..].trim_start());
+    }
+    if first.is_empty() || CLAUSE_WORDS.contains(&fu.as_str()) {
+        return (None, t);
+    }
+    // A bare identifier here can only be an alias — the collection name was
+    // already consumed by the caller.
+    if first.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '"') {
+        return (Some(first.trim_matches('"').to_string()), t[first_end..].trim_start());
+    }
+    (None, t)
+}
+
+/// Split on a delimiter that is at PAREN DEPTH ZERO and outside a literal.
+///
+/// `projection.split(',')` cuts `SUM(a, b)` in half; a select list is not a
+/// flat comma list once it can contain calls.
+fn split_top_level(s: &str, delim: char) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut in_s = false;
+    let mut in_d = false;
+    for c in s.chars() {
+        match c {
+            '\'' if !in_d => { in_s = !in_s; cur.push(c); }
+            '"' if !in_s => { in_d = !in_d; cur.push(c); }
+            '(' if !in_s && !in_d => { depth += 1; cur.push(c); }
+            ')' if !in_s && !in_d => { depth -= 1; cur.push(c); }
+            c if c == delim && depth == 0 && !in_s && !in_d => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Split `expr AS name` / `expr name` into the expression and its output name.
+///
+/// The alias is the name the CLIENT will look the column up by — SQLAlchemy
+/// reads `count(*) AS count_1` back as `count_1`, so dropping the alias and
+/// returning a column called `count` hands it a result it cannot find.
+fn split_output_alias(p: &str) -> (&str, Option<&str>) {
+    let pu = p.to_uppercase();
+    if let Some(at) = find_kw(&pu, "AS") {
+        let alias = p[at + 2..].trim().trim_matches('"');
+        if !alias.is_empty() {
+            return (p[..at].trim(), Some(alias));
+        }
+    }
+    // A bare alias: `count(*) count_1`. Only after a closing paren or a plain
+    // identifier, and never when the tail is itself part of the expression —
+    // so the split point is the LAST whitespace outside any parenthesis.
+    let b: Vec<char> = p.chars().collect();
+    let mut depth = 0i32;
+    let mut in_s = false;
+    let mut cut = None;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            '\'' => in_s = !in_s,
+            '(' if !in_s => depth += 1,
+            ')' if !in_s => depth -= 1,
+            c if c.is_whitespace() && depth == 0 && !in_s => cut = Some(i),
+            _ => {}
+        }
+    }
+    match cut {
+        Some(i) => {
+            let alias = p[i..].trim().trim_matches('"');
+            if alias.is_empty() { (p, None) } else { (p[..i].trim(), Some(alias)) }
+        }
+        None => (p, None),
+    }
+}
+
 fn sql_literals_to_nql(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -567,8 +914,19 @@ fn translate_update(sql: &str) -> Result<Stmt, String> {
     let rest = strip_prefix_ci(sql, "UPDATE").ok_or("expected UPDATE")?;
     let ru = rest.to_uppercase();
     let set_at = find_kw(&ru, "SET").ok_or("expected SET in UPDATE")?;
-    let coll = rest[..set_at].trim().trim_matches('"');
+    // `UPDATE orders o SET …` — Postgres allows an alias here, and taking the
+    // whole span as the collection name made it part of the name ("orders o").
+    let target = rest[..set_at].trim();
+    let mut parts = target.split_whitespace();
+    let coll = parts.next().unwrap_or("").trim_matches('"');
     let coll = coll.rsplit('.').next().unwrap_or(coll).to_string();
+    let upd_alias: Option<String> = match parts.next() {
+        Some(w) if w.eq_ignore_ascii_case("AS") => {
+            parts.next().map(|a| a.trim_matches('"').to_string())
+        }
+        Some(w) => Some(w.trim_matches('"').to_string()),
+        None => None,
+    };
     if coll.is_empty() {
         return Err("expected a collection name after UPDATE".into());
     }
@@ -596,7 +954,8 @@ fn translate_update(sql: &str) -> Result<Stmt, String> {
     }
     // The matching rows are found with an ordinary NQL read, so the whole
     // predicate surface (IN, BETWEEN, LIKE, OR, …) works in an UPDATE too.
-    let nql = format!("FROM {} {}", coll, sql_literals_to_nql(where_raw.trim()))
+    let where_raw = strip_column_qualifiers(where_raw.trim(), &coll, upd_alias.as_deref())?;
+    let nql = format!("FROM {} {}", coll, sql_literals_to_nql(&where_raw))
         .trim().to_string();
     Ok(Stmt::Update { coll, set, nql, returning })
 }
@@ -613,8 +972,9 @@ fn translate_delete(sql: &str) -> Result<Stmt, String> {
     if coll.is_empty() {
         return Err("expected a collection name after DELETE FROM".into());
     }
-    let where_raw = rest[end..].trim();
-    let nql = format!("FROM {} {}", coll, sql_literals_to_nql(where_raw))
+    let (del_alias, where_raw) = split_table_alias(rest[end..].trim());
+    let where_raw = strip_column_qualifiers(where_raw, &coll, del_alias.as_deref())?;
+    let nql = format!("FROM {} {}", coll, sql_literals_to_nql(&where_raw))
         .trim().to_string();
     Ok(Stmt::Delete { coll, nql, returning })
 }
@@ -723,10 +1083,36 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     if rest.is_empty() {
         return Err("expected a collection name after FROM".into());
     }
-    // A subquery in the FROM position, or a comma-separated table list (an
-    // implicit cross join), are both out of scope — say which.
+    // ── the one derived table with a provable flat equivalent ───────────────
+    //
+    // `SELECT count(*) FROM (SELECT … FROM coll WHERE …) AS anon` is what
+    // EVERY ORM emits for `.count()` — SQLAlchemy's `Query.count()` wraps the
+    // whole query in a subquery unconditionally. Refusing it means "SQLAlchemy
+    // works, except counting", which is not a boundary anyone would accept.
+    //
+    // Counting a derived table whose rows are exactly the inner query's rows
+    // is counting the inner query, so the rewrite is an IDENTITY rather than
+    // an approximation. Each guard below names a construct that would break
+    // that identity, and anything carrying one is still refused:
+    //
+    //   * `LIMIT` / `OFFSET`   — caps the row count before it is counted
+    //   * `DISTINCT`           — collapses duplicates, so the counts differ
+    //   * `GROUP BY`           — the inner rows ARE the groups
+    //   * an inner aggregate   — already one row, counting it answers 1
+    //   * anything but `count(*)` outside — the outer list would need the
+    //     inner columns, which a flat count cannot supply
     if rest.starts_with('(') {
-        return Err("subqueries in FROM are not supported".into());
+        if let Some(flat) = flatten_count_of_subquery(&projection, &rest) {
+            // Recurses ONCE at most: the rewrite is only produced when the
+            // inner FROM names a real collection, so the flat statement can
+            // never re-enter this branch.
+            return translate(&flat);
+        }
+        return Err("subqueries in FROM are not supported — except \
+                    `SELECT count(*) FROM (…)`, which is rewritten to a flat \
+                    count when the inner query has no LIMIT, OFFSET, DISTINCT, \
+                    GROUP BY or aggregate of its own (any of those would make the \
+                    two counts different numbers)".into());
     }
     let coll_end = rest.find(' ').unwrap_or(rest.len());
     let coll = &rest[..coll_end];
@@ -753,49 +1139,76 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     let tail = rest[coll_end..].trim();
 
     // ── the select list ──────────────────────────────────────────────────────
-    let pu = projection.to_uppercase();
+    //
+    // Parsed ITEM BY ITEM, which is what lets a list MIX plain columns with an
+    // aggregate — and that mixture is exactly what a `GROUP BY` query is.
+    // SQLAlchemy writes `SELECT orders.status, count(*) AS count_1 FROM orders
+    // GROUP BY orders.status` for the most ordinary grouped query there is,
+    // and the previous check refused any list containing a parenthesis at all,
+    // so the whole shape was unreachable even though NQL expresses it
+    // natively.
+    //
+    // NQL's grouped row carries the group key, `count`, and at most one NAMED
+    // aggregate — so `count(*)` is always available and one of SUM/AVG/MIN/MAX
+    // may join it. A second named aggregate is refused by name rather than
+    // silently dropped.
     let mut agg_clause = String::new();
+    let mut agg_srcs: Vec<String> = vec![];
     let mut project: Vec<Col> = vec![];
 
     if projection == "*" {
         // everything
-    } else if pu.starts_with("COUNT(") {
-        // COUNT(*) and COUNT(col) both become NQL's bare COUNT: NQL counts the
-        // group, and a per-column non-null count is not expressible here.
-        agg_clause = " COUNT".to_string();
-        project.push(Col::same("count"));
-    } else if let Some(agg) = ["SUM", "AVG", "MIN", "MAX"]
-        .iter()
-        .find(|a| pu.starts_with(&format!("{}(", a)))
-    {
-        let inner = projection[agg.len() + 1..]
-            .trim_end_matches(')')
-            .trim()
-            .to_string();
-        if inner.is_empty() || inner == "*" {
-            return Err(format!("{}() needs a column", agg));
-        }
-        agg_clause = format!(" {} {}", agg, inner);
-        // NQL emits `<agg>_<field>`; SQL names the column after the function.
-        project.push(Col::renamed(
-            &format!("{}_{}", agg.to_lowercase(), inner),
-            &agg.to_lowercase(),
-        ));
     } else {
-        for part in projection.split(',') {
+        for part in split_top_level(&projection, ',') {
             let p = part.trim();
             if p.is_empty() {
                 return Err("empty column in the select list".into());
             }
-            if p.contains('(') {
+            let (expr, alias) = split_output_alias(p);
+            let eu = expr.to_uppercase();
+
+            // COUNT(*) and COUNT(col) both become NQL's bare COUNT: NQL counts
+            // the group, and a per-column non-null count is not expressible.
+            if eu.starts_with("COUNT(") {
+                if agg_clause.is_empty() {
+                    agg_clause = " COUNT".to_string();
+                }
+                agg_srcs.push("count".to_string());
+                project.push(Col::renamed("count", alias.unwrap_or("count")));
+                continue;
+            }
+            if let Some(agg) = ["SUM", "AVG", "MIN", "MAX"]
+                .iter()
+                .find(|a| eu.starts_with(&format!("{}(", a)))
+            {
+                let inner = expr[agg.len() + 1..].trim_end_matches(')').trim();
+                if inner.is_empty() || inner == "*" {
+                    return Err(format!("{}() needs a column", agg));
+                }
+                let inner = inner.rsplit('.').next().unwrap_or(inner).trim_matches('"');
+                let named = format!("{} {}", agg, inner);
+                if !agg_clause.is_empty() && agg_clause.trim() != "COUNT" && agg_clause.trim() != named {
+                    return Err(format!(
+                        "only one of SUM/AVG/MIN/MAX is supported per statement \
+                         (already have {:?}, then {:?}) — NQL's grouped row carries \
+                         the group key, `count`, and ONE named aggregate",
+                        agg_clause.trim(), named));
+                }
+                agg_clause = format!(" {}", named);
+                // NQL emits `<agg>_<field>`; SQL names the column after the
+                // function unless the query aliased it.
+                let src = format!("{}_{}", agg.to_lowercase(), inner);
+                project.push(Col::renamed(&src, alias.unwrap_or(&agg.to_lowercase())));
+                agg_srcs.push(src);
+                continue;
+            }
+            if expr.contains('(') {
                 return Err(format!(
                     "expressions in the select list are not supported ({:?}) — \
                      supported: *, a column list, COUNT(*), or SUM/AVG/MIN/MAX(col)", p));
             }
-            // strip an alias: `col AS x` / `col x`
-            let raw = p.split_whitespace().next().unwrap_or(p);
-            let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
-            project.push(Col::same(name));
+            let name = expr.rsplit('.').next().unwrap_or(expr).trim_matches('"');
+            project.push(Col::renamed(name, alias.unwrap_or(name)));
         }
     }
 
@@ -805,7 +1218,10 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     // ORDER BY, LIMIT, OFFSET) are deliberately handed to the NQL parser
     // unchanged rather than re-parsed here. NQL is the authority on what is
     // valid; re-implementing its grammar would give two parsers to disagree.
-    let mut tail = tail.to_string();
+    // `FROM orders o WHERE …` — the alias is taken off the tail (NQL has no
+    // alias syntax) and then ACCEPTED as a qualifier on the columns.
+    let (alias, tail) = split_table_alias(tail);
+    let mut tail = strip_column_qualifiers(tail, coll, alias.as_deref())?;
     let tu = tail.to_uppercase();
     if let Some(at) = find_kw(&tu, "AS OF SYSTEM TIME") {
         let before = tail[..at].to_string();
@@ -833,15 +1249,27 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     // error, using Postgres's own wording so the message is already familiar.
     let tu_all = tail.to_uppercase();
     if let Some(gb_at) = find_kw(&tu_all, "GROUP BY") {
+        let head = tail[..gb_at].trim_end().to_string();
         let after = tail[gb_at + "GROUP BY".len()..].trim_start();
         let key_end = after.find(|c: char| c == ' ' || c == ',').unwrap_or(after.len());
         let group_key = after[..key_end].trim().trim_matches('"').to_string();
-        let is_agg = !agg_clause.is_empty();
+        let after_key = after[key_end..].trim_start();
+
+        // NQL groups by ONE field. Taking the first key and leaving the rest
+        // in the tail would group by something narrower than the query asked
+        // for — more rows than Postgres returns, each aggregating too much.
+        if after_key.starts_with(',') {
+            return Err(format!(
+                "GROUP BY takes one key here (got {:?} and more) — NQL groups by a \
+                 single field, and grouping by only the first would aggregate over \
+                 rows the query meant to keep apart",
+                group_key));
+        }
+
         for c in &project {
             let ok = c.src == group_key
                 || c.src == "count"
-                || (is_agg && c.out == agg_clause.trim().split(' ').next()
-                        .unwrap_or("").to_lowercase());
+                || agg_srcs.contains(&c.src);
             if !ok {
                 return Err(format!(
                     "column {:?} must appear in the GROUP BY clause or be used in an \
@@ -850,6 +1278,22 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
                     c.src));
             }
         }
+
+        // NQL's aggregate belongs IMMEDIATELY AFTER the group key
+        // (`GROUP BY status COUNT`), not after the collection name. Emitting
+        // `FROM orders COUNT GROUP BY status` is refused by the NQL parser
+        // with "only one aggregate per query" — which is how the most
+        // ordinary grouped query an ORM writes still failed even once its
+        // select list parsed.
+        //
+        // `count` rides along free with a named aggregate — an NQL grouped row
+        // carries the key, `count` AND the aggregate — so only the named one
+        // is emitted when both were asked for.
+        tail = format!("{} GROUP BY {}{} {}", head, group_key, agg_clause, after_key)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        agg_clause.clear();
     }
 
     let tail = sql_literals_to_nql(&tail);
@@ -1199,6 +1643,16 @@ fn infer_field_oid(db: Option<&Arc<Db>>, coll: &str, field: &str) -> i32 {
         "_seq" => return OID_INT8,
         "_id" | "_hash" | "_prev" | "_collection" | "_valid_from" | "_valid_to" => return OID_TEXT,
         _ => {}
+    }
+    // A catalogue relation types its own columns. Sampling a USER collection
+    // named `pg_type` finds nothing and falls back to text — and asyncpg,
+    // which declares parameter types client-side and refuses the call when
+    // the server's answer is wrong, then rejected `WHERE oid = $1` with
+    // "expected str, got int" before a single byte was sent.
+    if !field.is_empty() && crate::pgcatalog::is_catalog(coll) {
+        if let Some(rows) = crate::pgcatalog::rows(coll, db) {
+            return oid_for(&rows, field);
+        }
     }
     let db = match db {
         Some(db) => db,
@@ -1861,6 +2315,31 @@ fn describe_shape(
     n_params: usize,
 ) -> Option<(Vec<Col>, Vec<i32>)> {
     let probe = probe_sql(sql, n_params);
+
+    // The SQL evaluator describes its own output. It has to: `translate`
+    // cannot parse a catalogue join at all, so without this a `Describe`
+    // answered `NoData` — and a client told a SELECT has no output never
+    // reads its rows.
+    //
+    // The probe is EXECUTED here, which is affordable precisely because this
+    // path only serves catalogue relations and relation-free select lists.
+    // Column types come from the values it actually produced, unified across
+    // the rows by the same `oid_for` every other path uses — so a column
+    // advertised `int8` is one the wire really encodes as int8.
+    if sql_engine_owns(&probe) {
+        if let Ok(Some((done, _))) = try_catalog_select(&probe, db) {
+            if done.project.is_empty() {
+                return None;
+            }
+            let oids = done
+                .project
+                .iter()
+                .map(|c| oid_for(&done.rows, &c.src))
+                .collect();
+            return Some((done.project, oids));
+        }
+    }
+
     let stmt = translate(&probe).ok()?;
     let coll = stmt_collection(sql);
 
@@ -2123,10 +2602,19 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
                 // Reject unsupported SQL here rather than at Execute, so the
                 // client learns at the point it asked — which is also where
                 // Postgres reports it.
-                if let Err(why) = translate(&probe_sql(&sql, param_count(&sql))) {
-                    sock.write_all(&err_msg("0A000", &why)).await?;
-                    failed = true;
-                    continue;
+                //
+                // The SQL evaluator gets asked first, or a catalogue query
+                // would be refused at `Parse` by the NQL path that was never
+                // going to run it — and the extended protocol is where every
+                // ORM and async driver lives, so refusing here refuses them
+                // all.
+                let probe = probe_sql(&sql, param_count(&sql));
+                if !sql_engine_owns(&probe) {
+                    if let Err(why) = translate(&probe) {
+                        sock.write_all(&err_msg("0A000", &why)).await?;
+                        failed = true;
+                        continue;
+                    }
                 }
                 let param_oids = infer_param_oids(&sql, &declared, resolved.as_ref());
                 prepared.insert(name, Prepared { sql, param_oids, out_shape: None });
@@ -2403,6 +2891,49 @@ fn no_db(db_name: &str) -> Vec<u8> {
          (POST /v1/databases), or connect with -d <name>", db_name))
 }
 
+/// `pg_catalog.pg_class` → `pg_class`, but `information_schema.tables` keeps
+/// its qualifier, because `tables` is a plausible collection name and the
+/// catalogue must never shadow a user's own data.
+fn catalog_name(n: &str) -> String {
+    let joined: Vec<&str> = n.split('.').collect();
+    if joined.len() >= 2 && joined[joined.len() - 2] == "information_schema" {
+        format!("information_schema.{}", joined[joined.len() - 1])
+    } else {
+        joined[joined.len() - 1].to_string()
+    }
+}
+
+/// Does the SQL evaluator own this statement?
+///
+/// Two ways in. The first is obvious: it reads a catalogue relation.
+///
+/// The second is a statement with NO relation at all — a select list of
+/// literals and scalar function calls, which is exactly what this evaluator
+/// does and which the SQL→NQL path cannot express (NQL is FROM-first). That
+/// path answers a handful of EXACT spellings from a canned table
+/// (`SELECT 1`, `SELECT VERSION()`, `SELECT CURRENT_SCHEMA`), and those
+/// answers are what existing clients already see — so this predicate rescues
+/// only what it REFUSES, leaving every spelling it does handle alone.
+///
+/// That gap was not hypothetical. SQLAlchemy's PostgreSQL dialect opens every
+/// connection with `select pg_catalog.version()`, which is one character of
+/// qualification away from the canned `SELECT VERSION()` and therefore missed
+/// it — so the engine refused the first statement of dialect initialisation
+/// and NO SQLAlchemy application could connect at all. A canned list of
+/// spellings is the same brittleness `pgcatalog` exists to avoid; the fix is
+/// to let the evaluator answer, because it has `version()`,
+/// `current_setting()` and the rest as real functions.
+///
+/// Cheap: one parse, no execution, no storage access.
+fn sql_engine_owns(sql: &str) -> bool {
+    let Ok(sel) = crate::sqlselect::parse(sql) else { return false };
+    let touched = sel.base_relations();
+    if touched.is_empty() {
+        return translate(sql).is_err();
+    }
+    touched.iter().any(|t| crate::pgcatalog::is_catalog(&catalog_name(t)))
+}
+
 /// Run a `SELECT` through the full SQL engine when it touches the catalogue.
 ///
 /// The gate is deliberately narrow: a statement goes to `sqlselect` only when
@@ -2444,19 +2975,7 @@ fn try_catalog_select(
     // subqueries; a walk over the top-level FROM list alone would route both
     // to the NQL path, which cannot parse them and would report an error that
     // sends the reader to fix the wrong thing.
-    let touched: Vec<String> = sel.base_relations();
-    let catalog_name = |n: &str| -> String {
-        // `pg_catalog.pg_class` → `pg_class`, but `information_schema.tables`
-        // keeps its qualifier, because `tables` is a plausible collection
-        // name and the catalogue must never shadow a user's own data.
-        let joined: Vec<&str> = n.split('.').collect();
-        if joined.len() >= 2 && joined[joined.len() - 2] == "information_schema" {
-            format!("information_schema.{}", joined[joined.len() - 1])
-        } else {
-            joined[joined.len() - 1].to_string()
-        }
-    };
-    if !touched.iter().any(|t| crate::pgcatalog::is_catalog(&catalog_name(t))) {
+    if !sql_engine_owns(sql) {
         return Ok(None);
     }
 
@@ -3023,6 +3542,16 @@ mod tests {
     }
     fn names(cols: &[Col]) -> Vec<String> { cols.iter().map(|c| c.out.clone()).collect() }
 
+    /// The full projection, so a test can assert the SRC and the OUT
+    /// separately — they are different jobs and conflating them is how an
+    /// alias got lost.
+    fn cols_of(sql: &str) -> Vec<Col> {
+        match translate(sql).unwrap() {
+            Stmt::Query { project, .. } => project,
+            other => panic!("{:?}", other),
+        }
+    }
+
     #[test]
     fn select_star_becomes_bare_from() {
         assert_eq!(q("SELECT * FROM orders"), "FROM orders");
@@ -3039,11 +3568,194 @@ mod tests {
     }
 
     #[test]
-    fn aliases_and_qualified_names_reduce_to_the_field() {
-        assert_eq!(proj("SELECT o.status AS s, o.total total FROM orders o"),
-                   vec!["status", "total"]);
+    fn a_qualifier_reduces_to_the_field_while_an_ALIAS_is_the_name_the_client_sees() {
+        // Two different jobs, and they used to be conflated. The SRC is what
+        // NEDB reads out of the row, so a qualifier must be stripped from it.
+        // The OUT is the name the CLIENT looks the column up by, so an alias
+        // must be KEPT in it — `SELECT status AS s` returns a column called
+        // `s`, and answering with one called `status` hands a client a result
+        // it cannot find. SQLAlchemy writes `count(*) AS count_1` and then
+        // reads `count_1`.
+        let cols = cols_of("SELECT o.status AS s, o.total total, o.region FROM orders o");
+        assert_eq!(cols.iter().map(|c| c.src.clone()).collect::<Vec<_>>(),
+                   vec!["status", "total", "region"]);
+        assert_eq!(cols.iter().map(|c| c.out.clone()).collect::<Vec<_>>(),
+                   vec!["s", "total", "region"]);
         assert_eq!(q("SELECT * FROM public.orders"), "FROM orders");
         assert_eq!(q("SELECT * FROM \"orders\""), "FROM orders");
+    }
+
+    #[test]
+    fn a_select_list_may_MIX_columns_with_an_aggregate() {
+        // What a GROUP BY query actually looks like. The previous parser
+        // refused any list containing a parenthesis, so this whole shape was
+        // unreachable even though NQL expresses it natively — and it is the
+        // single most common grouped query an ORM emits.
+        // The aggregate sits IMMEDIATELY AFTER the group key — verified
+        // against the running engine, which refuses the other order with
+        // "only one aggregate per query".
+        assert_eq!(q("SELECT status, count(*) AS count_1 FROM orders GROUP BY status"),
+                   "FROM orders GROUP BY status COUNT");
+        // SQL puts GROUP BY before ORDER BY / LIMIT; the aggregate still lands
+        // on the key, and the rest of the tail follows.
+        assert_eq!(q("SELECT status, count(*) FROM orders WHERE total > 1 GROUP BY status ORDER BY status LIMIT 5"),
+                   "FROM orders WHERE total > 1 GROUP BY status COUNT ORDER BY status LIMIT 5");
+        // A bare aggregate with NO grouping still goes after the collection.
+        assert_eq!(q("SELECT count(*) FROM orders"), "FROM orders COUNT");
+        assert_eq!(q("SELECT sum(total) FROM orders"), "FROM orders SUM total");
+        // More than one group key is refused by name: NQL groups by a single
+        // field, and using only the first would aggregate over rows the query
+        // meant to keep apart.
+        let e = translate("SELECT status, count(*) FROM orders GROUP BY status, region").unwrap_err();
+        assert!(e.contains("GROUP BY takes one key"), "{}", e);
+        let cols = cols_of("SELECT status, count(*) AS count_1 FROM orders GROUP BY status");
+        assert_eq!(cols.iter().map(|c| c.src.clone()).collect::<Vec<_>>(),
+                   vec!["status", "count"]);
+        assert_eq!(cols.iter().map(|c| c.out.clone()).collect::<Vec<_>>(),
+                   vec!["status", "count_1"]);
+
+        // A named aggregate rides along with `count`, because an NQL grouped
+        // row carries both.
+        let cols = cols_of("SELECT status, count(*), sum(total) FROM orders GROUP BY status");
+        assert_eq!(cols.iter().map(|c| c.src.clone()).collect::<Vec<_>>(),
+                   vec!["status", "count", "sum_total"]);
+        assert_eq!(q("SELECT status, count(*), sum(total) FROM orders GROUP BY status"),
+                   "FROM orders GROUP BY status SUM total");
+
+        // A qualifier on the aggregate's column is stripped like any other.
+        assert_eq!(q("SELECT o.status, sum(o.total) FROM orders o GROUP BY o.status"),
+                   "FROM orders GROUP BY status SUM total");
+
+        // Two NAMED aggregates cannot both be carried, and that is refused by
+        // name rather than silently dropping one.
+        let e = translate("SELECT status, sum(total), avg(total) FROM orders GROUP BY status")
+            .unwrap_err();
+        assert!(e.contains("only one of SUM/AVG/MIN/MAX"), "{}", e);
+
+        // A column that is neither a key nor an aggregate is still refused.
+        let e = translate("SELECT status, total, count(*) FROM orders GROUP BY status")
+            .unwrap_err();
+        assert!(e.contains("must appear in the GROUP BY clause"), "{}", e);
+    }
+
+    #[test]
+    fn count_of_a_subquery_flattens_only_when_the_two_counts_MUST_agree() {
+        // `.count()` in every ORM wraps the whole query in a derived table.
+        // Counting rows that ARE the inner query's rows is counting the inner
+        // query, so this is an identity, not an approximation.
+        assert_eq!(
+            q("SELECT count(*) AS count_1 FROM (SELECT orders._id AS a, orders.status AS b \
+               FROM orders WHERE orders.status = 'paid') AS anon_1"),
+            // Verified against the running engine: with no GROUP BY the
+            // aggregate may sit either side of WHERE and answers identically.
+            r#"FROM orders COUNT WHERE status = "paid""#);
+        // No predicate at all.
+        assert_eq!(q("SELECT count(*) FROM (SELECT orders._id FROM orders) AS anon_1"),
+                   "FROM orders COUNT");
+        // ORDER BY cannot change a count, so it is dropped rather than refused.
+        assert_eq!(q("SELECT count(*) FROM (SELECT _id FROM orders ORDER BY total DESC) AS a"),
+                   "FROM orders COUNT");
+        // The outer alias is the name the client reads the column back by.
+        let cols = cols_of("SELECT count(*) AS count_1 FROM (SELECT _id FROM orders) AS a");
+        assert_eq!(cols[0].src, "count");
+        assert_eq!(cols[0].out, "count_1");
+
+        // Each guard is a construct that would make the two counts DIFFERENT
+        // numbers, so each is refused rather than silently flattened.
+        for sql in [
+            // LIMIT / OFFSET cap the rows before they are counted
+            "SELECT count(*) FROM (SELECT _id FROM orders LIMIT 1) AS a",
+            "SELECT count(*) FROM (SELECT _id FROM orders OFFSET 1) AS a",
+            // the inner rows ARE the groups
+            "SELECT count(*) FROM (SELECT status FROM orders GROUP BY status) AS a",
+            // an inner aggregate already reduced the rows to one
+            "SELECT count(*) FROM (SELECT count(*) FROM orders) AS a",
+            "SELECT count(*) FROM (SELECT sum(total) FROM orders) AS a",
+            // the outer list would need the derived table's own columns
+            "SELECT count(*), status FROM (SELECT status FROM orders) AS a",
+            "SELECT status FROM (SELECT status FROM orders) AS a",
+            // one level is the claim
+            "SELECT count(*) FROM (SELECT x FROM (SELECT _id AS x FROM orders) AS b) AS a",
+        ] {
+            let e = translate(sql).unwrap_err();
+            assert!(e.contains("subqueries in FROM"), "{} -> {}", sql, e);
+        }
+
+        // DISTINCT and the set operators are caught EARLIER, by their own
+        // rules, which scan the whole statement before the FROM list is even
+        // read. Asserted separately so the test records which check owns each
+        // refusal rather than implying one catch-all does.
+        for (sql, needle) in [
+            ("SELECT count(*) FROM (SELECT DISTINCT status FROM orders) AS a", "DISTINCT"),
+            ("SELECT count(*) FROM (SELECT a FROM t UNION SELECT b FROM u) AS x", "UNION"),
+        ] {
+            let e = translate(sql).unwrap_err();
+            assert!(e.contains(needle), "{} -> {}", sql, e);
+        }
+    }
+
+    #[test]
+    fn a_QUALIFIED_column_in_WHERE_finds_its_field_instead_of_ZERO_ROWS() {
+        // THE silent wrong answer. NQL looks a field up FLAT, so
+        // `WHERE orders.status = 'paid'` asked for a field literally named
+        // "orders.status", no document had one, and the query returned ZERO
+        // ROWS with no error — an empty result that reads exactly like "you
+        // have no paid orders". Every ORM qualifies its predicates, so every
+        // filtered SQLAlchemy query answered empty and `.get(pk)` answered
+        // None.
+        assert_eq!(q("SELECT _id FROM orders WHERE orders.status = 'paid'"),
+                   r#"FROM orders WHERE status = "paid""#);
+        assert_eq!(q("SELECT _id FROM orders WHERE orders.total > 50"),
+                   "FROM orders WHERE total > 50");
+        // Every clause in the tail, not just WHERE.
+        assert_eq!(q("SELECT _id FROM orders ORDER BY orders.total DESC LIMIT 2"),
+                   "FROM orders ORDER BY total DESC LIMIT 2");
+        assert_eq!(q("SELECT status, count(*) FROM orders GROUP BY orders.status"),
+                   "FROM orders GROUP BY status COUNT");
+
+        // An alias is a legal qualifier and is accepted as one. It is also
+        // REMOVED from the tail, because NQL has no alias syntax and reported
+        // an "unexpected token" on it.
+        assert_eq!(q("SELECT o.status FROM orders o WHERE o.status = 'paid'"),
+                   r#"FROM orders WHERE status = "paid""#);
+        assert_eq!(q("SELECT o.status FROM orders AS o WHERE o.total > 1"),
+                   "FROM orders WHERE total > 1");
+
+        // A qualifier naming NEITHER the collection nor its alias is an
+        // ERROR, not a strip. Stripping it would answer from the one relation
+        // that IS present, which is a different wrong answer in the same
+        // empty-looking clothes.
+        let e = translate("SELECT _id FROM orders WHERE nosuch.status = 'paid'").unwrap_err();
+        assert!(e.contains("no table or alias named \"nosuch\""), "{}", e);
+        let e = translate("SELECT _id FROM orders o WHERE p.status = 'paid'").unwrap_err();
+        assert!(e.contains("aliased \"o\""), "the message names the alias in scope: {}", e);
+
+        // A dot INSIDE a literal is data, not a qualifier.
+        assert_eq!(q("SELECT _id FROM orders WHERE status = 'pa.id'"),
+                   r#"FROM orders WHERE status = "pa.id""#);
+        // ...and a decimal point is not one either.
+        assert_eq!(q("SELECT _id FROM orders WHERE total > 1.5"),
+                   "FROM orders WHERE total > 1.5");
+
+        // UPDATE and DELETE carry the same tail, and had the same bug.
+        match translate("UPDATE orders o SET status = 'x' WHERE o.total > 5").unwrap() {
+            Stmt::Update { coll, nql, .. } => {
+                assert_eq!(coll, "orders", "the alias is not part of the collection name");
+                assert_eq!(nql, "FROM orders WHERE total > 5");
+            }
+            other => panic!("{:?}", other),
+        }
+        match translate("DELETE FROM orders o WHERE o.status = 'paid'").unwrap() {
+            Stmt::Delete { coll, nql, .. } => {
+                assert_eq!(coll, "orders");
+                assert_eq!(nql, r#"FROM orders WHERE status = "paid""#);
+            }
+            other => panic!("{:?}", other),
+        }
+
+        // `AS OF SYSTEM TIME` also begins with AS and is NOT an alias.
+        assert_eq!(q("SELECT _id FROM orders AS OF SYSTEM TIME 3 WHERE orders.total > 1"),
+                   "FROM orders AS OF 3 WHERE total > 1");
     }
 
     #[test]
