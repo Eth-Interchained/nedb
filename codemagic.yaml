@@ -72,16 +72,23 @@ workflows:
           chmod +x python/nedb/nedbd-v2
           echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
 
-      - name: Stage Python source + verify binary
+      # Staged by the COMMITTED SCRIPT, which is the only copy of this logic.
+      #
+      # These steps used to inline it, and the inline copy staged
+      # `python/nedb/` but not `README.md` — so `maturin` failed with "Failed
+      # to read readme specified in pyproject.toml" and BOTH macOS wheels for
+      # v4.3.0 died while every GitHub Actions leg passed. release.yml had
+      # already moved to the script and picked up the README automatically;
+      # this file never adopted it and drifted.
+      #
+      # The script's own header records the same bug happening once before, in
+      # test.yml. It exists to have ONE copy. Calling it is the fix.
+      - name: Stage Python source + README + verify binary
         script: |
-          rm -rf rust/crates/nedb-py/python
-          mkdir -p rust/crates/nedb-py/python
-          cp -r python/nedb rust/crates/nedb-py/python/nedb
-          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
-          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
-          # Fail loudly if binary is missing — maturin include= needs it present
+          bash scripts/stage_maturin.sh
+          # Fail loudly rather than let maturin package a wheel without them.
+          ls -lh rust/crates/nedb-py/README.md || { echo "ERROR: README.md missing!"; exit 1; }
           ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
-          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) py files"
 
       - name: Build wheel (maturin)
         script: |
@@ -183,14 +190,22 @@ workflows:
           chmod +x python/nedb/nedbd-v2
           echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
 
-      - name: Stage Python source + verify binary
+      # Staged by the COMMITTED SCRIPT, which is the only copy of this logic.
+      #
+      # These steps used to inline it, and the inline copy staged
+      # `python/nedb/` but not `README.md` — so `maturin` failed with "Failed
+      # to read readme specified in pyproject.toml" and BOTH macOS wheels for
+      # v4.3.0 died while every GitHub Actions leg passed. release.yml had
+      # already moved to the script and picked up the README automatically;
+      # this file never adopted it and drifted.
+      #
+      # The script's own header records the same bug happening once before, in
+      # test.yml. It exists to have ONE copy. Calling it is the fix.
+      - name: Stage Python source + README + verify binary
         script: |
-          rm -rf rust/crates/nedb-py/python
-          mkdir -p rust/crates/nedb-py/python
-          cp -r python/nedb rust/crates/nedb-py/python/nedb
-          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
-          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
-          # Fail loudly if binary is missing — maturin include= needs it present
+          bash scripts/stage_maturin.sh
+          # Fail loudly rather than let maturin package a wheel without them.
+          ls -lh rust/crates/nedb-py/README.md || { echo "ERROR: README.md missing!"; exit 1; }
           ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
 
       - name: Build wheel (maturin)
