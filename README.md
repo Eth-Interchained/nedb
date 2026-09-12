@@ -206,6 +206,44 @@ there is no declared column order to infer. Values must be literals — a number
 a quoted string, `TRUE`/`FALSE`/`NULL` — since storing an unevaluated
 expression as text would be worse than refusing it.
 
+### `\d` works — the catalogue is real tables, not matched strings
+
+`pg_catalog` and `information_schema` are **queryable relations synthesised
+from the live database**, not pattern-matched query text, so psql's
+introspection runs as the SQL it actually is. `\dt` alone is two `LEFT JOIN`s,
+a nine-branch `CASE`, two scalar functions and `ORDER BY 1,2`; `\d orders`
+is a regex (`^(orders)$`) plus three correlated subqueries; `\dp` builds two
+`ARRAY(SELECT …)` columns with `= ANY(…)`; `\dd` is a seven-arm `UNION ALL`
+inside a derived table; `\dP+` is a `LATERAL` join. All of it is evaluated by
+a real SQL engine (`rust/nedb-v2/src/sqlselect.rs`): joins (hash and nested
+loop), subqueries, `EXISTS`, `ANY`/`ALL`, set operations, derived tables,
+`LATERAL`, aggregates, `CASE`, casts, and the POSIX ERE subset psql writes.
+
+```console
+shop=> \d orders
+              Table "public.orders"
+ Column |  Type  | Collation | Nullable | Default
+--------+--------+-----------+----------+---------
+ _id    | text   |           |          |
+ _seq   | bigint |           |          |
+ status | text   |           |          |
+ total  | bigint |           |          |
+```
+
+**Every psql 17 backslash-describe command exits 0** against `nedbd` — `\d`,
+`\dt+`, `\dn`, `\l`, `\du`, `\df`, `\dp`, `\dT`, `\dd`, `\dD`, `\dy`, `\dRp`,
+`\dRs`, `\dX`, `\dP+`, `\dconfig`, `\z` and the rest — verified by driving the
+real `psql` binary in `tests/test_psql_introspection.py` (psql 16 and 17).
+Three exit 1 exactly as they do on a fresh Postgres: `\dx+`, `\dRp+` and
+`\dF+` print psql's own "Did not find any …" when a `+` listing is empty.
+
+What a schemaless engine reports is *derived*, and says so: a collection is a
+table, a field observed in a sampled document is a column typed the way the
+wire types it, and everything Postgres tracks that NEDB does not — owners,
+ACLs, sizes, statistics, publications, triggers — is a fixed value or an
+empty relation, never a fabricated plausible one. `pg_size_pretty(pg_table_size(…))`
+is a blank cell in `\dt+`, not an invented number.
+
 ### Your driver, not just `psql`
 
 **Both wire protocols are implemented**, which is the difference between "psql

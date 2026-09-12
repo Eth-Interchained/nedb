@@ -67,10 +67,19 @@
 //! `<>` to `!=`. Column projection is applied here, after NQL returns whole
 //! documents, because NQL is FROM-first and has no projection clause.
 //!
-//! Not supported, each refused by name: JOIN, subqueries, CTEs, window
-//! functions, DDL, `TRUNCATE`, `GRANT`/`REVOKE`. `INSERT` requires an explicit
-//! column list, because NEDB is schemaless and there is no declared column
-//! order to infer.
+//! That translation serves user collections. Statements that read the
+//! catalogue (`pg_catalog.*`, `information_schema.*`) go instead to the real
+//! SQL evaluator in `sqlselect` — joins, subqueries, `EXISTS`, `ARRAY(...)`,
+//! `ANY`/`ALL`, `UNION`, derived tables, `LATERAL`, aggregates, `CASE`, scalar
+//! functions — because that is what psql's `\d` family is written in. Every
+//! psql 17 backslash command that can succeed against an empty-of-features
+//! Postgres exits 0 here, verified by driving the real binary
+//! (`tests/test_psql_introspection.py`).
+//!
+//! Not supported on the user-collection path, each refused by name: JOIN,
+//! subqueries, CTEs, window functions, DDL, `TRUNCATE`, `GRANT`/`REVOKE`.
+//! `INSERT` requires an explicit column list, because NEDB is schemaless and
+//! there is no declared column order to infer.
 //!
 //! # Protocol coverage
 //!
@@ -111,9 +120,9 @@
 //! must equal it; otherwise any connection is accepted.
 //!
 //! Still outside the boundary, and refused by name: SQL-level cursors
-//! (`DECLARE`/`FETCH`), `pg_catalog` introspection (so `\dt` and DBeaver's
-//! schema browser stay empty), and binary *result* format for a column whose
-//! stored values disagree about their type across documents.
+//! (`DECLARE`/`FETCH`), `GROUP BY` on the catalogue path, and binary *result*
+//! format for a column whose stored values disagree about their type across
+//! documents.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2430,14 +2439,12 @@ fn try_catalog_select(
         }
     };
 
-    // Which relations does it read?
-    let mut touched: Vec<String> = vec![];
-    if let Some(f) = &sel.from {
-        touched.push(f.name.clone());
-    }
-    for j in &sel.joins {
-        touched.push(j.table.name.clone());
-    }
+    // Which relations does it read — at ANY depth? `\dd` names its catalogue
+    // relations only inside a derived table, and `\dT` only inside two
+    // subqueries; a walk over the top-level FROM list alone would route both
+    // to the NQL path, which cannot parse them and would report an error that
+    // sends the reader to fix the wrong thing.
+    let touched: Vec<String> = sel.base_relations();
     let catalog_name = |n: &str| -> String {
         // `pg_catalog.pg_class` → `pg_class`, but `information_schema.tables`
         // keeps its qualifier, because `tables` is a plausible collection
@@ -2450,13 +2457,6 @@ fn try_catalog_select(
         }
     };
     if !touched.iter().any(|t| crate::pgcatalog::is_catalog(&catalog_name(t))) {
-        return Ok(None);
-    }
-
-    // An aggregate over the catalogue falls through on purpose, so the caller
-    // produces the one clear "a catalogue has nothing to aggregate" message
-    // rather than a generic "unknown function" from this engine.
-    if select_has_aggregate(&sel) {
         return Ok(None);
     }
 
@@ -2570,32 +2570,6 @@ fn mentions_catalog(sql: &str) -> bool {
         || low.contains("information_schema.")
         || low.contains("from pg_")
         || low.contains("join pg_")
-}
-
-/// Does any select item call an aggregate?
-fn select_has_aggregate(sel: &crate::sqlselect::Select) -> bool {
-    fn walk(e: &crate::sqlselect::Expr) -> bool {
-        use crate::sqlselect::Expr as E;
-        match e {
-            E::Func { name, args } => {
-                matches!(name.as_str(),
-                         "count" | "sum" | "avg" | "min" | "max" | "array_agg"
-                         | "string_agg" | "bool_and" | "bool_or")
-                    || args.iter().any(walk)
-            }
-            E::Binary { left, right, .. } => walk(left) || walk(right),
-            E::Unary { expr, .. } | E::Cast { expr, .. } => walk(expr),
-            E::IsNull { expr, .. } => walk(expr),
-            E::InList { expr, list, .. } => walk(expr) || list.iter().any(walk),
-            E::Case { operand, whens, else_ } => {
-                operand.as_deref().map(walk).unwrap_or(false)
-                    || whens.iter().any(|(c, t)| walk(c) || walk(t))
-                    || else_.as_deref().map(walk).unwrap_or(false)
-            }
-            _ => false,
-        }
-    }
-    sel.items.iter().any(|i| walk(&i.expr))
 }
 
 /// The catalogue relation a translated query reads from, if any.

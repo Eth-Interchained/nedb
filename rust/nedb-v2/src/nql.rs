@@ -497,12 +497,11 @@ impl Parser {
             // Refuse an unsupported metacharacter HERE, at parse time, so the
             // caller learns at the point of the mistake instead of receiving a
             // confidently wrong row set.
-            if let Some(bad) = unsupported_regex_char(&pattern) {
-                bail!("WHERE: regex {:?} uses {:?}, which this engine does not \
-                       implement. The supported subset is ^ $ . and literal text \
-                       — enough for catalogue filters like '^pg_'. Matching the \
-                       rest approximately would silently include or exclude rows, \
-                       so it is refused instead", pattern, bad);
+            if let Some(why) = regex_error(&pattern) {
+                bail!("WHERE: {} — in {:?}. The supported subset is ^ $ . | ( ) \
+                       [ ] * + ? and literal text. Matching the rest approximately \
+                       would silently include or exclude rows, so it is refused \
+                       instead", why, pattern);
             }
             return Ok(Pred::Regex {
                 field,
@@ -807,58 +806,229 @@ fn like_match(value: &str, pattern: &str, ci: bool) -> bool {
     pi == p.len()
 }
 
-/// The first regex metacharacter in `pattern` that this engine does not
-/// implement, or `None` when the whole pattern is inside the supported subset.
-///
-/// Supported: `^` `$` `.` and literal text. Everything else is refused rather
-/// than approximated — see `Pred::Regex`.
-fn unsupported_regex_char(pattern: &str) -> Option<char> {
-    // `\` is listed because an escape changes the meaning of the NEXT
-    // character, so honouring `^` and `.` while ignoring escapes would make
-    // `\.` match any character instead of a literal dot.
-    const UNSUPPORTED: &[char] =
-        &['*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '\\'];
-    pattern.chars().find(|c| UNSUPPORTED.contains(c))
+// ── POSIX ERE, the subset psql actually writes ──────────────────────────────
+//
+// A hand-rolled backtracking matcher. Still deliberately no `regex` crate: it
+// would add a dependency tree to an engine whose small footprint is a selling
+// point. What changed is the SUBSET. It used to be `^ $ .` and literal text,
+// which was everything `\dn` and `\dt` needed — and then `\d orders` sent
+// `relname ~ '^(orders)$'` and the group was refused by name. A group, an
+// alternation and the three quantifiers are the whole of what psql generates
+// (`\d ord*` becomes `^(ord.*)$`), so that is the whole of what is added.
+//
+// Supported:  literals · `.` · `^` `$` · `|` · `( )` · `[abc]` `[^a-z]` ·
+//             `*` `+` `?` · `\x` as the literal x
+// Refused BY NAME, never approximated: `{n,m}` intervals, `[[:class:]]`
+// POSIX classes, `\1` back-references and `\d \w \s \b` shorthands. The
+// Python reference engine implements the identical grammar with the identical
+// algorithm — two engines accepting different regex languages is a divergence
+// in a FILTER, which silently includes or excludes rows.
+
+#[derive(Debug, Clone, PartialEq)]
+enum ReNode {
+    Char(char),
+    Any,
+    /// `[...]`: single chars and inclusive ranges, optionally negated.
+    Class { items: Vec<(char, char)>, negated: bool },
+    Start,
+    End,
+    Group(Vec<Vec<ReItem>>),
 }
 
-/// POSIX regex matching over the documented subset: `^`, `$`, `.`, literals.
-///
-/// `^` anchors at the start and `$` at the end; ANYWHERE else they are literal
-/// characters, which is what POSIX says. An unanchored pattern is a substring
-/// search, which is the behaviour psql's catalogue filters rely on.
-fn regex_match(value: &str, pattern: &str, ci: bool) -> bool {
-    let (v, p): (Vec<char>, Vec<char>) = if ci {
-        (value.to_lowercase().chars().collect(), pattern.to_lowercase().chars().collect())
-    } else {
-        (value.chars().collect(), pattern.chars().collect())
-    };
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReQuant { One, Opt, Star, Plus }
 
-    let anchored_start = p.first() == Some(&'^');
-    // No length guard here: a pattern of exactly `$` IS an end anchor in
-    // POSIX and matches every string. Guarding on `len > 1` made that lone
-    // `$` a literal dollar sign, so `x ~ '$'` answered false where Postgres
-    // answers true. The slice below cannot underflow — a single character
-    // cannot be both `^` and `$`, so the two anchors never consume more than
-    // the pattern holds.
-    let anchored_end = p.last() == Some(&'$');
-    let body = &p[usize::from(anchored_start)..p.len() - usize::from(anchored_end)];
+#[derive(Debug, Clone, PartialEq)]
+struct ReItem { node: ReNode, quant: ReQuant }
 
-    // `.` matches exactly one character, so a fixed-length comparison.
-    let matches_at = |start: usize| -> bool {
-        if start + body.len() > v.len() {
-            return false;
-        }
-        body.iter().enumerate().all(|(i, pc)| *pc == '.' || *pc == v[start + i])
-    };
-
-    match (anchored_start, anchored_end) {
-        (true, true) => v.len() == body.len() && matches_at(0),
-        (true, false) => matches_at(0),
-        (false, true) => v.len() >= body.len() && matches_at(v.len() - body.len()),
-        // Unanchored: a substring search. An empty pattern matches anything,
-        // exactly as POSIX says.
-        (false, false) => (0..=v.len().saturating_sub(body.len())).any(matches_at),
+/// Compile a pattern, or say exactly which construct is outside the subset.
+fn regex_compile(pattern: &str) -> Result<Vec<Vec<ReItem>>, String> {
+    let p: Vec<char> = pattern.chars().collect();
+    let mut pos = 0usize;
+    let alt = regex_parse_alt(&p, &mut pos, 0)?;
+    if pos < p.len() {
+        // Only a stray `)` can stop the top-level parse early.
+        return Err(format!("regex {:?} has an unmatched ')'", pattern));
     }
+    Ok(alt)
+}
+
+fn regex_parse_alt(p: &[char], pos: &mut usize, depth: usize) -> Result<Vec<Vec<ReItem>>, String> {
+    let mut branches = vec![];
+    loop {
+        let mut seq: Vec<ReItem> = vec![];
+        while *pos < p.len() {
+            let c = p[*pos];
+            if c == '|' || c == ')' {
+                break;
+            }
+            *pos += 1;
+            let node = match c {
+                '.' => ReNode::Any,
+                '^' => ReNode::Start,
+                '$' => ReNode::End,
+                '(' => {
+                    let inner = regex_parse_alt(p, pos, depth + 1)?;
+                    if *pos >= p.len() || p[*pos] != ')' {
+                        return Err("regex has an unmatched '('".to_string());
+                    }
+                    *pos += 1;
+                    ReNode::Group(inner)
+                }
+                '[' => {
+                    let negated = *pos < p.len() && p[*pos] == '^';
+                    if negated {
+                        *pos += 1;
+                    }
+                    let mut items = vec![];
+                    let mut first = true;
+                    loop {
+                        if *pos >= p.len() {
+                            return Err("regex has an unmatched '['".to_string());
+                        }
+                        let ch = p[*pos];
+                        if ch == ']' && !first {
+                            *pos += 1;
+                            break;
+                        }
+                        first = false;
+                        if ch == '[' && p.get(*pos + 1) == Some(&':') {
+                            return Err(
+                                "regex uses a POSIX character class like [[:alpha:]], \
+                                 which this engine does not implement".to_string(),
+                            );
+                        }
+                        let lo = if ch == '\\' {
+                            *pos += 1;
+                            *p.get(*pos).ok_or("regex ends inside an escape")?
+                        } else {
+                            ch
+                        };
+                        *pos += 1;
+                        // `a-z`, but a trailing `-` before `]` is a literal.
+                        if *pos + 1 < p.len() && p[*pos] == '-' && p[*pos + 1] != ']' {
+                            let hi = p[*pos + 1];
+                            *pos += 2;
+                            if hi < lo {
+                                return Err(format!("regex range {}-{} is reversed", lo, hi));
+                            }
+                            items.push((lo, hi));
+                        } else {
+                            items.push((lo, lo));
+                        }
+                    }
+                    ReNode::Class { items, negated }
+                }
+                '{' | '}' => {
+                    return Err(format!(
+                        "regex uses {:?} (an interval like a{{2,3}}), which this engine \
+                         does not implement", c
+                    ))
+                }
+                '*' | '+' | '?' => {
+                    return Err(format!("regex has a {:?} with nothing to repeat", c))
+                }
+                '\\' => {
+                    let e = *p.get(*pos).ok_or("regex ends inside an escape")?;
+                    *pos += 1;
+                    if e.is_ascii_digit() {
+                        return Err("regex uses a back-reference like \\1, which this \
+                                    engine does not implement".to_string());
+                    }
+                    if matches!(e, 'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B') {
+                        return Err(format!(
+                            "regex uses the shorthand class \\{}, which this engine does \
+                             not implement — write the [..] class out", e
+                        ));
+                    }
+                    ReNode::Char(e)
+                }
+                other => ReNode::Char(other),
+            };
+            let quant = match p.get(*pos) {
+                Some('*') => { *pos += 1; ReQuant::Star }
+                Some('+') => { *pos += 1; ReQuant::Plus }
+                Some('?') => { *pos += 1; ReQuant::Opt }
+                _ => ReQuant::One,
+            };
+            if quant != ReQuant::One && matches!(node, ReNode::Start | ReNode::End) {
+                return Err("regex repeats an anchor, which is meaningless".to_string());
+            }
+            seq.push(ReItem { node, quant });
+        }
+        branches.push(seq);
+        if *pos < p.len() && p[*pos] == '|' {
+            *pos += 1;
+            continue;
+        }
+        if *pos < p.len() && p[*pos] == ')' && depth == 0 {
+            return Err("regex has an unmatched ')'".to_string());
+        }
+        return Ok(branches);
+    }
+}
+
+fn re_class_hit(items: &[(char, char)], negated: bool, c: char) -> bool {
+    items.iter().any(|(lo, hi)| *lo <= c && c <= *hi) != negated
+}
+
+/// Match one atom at `pos`, then hand every possible continuation to `k`.
+fn re_atom(node: &ReNode, t: &[char], pos: usize, k: &dyn Fn(usize) -> bool) -> bool {
+    match node {
+        ReNode::Char(c) => pos < t.len() && t[pos] == *c && k(pos + 1),
+        ReNode::Any => pos < t.len() && k(pos + 1),
+        ReNode::Class { items, negated } => {
+            pos < t.len() && re_class_hit(items, *negated, t[pos]) && k(pos + 1)
+        }
+        ReNode::Start => pos == 0 && k(pos),
+        ReNode::End => pos == t.len() && k(pos),
+        ReNode::Group(alt) => alt.iter().any(|seq| re_seq(seq, t, pos, k)),
+    }
+}
+
+/// Greedy `*`: take one more, else fall through to the rest.
+fn re_star(node: &ReNode, rest: &[ReItem], t: &[char], pos: usize, k: &dyn Fn(usize) -> bool) -> bool {
+    // A repetition that consumed nothing must not recurse, or `()*` loops.
+    re_atom(node, t, pos, &|p| p != pos && re_star(node, rest, t, p, k)) || re_seq(rest, t, pos, k)
+}
+
+fn re_seq(seq: &[ReItem], t: &[char], pos: usize, k: &dyn Fn(usize) -> bool) -> bool {
+    let Some(item) = seq.first() else { return k(pos) };
+    let rest = &seq[1..];
+    match item.quant {
+        ReQuant::One => re_atom(&item.node, t, pos, &|p| re_seq(rest, t, p, k)),
+        ReQuant::Opt => {
+            re_atom(&item.node, t, pos, &|p| re_seq(rest, t, p, k)) || re_seq(rest, t, pos, k)
+        }
+        ReQuant::Star => re_star(&item.node, rest, t, pos, k),
+        ReQuant::Plus => re_atom(&item.node, t, pos, &|p| re_star(&item.node, rest, t, p, k)),
+    }
+}
+
+/// Why `pattern` is outside the supported subset, or `None` when it compiles.
+///
+/// Refused rather than approximated — see the module comment above. Every
+/// message names the construct, because "regex error" sends the reader to
+/// fix the wrong thing.
+fn regex_error(pattern: &str) -> Option<String> {
+    regex_compile(pattern).err()
+}
+
+/// POSIX ERE matching over the documented subset. Unanchored patterns search
+/// for a match anywhere, exactly as `~` does in Postgres.
+///
+/// A pattern outside the subset matches NOTHING here; callers validate with
+/// `regex_error` at parse time so that case is reported, never reached.
+fn regex_match(value: &str, pattern: &str, ci: bool) -> bool {
+    let (v, p) = if ci {
+        (value.to_lowercase(), pattern.to_lowercase())
+    } else {
+        (value.to_string(), pattern.to_string())
+    };
+    let Ok(alt) = regex_compile(&p) else { return false };
+    let t: Vec<char> = v.chars().collect();
+    let done = |_: usize| true;
+    (0..=t.len()).any(|start| alt.iter().any(|seq| re_seq(seq, &t, start, &done)))
 }
 
 /// Public aliases so the SQL `SELECT` engine matches patterns with EXACTLY
@@ -872,9 +1042,10 @@ pub fn regex_match_pub(value: &str, pattern: &str, ci: bool) -> bool {
     regex_match(value, pattern, ci)
 }
 
-/// The first unsupported regex metacharacter, or `None`. See `Pred::Regex`.
-pub fn unsupported_regex_char_pub(pattern: &str) -> Option<char> {
-    unsupported_regex_char(pattern)
+/// Why a pattern is outside the supported regex subset, or `None`. See
+/// `Pred::Regex`.
+pub fn regex_error_pub(pattern: &str) -> Option<String> {
+    regex_error(pattern)
 }
 
 /// SQL `LIKE` matching — `%` any run, `_` exactly one char.
@@ -1909,21 +2080,68 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_regex_metacharacter_is_REFUSED_not_approximated() {
-        // The whole point. Matching `a+b` approximately would silently include
-        // or exclude rows, and a wrong catalogue listing looks exactly like a
-        // correct one. So the parser refuses and names the character.
-        for pat in ["a+b", "a*b", "a?b", "[ab]", "(a|b)", "a{2}", "a\\.b"] {
-            assert!(unsupported_regex_char(pat).is_some(),
-                    "{:?} must be refused, not matched approximately", pat);
+    fn regex_groups_alternation_classes_and_quantifiers_match_as_ERE_says() {
+        // THE case that forced the wider subset: `\d orders` sends
+        // `relname ~ '^(orders)$'`, and `\d ord*` sends `^(ord.*)$`.
+        assert!(regex_match("orders", "^(orders)$", false));
+        assert!(!regex_match("orders2", "^(orders)$", false));
+        assert!(regex_match("orders", "^(ord.*)$", false));
+        assert!(regex_match("ord", "^(ord.*)$", false), "`.*` may match nothing");
+        assert!(!regex_match("xord", "^(ord.*)$", false));
+        // alternation, inside and outside a group
+        assert!(regex_match("drivers", "^(orders|drivers)$", false));
+        assert!(!regex_match("riders", "^(orders|drivers)$", false));
+        assert!(regex_match("b", "a|b", false));
+        // quantifiers are greedy and backtrack
+        assert!(regex_match("aaab", "^a+b$", false));
+        assert!(!regex_match("b", "^a+b$", false));
+        assert!(regex_match("b", "^a*b$", false));
+        assert!(regex_match("ab", "^a?b$", false));
+        assert!(!regex_match("aab", "^a?b$", false));
+        assert!(regex_match("aXb", "^a.+b$", false));
+        // classes, ranges, negation, and a trailing literal `-`
+        assert!(regex_match("pg_toast_9", "^pg_[a-z]+_[0-9]$", false));
+        assert!(!regex_match("pg_toast_x", "^pg_[a-z]+_[0-9]$", false));
+        assert!(regex_match("x", "^[^0-9]$", false));
+        assert!(!regex_match("5", "^[^0-9]$", false));
+        assert!(regex_match("a-b", "^a[-]b$", false));
+        // an escape is the literal character, so `\.` is a dot and not "any"
+        assert!(regex_match("a.b", "^a\\.b$", false));
+        assert!(!regex_match("axb", "^a\\.b$", false));
+        assert!(regex_match("(x)", "^\\(x\\)$", false));
+        // `()*` must not loop forever: an empty repetition consumes nothing
+        assert!(regex_match("q", "^()*q$", false));
+        // operates on chars
+        assert!(regex_match("héllo", "^h.l+o$", false));
+    }
+
+    #[test]
+    fn an_unsupported_regex_construct_is_REFUSED_BY_NAME_not_approximated() {
+        // Matching `a{2,3}` approximately would silently include or exclude
+        // rows, and a wrong catalogue listing looks exactly like a correct
+        // one. So the parser refuses and names the construct.
+        for (pat, needle) in [
+            ("a{2}", "interval"),
+            ("[[:alpha:]]", "POSIX character class"),
+            ("(a)\\1", "back-reference"),
+            ("\\d+", "shorthand class"),
+            ("(ab", "unmatched '('"),
+            ("ab)", "unmatched ')'"),
+            ("[ab", "unmatched '['"),
+            ("*a", "nothing to repeat"),
+            ("[z-a]", "reversed"),
+        ] {
+            let why = regex_error(pat).unwrap_or_else(|| {
+                panic!("{:?} must be refused, not matched approximately", pat)
+            });
+            assert!(why.contains(needle), "{:?}: {:?} should name {:?}", pat, why, needle);
+            // And the matcher never answers for a pattern the parser refused.
+            assert!(!regex_match("aa", pat, false));
         }
-        for pat in ["^pg_", "sql$", "^public$", "a.c", "plain", ""] {
-            assert_eq!(unsupported_regex_char(pat), None, "{:?} is in the subset", pat);
+        for pat in ["^pg_", "sql$", "^public$", "a.c", "plain", "", "^(orders)$",
+                    "a+b", "a*b", "a?b", "[ab]", "(a|b)", "a\\.b", "a[-]b"] {
+            assert_eq!(regex_error(pat), None, "{:?} is in the subset", pat);
         }
-        // `\` is refused because an escape changes the NEXT character's
-        // meaning: honouring `.` while ignoring `\` would make `\.` match any
-        // character instead of a literal dot.
-        assert_eq!(unsupported_regex_char("a\\.b"), Some('\\'));
     }
 
     #[test]
@@ -1948,8 +2166,8 @@ mod tests {
 
     #[test]
     fn a_bad_regex_is_rejected_at_parse_time_with_the_offending_char() {
-        let e = parse(r#"FROM t WHERE x ~ "a+b""#).unwrap_err().to_string();
-        assert!(e.contains('+'), "the error must name the character: {}", e);
+        let e = parse(r#"FROM t WHERE x ~ "a{2}""#).unwrap_err().to_string();
+        assert!(e.contains("interval"), "the error must name the construct: {}", e);
         assert!(e.contains("refused"), "{}", e);
     }
 

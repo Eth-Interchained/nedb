@@ -130,55 +130,202 @@ def like_to_regex(pattern: str, ci: bool = False) -> "re.Pattern":
     return re.compile("^" + "".join(out) + "$", flags)
 
 
-# ── `~` / `!~` — POSIX regex over a DOCUMENTED SUBSET ────────────────────────
-
-# Supported: ^ $ . and literal text. Everything else is REFUSED.
+# ── `~` / `!~` — POSIX ERE, the subset psql actually writes ─────────────────
 #
-# This exists because Postgres catalogue introspection needs it: psql's `\dn`
-# filters with `nspname !~ '^pg_'`. Without the operator those queries cannot
-# run at all.
+# A hand-rolled backtracking matcher, and the SAME ALGORITHM as the Rust
+# engine's (rust/nedb-v2/src/nql.rs) — Python has `re` and could match the
+# full language, but two engines that accept different regex languages is a
+# divergence in a FILTER, which silently includes or excludes rows. So Python
+# implements the identical grammar and refuses the identical patterns rather
+# than being quietly more capable.
 #
-# Python has `re` and could match the full language — but the RUST engine
-# cannot without taking a regex dependency it should not take for two anchored
-# prefix patterns. Two engines that accept different regex languages is a
-# divergence, and a divergence in a FILTER silently includes or excludes rows.
-# So Python deliberately implements the same subset and refuses the same
-# patterns, rather than being quietly more capable.
-_REGEX_UNSUPPORTED = set("*+?[](){}|\\")
+# It used to be `^ $ .` and literal text, which was everything psql's `\dn`
+# and `\dt` needed — and then `\d orders` sent `relname ~ '^(orders)$'` and
+# the group was refused by name. Groups, alternation and the three quantifiers
+# are the whole of what psql generates (`\d ord*` becomes `^(ord.*)$`).
+#
+# Supported:  literals · `.` · `^` `$` · `|` · `( )` · `[abc]` `[^a-z]` ·
+#             `*` `+` `?` · `\x` as the literal x
+# Refused BY NAME, never approximated: `{n,m}` intervals, `[[:class:]]` POSIX
+# classes, `\1` back-references and `\d \w \s \b` shorthands.
 
 
-def unsupported_regex_char(pattern: str):
-    """The first metacharacter outside the supported subset, or None."""
-    for ch in pattern:
-        if ch in _REGEX_UNSUPPORTED:
-            return ch
+class RegexError(ValueError):
+    """A pattern outside the supported subset, naming the construct."""
+
+
+def _re_parse_alt(p, pos, depth):
+    """Returns (branches, pos). A branch is a list of (node, quant)."""
+    branches = []
+    while True:
+        seq = []
+        while pos < len(p):
+            c = p[pos]
+            if c in "|)":
+                break
+            pos += 1
+            if c == ".":
+                node = ("any",)
+            elif c == "^":
+                node = ("start",)
+            elif c == "$":
+                node = ("end",)
+            elif c == "(":
+                inner, pos = _re_parse_alt(p, pos, depth + 1)
+                if pos >= len(p) or p[pos] != ")":
+                    raise RegexError("regex has an unmatched '('")
+                pos += 1
+                node = ("group", inner)
+            elif c == "[":
+                negated = pos < len(p) and p[pos] == "^"
+                if negated:
+                    pos += 1
+                items = []
+                first = True
+                while True:
+                    if pos >= len(p):
+                        raise RegexError("regex has an unmatched '['")
+                    ch = p[pos]
+                    if ch == "]" and not first:
+                        pos += 1
+                        break
+                    first = False
+                    if ch == "[" and pos + 1 < len(p) and p[pos + 1] == ":":
+                        raise RegexError(
+                            "regex uses a POSIX character class like [[:alpha:]], "
+                            "which this engine does not implement")
+                    if ch == "\\":
+                        pos += 1
+                        if pos >= len(p):
+                            raise RegexError("regex ends inside an escape")
+                        lo = p[pos]
+                    else:
+                        lo = ch
+                    pos += 1
+                    # `a-z`, but a trailing `-` before `]` is a literal.
+                    if pos + 1 < len(p) and p[pos] == "-" and p[pos + 1] != "]":
+                        hi = p[pos + 1]
+                        pos += 2
+                        if hi < lo:
+                            raise RegexError(f"regex range {lo}-{hi} is reversed")
+                        items.append((lo, hi))
+                    else:
+                        items.append((lo, lo))
+                node = ("class", items, negated)
+            elif c in "{}":
+                raise RegexError(
+                    f"regex uses {c!r} (an interval like a{{2,3}}), which this "
+                    f"engine does not implement")
+            elif c in "*+?":
+                raise RegexError(f"regex has a {c!r} with nothing to repeat")
+            elif c == "\\":
+                if pos >= len(p):
+                    raise RegexError("regex ends inside an escape")
+                e = p[pos]
+                pos += 1
+                if e.isdigit():
+                    raise RegexError(
+                        "regex uses a back-reference like \\1, which this engine "
+                        "does not implement")
+                if e in "dDwWsSbB":
+                    raise RegexError(
+                        f"regex uses the shorthand class \\{e}, which this engine "
+                        f"does not implement — write the [..] class out")
+                node = ("char", e)
+            else:
+                node = ("char", c)
+            quant = "one"
+            if pos < len(p) and p[pos] in "*+?":
+                quant = {"*": "star", "+": "plus", "?": "opt"}[p[pos]]
+                pos += 1
+            if quant != "one" and node[0] in ("start", "end"):
+                raise RegexError("regex repeats an anchor, which is meaningless")
+            seq.append((node, quant))
+        branches.append(seq)
+        if pos < len(p) and p[pos] == "|":
+            pos += 1
+            continue
+        if pos < len(p) and p[pos] == ")" and depth == 0:
+            raise RegexError("regex has an unmatched ')'")
+        return branches, pos
+
+
+def regex_compile(pattern: str):
+    """Compile a pattern, or raise RegexError naming the construct."""
+    branches, pos = _re_parse_alt(pattern, 0, 0)
+    if pos < len(pattern):
+        raise RegexError(f"regex {pattern!r} has an unmatched ')'")
+    return branches
+
+
+def regex_error(pattern: str):
+    """Why `pattern` is outside the subset, or None when it compiles."""
+    try:
+        regex_compile(pattern)
+    except RegexError as e:
+        return str(e)
     return None
 
 
-def regex_match(value: str, pattern: str, ci: bool = False) -> bool:
-    """Match the supported subset. `^`/`$` anchor; `.` is exactly one char.
+def unsupported_regex_char(pattern: str):
+    """Back-compatible spelling of `regex_error` — kept for older callers."""
+    return regex_error(pattern)
 
-    A lone `$` is an END ANCHOR and matches every string — POSIX says so, and
-    treating it as a literal dollar sign was a real bug caught by test.
+
+def _re_atom(node, t, pos, k):
+    kind = node[0]
+    if kind == "char":
+        return pos < len(t) and t[pos] == node[1] and k(pos + 1)
+    if kind == "any":
+        return pos < len(t) and k(pos + 1)
+    if kind == "class":
+        if pos >= len(t):
+            return False
+        c = t[pos]
+        hit = any(lo <= c <= hi for lo, hi in node[1])
+        return (hit != node[2]) and k(pos + 1)
+    if kind == "start":
+        return pos == 0 and k(pos)
+    if kind == "end":
+        return pos == len(t) and k(pos)
+    # group
+    return any(_re_seq(seq, t, pos, k) for seq in node[1])
+
+
+def _re_star(node, rest, t, pos, k):
+    # A repetition that consumed nothing must not recurse, or `()*` loops.
+    return (_re_atom(node, t, pos, lambda p: p != pos and _re_star(node, rest, t, p, k))
+            or _re_seq(rest, t, pos, k))
+
+
+def _re_seq(seq, t, pos, k):
+    if not seq:
+        return k(pos)
+    (node, quant), rest = seq[0], seq[1:]
+    if quant == "one":
+        return _re_atom(node, t, pos, lambda p: _re_seq(rest, t, p, k))
+    if quant == "opt":
+        return (_re_atom(node, t, pos, lambda p: _re_seq(rest, t, p, k))
+                or _re_seq(rest, t, pos, k))
+    if quant == "star":
+        return _re_star(node, rest, t, pos, k)
+    return _re_atom(node, t, pos, lambda p: _re_star(node, rest, t, p, k))
+
+
+def regex_match(value: str, pattern: str, ci: bool = False) -> bool:
+    """POSIX ERE over the documented subset; unanchored patterns search.
+
+    A pattern outside the subset matches NOTHING here; callers validate with
+    `regex_error` at parse time so that case is reported, never reached.
     """
     if ci:
         value, pattern = value.lower(), pattern.lower()
-    start = pattern.startswith("^")
-    end = pattern.endswith("$")
-    body = pattern[1 if start else 0: len(pattern) - (1 if end else 0)]
-
-    def at(i: int) -> bool:
-        if i + len(body) > len(value):
-            return False
-        return all(pc == "." or pc == value[i + j] for j, pc in enumerate(body))
-
-    if start and end:
-        return len(value) == len(body) and at(0)
-    if start:
-        return at(0)
-    if end:
-        return len(value) >= len(body) and at(len(value) - len(body))
-    return any(at(i) for i in range(len(value) - len(body) + 1))
+    try:
+        branches = regex_compile(pattern)
+    except RegexError:
+        return False
+    return any(_re_seq(seq, value, start, lambda _p: True)
+               for start in range(len(value) + 1) for seq in branches)
 
 
 def parse_nql(text: str) -> dict:
@@ -376,17 +523,16 @@ def parse_nql(text: str) -> dict:
             if t2 not in ("str", "word"):
                 raise SyntaxError(f"NQL: {op} expects a pattern string, got {pat!r}")
             i += 1
-            bad = unsupported_regex_char(pat)
-            if bad is not None:
+            why = regex_error(pat)
+            if why is not None:
                 # Refused at PARSE time so the caller learns at the point of
                 # the mistake, and refused identically in both engines so the
                 # two cannot accept different regex languages.
                 raise SyntaxError(
-                    f"NQL: regex {pat!r} uses {bad!r}, which this engine does not "
-                    f"implement. The supported subset is ^ $ . and literal text — "
-                    f"enough for catalogue filters like '^pg_'. Matching the rest "
-                    f"approximately would silently include or exclude rows, so it "
-                    f"is refused instead")
+                    f"NQL: {why} — in {pat!r}. The supported subset is ^ $ . | ( ) "
+                    f"[ ] * + ? and literal text. Matching the rest approximately "
+                    f"would silently include or exclude rows, so it is refused "
+                    f"instead")
             return {"op": "regex", "field": field, "pattern": pat,
                     "negated": op.startswith("!"), "ci": op.endswith("*")}
 

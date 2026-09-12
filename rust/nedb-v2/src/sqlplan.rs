@@ -176,6 +176,10 @@ pub struct Plan {
     /// silent: you cannot tell "correctly refused" from "forgot to look" if
     /// the decision leaves no trace.
     pub refusals: Vec<String>,
+    /// Stages this plan tree cannot draw — a set operation's arms, an
+    /// aggregate collapse — reported as prose rather than omitted, because a
+    /// plan that silently leaves out a stage misdescribes what ran.
+    pub notes: Vec<String>,
 }
 
 impl Plan {
@@ -285,6 +289,9 @@ impl Plan {
 
         for r in &self.refusals {
             out.push(r.clone());
+        }
+        for n in &self.notes {
+            out.push(n.clone());
         }
         if let Some(b) = self.budget {
             out.push(format!(

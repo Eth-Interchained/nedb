@@ -88,8 +88,42 @@ pub fn is_catalog(table: &str) -> bool {
             | "information_schema.schemata"
             | "information_schema.key_column_usage"
             | "information_schema.table_constraints"
-    )
+    ) || EMPTY_CATALOG.contains(&table)
 }
+
+/// Postgres system relations psql's `\d` family reads that NEDB has no
+/// counterpart for: no policies, defaults, collations, inheritance,
+/// publications, triggers, rules, large objects, extended statistics,
+/// enums, procedures, operators, extensions, foreign servers, text search
+/// or event triggers.
+///
+/// Each is a real relation here that is EMPTY, which is the truthful answer
+/// — `\dRp` on a fresh Postgres lists no publications either. An unknown
+/// bare name is still an error; these are the names psql 17 actually writes,
+/// verified by running every backslash command against the binary.
+const EMPTY_CATALOG: &[&str] = &[
+    "pg_policy", "pg_attrdef", "pg_collation", "pg_inherits", "pg_publication",
+    "pg_publication_rel", "pg_publication_namespace", "pg_subscription",
+    "pg_subscription_rel", "pg_largeobject_metadata", "pg_statistic_ext",
+    "pg_statistic_ext_data", "pg_trigger", "pg_rewrite", "pg_event_trigger",
+    "pg_enum", "pg_range", "pg_proc", "pg_aggregate", "pg_language",
+    "pg_operator", "pg_opclass", "pg_opfamily", "pg_amop", "pg_amproc", "pg_cast",
+    "pg_conversion", "pg_extension", "pg_available_extensions",
+    "pg_available_extension_versions", "pg_foreign_data_wrapper",
+    "pg_foreign_server", "pg_foreign_table", "pg_user_mapping", "pg_user_mappings",
+    "pg_default_acl", "pg_partitioned_table", "pg_ts_config", "pg_ts_config_map",
+    "pg_ts_dict", "pg_ts_parser", "pg_ts_template", "pg_seclabel", "pg_shdescription",
+    "pg_auth_members", "pg_shseclabel", "pg_replication_origin", "pg_sequence",
+    "pg_stat_user_tables", "pg_stat_all_tables", "pg_stats", "pg_statistic",
+    "pg_depend", "pg_shdepend", "pg_init_privs", "pg_parameter_acl",
+    "pg_transform", "pg_group", "pg_shadow", "pg_locks", "pg_stat_activity",
+    "pg_prepared_statements", "pg_cursors", "pg_timezone_names", "pg_timezone_abbrevs",
+    "information_schema.views", "information_schema.routines",
+    "information_schema.sequences", "information_schema.referential_constraints",
+    "information_schema.constraint_column_usage", "information_schema.triggers",
+    "information_schema.domains", "information_schema.column_privileges",
+    "information_schema.table_privileges", "information_schema.check_constraints",
+];
 
 /// A stable synthetic OID for a name.
 ///
@@ -240,12 +274,34 @@ pub fn rows(table: &str, db: Option<&Arc<Db>>) -> Option<Vec<Value>> {
                     ("relowner", json!(OWNER_OID)),
                     ("relam", json!(2)),          // heap
                     ("reltuples", json!(-1.0)),   // -1 = never analysed, which is true
+                    ("relpages", json!(0)),
                     ("relhasindex", json!(false)),
                     ("relpersistence", json!("p")),
                     ("reltablespace", json!(0)),
                     ("relispartition", json!(false)),
                     ("reltoastrelid", json!(0)),
                     ("relnatts", json!(columns_of(db, c).len() as i64)),
+                    // What `\d <table>` reads to decide which further
+                    // queries to send. Every "has" is false and every count is
+                    // zero because NEDB has none of these — and each false
+                    // spares psql a query against an empty relation.
+                    ("relacl", Value::Null),
+                    ("relchecks", json!(0)),
+                    ("relhasrules", json!(false)),
+                    ("relhastriggers", json!(false)),
+                    ("relhassubclass", json!(false)),
+                    ("relrowsecurity", json!(false)),
+                    ("relforcerowsecurity", json!(false)),
+                    ("relispopulated", json!(true)),
+                    ("relreplident", json!("d")),
+                    ("reloftype", json!(0)),
+                    ("relpartbound", Value::Null),
+                    ("reloptions", Value::Null),
+                    ("relfilenode", json!(oid_for(c))),
+                    ("reltype", json!(0)),
+                    ("relofoid", json!(0)),
+                    // `tableoid` is the OID of pg_class itself in Postgres.
+                    ("tableoid", json!(1259)),
                 ])
             })
             .collect(),
@@ -274,6 +330,19 @@ pub fn rows(table: &str, db: Option<&Arc<Db>>) -> Option<Vec<Value>> {
                             ("attisdropped", json!(false)),
                             ("attidentity", json!("")),
                             ("attgenerated", json!("")),
+                            ("attacl", Value::Null),
+                            ("attcollation", json!(0)),
+                            ("attstattarget", Value::Null),
+                            ("attstorage", json!("x")),
+                            ("attcompression", json!("")),
+                            ("attfdwoptions", Value::Null),
+                            ("attoptions", Value::Null),
+                            ("attndims", json!(0)),
+                            ("attbyval", json!(false)),
+                            ("attalign", json!("i")),
+                            ("atthasmissing", json!(false)),
+                            ("attislocal", json!(true)),
+                            ("attinhcount", json!(0)),
                         ])
                     })
                     .collect::<Vec<_>>()
@@ -352,6 +421,23 @@ pub fn rows(table: &str, db: Option<&Arc<Db>>) -> Option<Vec<Value>> {
                 ("typcategory", json!("S")),
                 ("typelem", json!(0)),
                 ("typrelid", json!(0)),
+                // What `\dT` reads: no array types are advertised, so the
+                // NOT EXISTS over `typarray` finds nothing to hide; no
+                // domains, so `typbasetype` is 0 and `typtype` is never 'd'.
+                ("typarray", json!(0)),
+                ("typbasetype", json!(0)),
+                ("typtypmod", json!(-1)),
+                ("typcollation", json!(0)),
+                ("typnotnull", json!(false)),
+                ("typdefault", Value::Null),
+                ("typacl", Value::Null),
+                ("typndims", json!(0)),
+                ("typbyval", json!(false)),
+                ("typalign", json!("i")),
+                ("typstorage", json!("x")),
+                ("typinput", json!(0)),
+                ("typoutput", json!(0)),
+                ("tableoid", json!(1247)),
             ])
         })
         .collect(),
@@ -399,6 +485,8 @@ pub fn rows(table: &str, db: Option<&Arc<Db>>) -> Option<Vec<Value>> {
         "pg_index" | "pg_description" | "pg_constraint" | "pg_tablespace"
         | "pg_settings" | "information_schema.key_column_usage"
         | "information_schema.table_constraints" => vec![],
+
+        t if EMPTY_CATALOG.contains(&t) => vec![],
 
         _ => return None,
     })

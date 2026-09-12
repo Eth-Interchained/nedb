@@ -323,6 +323,27 @@ pub enum Expr {
     /// catalogue SQL uses (`prattrs::int2[]`), and the alternative — refusing
     /// every cast — would reject queries whose result the cast cannot change.
     Cast { expr: Box<Expr>, ty: String },
+    /// `(SELECT ...)` used as a VALUE: one column, at most one row. Postgres's
+    /// `\dT` hinges on one (`(SELECT c.relkind = 'c' FROM pg_class c WHERE
+    /// c.oid = t.typrelid)`), and `\d <table>` on three.
+    Subquery(Box<Select>),
+    /// `[NOT] EXISTS (SELECT ...)` — never NULL, which is why it is its own
+    /// variant rather than `Subquery IS NOT NULL`.
+    Exists { query: Box<Select>, negated: bool },
+    /// `ARRAY(SELECT ...)` — the first column of every row, as one array.
+    /// `\dp`, `\dT+`, `\dD` and `\dy` all build one and hand it to
+    /// `array_to_string`.
+    ArrayQuery(Box<Select>),
+    /// `x [NOT] IN (SELECT ...)` — `InList` semantics over the first column.
+    InSubquery { expr: Box<Expr>, query: Box<Select>, negated: bool },
+    /// `x op ANY (...)` / `x op SOME (...)` / `x op ALL (...)`. The right side
+    /// evaluates to an array — an `ArrayQuery` when it was written as a
+    /// subquery — and `op` is applied element by element.
+    Quantified { op: String, left: Box<Expr>, all: bool, right: Box<Expr> },
+    /// `arr[i]` — one-based, as Postgres subscripts are.
+    Index { expr: Box<Expr>, index: Box<Expr> },
+    /// `ARRAY[a, b, c]` — an array literal.
+    ArrayLit(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -341,11 +362,33 @@ pub struct TableRef {
     /// The table name as written, minus quoting. A `pg_catalog.` qualifier is
     /// preserved here and resolved by the caller, because `information_schema`
     /// table names collide with plausible user collection names.
+    ///
+    /// For a derived table this is the literal `(subquery)`, and for a table
+    /// function it is the function's bare name — both only ever shown in a
+    /// plan, never resolved as a relation.
     pub name: String,
     pub alias: Option<String>,
+    /// `FROM (SELECT ...) AS t` — the relation is the subquery's output.
+    /// psql's `\dd` is one seven-arm `UNION ALL` wrapped exactly this way.
+    pub sub: Option<Box<Select>>,
+    /// `FROM generate_series(0, n) s` / `FROM unnest(arr) AS t(x)` — a table
+    /// function with its arguments. Evaluated in the enclosing row's scope,
+    /// because psql writes `unnest(evttags)` over the OUTER row's column.
+    pub args: Option<Vec<Expr>>,
+    /// `AS t(x, y)` — column aliases for a derived table or table function.
+    pub col_aliases: Vec<String>,
+    /// `LATERAL (SELECT ...)` — the derived table may read the FROM items
+    /// before it, so it is re-evaluated once per row of those. psql's `\dP+`
+    /// sizes each partitioned table this way.
+    pub lateral: bool,
 }
 
 impl TableRef {
+    /// A plain named relation.
+    pub fn named(name: impl Into<String>, alias: Option<String>) -> Self {
+        TableRef { name: name.into(), alias, sub: None, args: None, col_aliases: vec![], lateral: false }
+    }
+
     /// How this table's columns are addressed: the alias when given, else the
     /// table's own bare name, which is what SQL says.
     pub fn binding(&self) -> String {
@@ -353,6 +396,18 @@ impl TableRef {
             self.name.rsplit('.').next().unwrap_or(&self.name).to_string()
         })
     }
+}
+
+/// `UNION` / `INTERSECT` / `EXCEPT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp { Union, Intersect, Except }
+
+/// One further arm of a compound query: `<op> [ALL] SELECT ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetArm {
+    pub op: SetOp,
+    pub all: bool,
+    pub query: Select,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -384,9 +439,119 @@ pub struct Select {
     pub from: Option<TableRef>,
     pub joins: Vec<Join>,
     pub where_: Option<Expr>,
+    /// `ORDER BY` / `LIMIT` / `OFFSET`. On a compound query (`set_ops`
+    /// non-empty) these apply to the COMBINED result, as SQL says, and every
+    /// arm carries none of its own.
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// The further arms of a `UNION` / `INTERSECT` / `EXCEPT`. Empty for an
+    /// ordinary SELECT. This SELECT's own clauses are the FIRST arm.
+    pub set_ops: Vec<SetArm>,
+}
+
+impl Select {
+    /// Every base relation this query reads, at any depth: the FROM list,
+    /// the joins, derived tables, and every subquery inside an expression or
+    /// a further set-operation arm.
+    ///
+    /// The caller that routes a statement to this engine decides by relation
+    /// name, so a name buried three levels down inside `\dd`'s derived table
+    /// has to surface here or the statement is routed to a path that cannot
+    /// parse it — and reports a confusing error from that path.
+    pub fn base_relations(&self) -> Vec<String> {
+        let mut out = vec![];
+        self.collect_relations(&mut out);
+        out
+    }
+
+    fn collect_relations(&self, out: &mut Vec<String>) {
+        fn table(t: &TableRef, out: &mut Vec<String>) {
+            if let Some(sub) = &t.sub {
+                sub.collect_relations(out);
+            } else if let Some(args) = &t.args {
+                for a in args {
+                    expr(a, out);
+                }
+            } else {
+                out.push(t.name.clone());
+            }
+        }
+        fn expr(e: &Expr, out: &mut Vec<String>) {
+            match e {
+                Expr::Subquery(q) | Expr::ArrayQuery(q) => q.collect_relations(out),
+                Expr::Exists { query, .. } => query.collect_relations(out),
+                Expr::InSubquery { expr: x, query, .. } => {
+                    expr(x, out);
+                    query.collect_relations(out);
+                }
+                Expr::Quantified { left, right, .. } => {
+                    expr(left, out);
+                    expr(right, out);
+                }
+                Expr::Index { expr: x, index } => {
+                    expr(x, out);
+                    expr(index, out);
+                }
+                Expr::ArrayLit(items) | Expr::InList { list: items, .. } => {
+                    if let Expr::InList { expr: x, .. } = e {
+                        expr(x, out);
+                    }
+                    for i in items {
+                        expr(i, out);
+                    }
+                }
+                Expr::Func { args, .. } => {
+                    for a in args {
+                        expr(a, out);
+                    }
+                }
+                Expr::Case { operand, whens, else_ } => {
+                    if let Some(o) = operand {
+                        expr(o, out);
+                    }
+                    for (w, t) in whens {
+                        expr(w, out);
+                        expr(t, out);
+                    }
+                    if let Some(x) = else_ {
+                        expr(x, out);
+                    }
+                }
+                Expr::Binary { left, right, .. } => {
+                    expr(left, out);
+                    expr(right, out);
+                }
+                Expr::Unary { expr: x, .. } | Expr::Cast { expr: x, .. } | Expr::IsNull { expr: x, .. } => {
+                    expr(x, out)
+                }
+                Expr::Column { .. } | Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) => {}
+            }
+        }
+        if let Some(f) = &self.from {
+            table(f, out);
+        }
+        for j in &self.joins {
+            table(&j.table, out);
+            if let Some(on) = &j.on {
+                expr(on, out);
+            }
+        }
+        for item in &self.items {
+            expr(&item.expr, out);
+        }
+        if let Some(w) = &self.where_ {
+            expr(w, out);
+        }
+        for ob in &self.order_by {
+            if let Some(e) = &ob.expr {
+                expr(e, out);
+            }
+        }
+        for arm in &self.set_ops {
+            arm.query.collect_relations(out);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -546,6 +711,33 @@ impl Parser {
                 _ => break,
             };
             self.pos += width;
+
+            // `x op ANY (...)` / `SOME` / `ALL` — a quantified comparison.
+            // psql's `\dp` writes `oid = ANY (polroles)`, `\dX` writes
+            // `'d' = any(es.stxkind)`. The right side is either an array value
+            // or a subquery, and the subquery form is read as ARRAY(SELECT)
+            // so one evaluator serves both.
+            let quant = match self.peek() {
+                Tok::Word { upper, .. }
+                    if matches!(upper.as_str(), "ANY" | "SOME" | "ALL")
+                        && matches!(self.peek_at(1), Tok::Punct('(')) =>
+                {
+                    Some(upper == "ALL")
+                }
+                _ => None,
+            };
+            if let Some(all) = quant {
+                self.pos += 2; // the word and the `(`
+                let right = if self.peek().is_kw("SELECT") {
+                    Expr::ArrayQuery(Box::new(self.parse_query()?))
+                } else {
+                    self.parse_expr()?
+                };
+                self.expect_punct(')')?;
+                left = Expr::Quantified { op, left: Box::new(left), all, right: Box::new(right) };
+                continue;
+            }
+
             // Left-associative: the right side binds tighter than this level.
             let right = self.parse_bin(bp + 1)?;
             left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
@@ -556,10 +748,34 @@ impl Parser {
 
     fn parse_postfix(&mut self, mut e: Expr) -> Result<Expr> {
         loop {
+            // `arr[i]` — a subscript. psql's publication query writes
+            // `prattrs[s]`.
+            if matches!(self.peek(), Tok::Punct('[')) {
+                self.pos += 1;
+                let index = self.parse_expr()?;
+                self.expect_punct(']')?;
+                e = Expr::Index { expr: Box::new(e), index: Box::new(index) };
+                continue;
+            }
+
             // IS [NOT] NULL
             if self.peek().is_kw("IS") {
                 self.pos += 1;
                 let negated = self.eat_kw("NOT");
+                // `IS [NOT] DISTINCT FROM` — the null-safe comparison, which
+                // psql's `\dconfig` uses. Never UNKNOWN: two NULLs are not
+                // distinct, a NULL and a value are.
+                if self.eat_kw("DISTINCT") {
+                    self.expect_kw("FROM")?;
+                    // Binds like a comparison: the operand is parsed above AND.
+                    let rhs = self.parse_bin(5)?;
+                    e = Expr::Binary {
+                        op: if negated { "IS NOT DISTINCT FROM".into() } else { "IS DISTINCT FROM".into() },
+                        left: Box::new(e),
+                        right: Box::new(rhs),
+                    };
+                    continue;
+                }
                 if !self.eat_kw("NULL") {
                     // `IS TRUE` / `IS FALSE` are the other legal spellings.
                     if self.eat_kw("TRUE") {
@@ -633,6 +849,13 @@ impl Parser {
             };
 
             self.expect_punct('(')?;
+            // `x IN (SELECT ...)` — the list is a subquery's first column.
+            if self.peek().is_kw("SELECT") {
+                let query = Box::new(self.parse_query()?);
+                self.expect_punct(')')?;
+                e = Expr::InSubquery { expr: Box::new(e), query, negated: negated_in };
+                continue;
+            }
             let mut list = vec![];
             if !self.eat_punct(')') {
                 loop {
@@ -736,21 +959,83 @@ impl Parser {
         // nothing about what to change. `\d` and `\dp` both hinge on
         // subqueries, so this is the message somebody will actually read.
         if self.eat_punct('(') {
+            // A scalar subquery. It may carry its own ORDER BY / LIMIT, and
+            // may itself be a UNION, so it is a full query.
             if self.peek().is_kw("SELECT") {
-                bail!("a subquery is not supported by this SELECT path");
+                let q = self.parse_query()?;
+                self.expect_punct(')')?;
+                return Ok(Expr::Subquery(Box::new(q)));
             }
             let e = self.parse_expr()?;
             self.expect_punct(')')?;
             return Ok(e);
         }
 
-        // `ARRAY(SELECT ...)` and `EXISTS (SELECT ...)` — both appear in
-        // psql's \dp, and both are subqueries wearing a function's clothes.
-        if self.peek().is_kw("ARRAY") {
-            bail!("the ARRAY(...) constructor is not supported by this SELECT path");
+        // `ARRAY(SELECT ...)` and `ARRAY[a, b]`. The first appears throughout
+        // psql's `\dp`, `\dT+`, `\dD` and `\dy`; it is a subquery wearing a
+        // function's clothes, and its value is the first column of every row.
+        if self.peek().is_kw("ARRAY") && matches!(self.peek_at(1), Tok::Punct('(') | Tok::Punct('[')) {
+            self.pos += 1;
+            if self.eat_punct('(') {
+                if !self.peek().is_kw("SELECT") {
+                    bail!("ARRAY(...) takes a subquery; for a list of values write ARRAY[...]");
+                }
+                let q = self.parse_query()?;
+                self.expect_punct(')')?;
+                return Ok(Expr::ArrayQuery(Box::new(q)));
+            }
+            self.expect_punct('[')?;
+            let mut items = vec![];
+            if !self.eat_punct(']') {
+                loop {
+                    items.push(self.parse_expr()?);
+                    if self.eat_punct(',') {
+                        continue;
+                    }
+                    self.expect_punct(']')?;
+                    break;
+                }
+            }
+            return Ok(Expr::ArrayLit(items));
         }
-        if self.peek().is_kw("EXISTS") {
-            bail!("EXISTS (...) is not supported by this SELECT path");
+
+        // `EXISTS (SELECT ...)`. `NOT EXISTS` arrives here through
+        // `parse_unary`'s NOT and is wrapped there, which is correct because
+        // EXISTS is never NULL and NOT of a boolean is exact.
+        if self.peek().is_kw("EXISTS") && matches!(self.peek_at(1), Tok::Punct('(')) {
+            self.pos += 2;
+            if !self.peek().is_kw("SELECT") {
+                bail!("EXISTS (...) takes a subquery");
+            }
+            let q = self.parse_query()?;
+            self.expect_punct(')')?;
+            return Ok(Expr::Exists { query: Box::new(q), negated: false });
+        }
+
+        // `CAST(expr AS type)` — the standard spelling of `expr::type`, which
+        // psql's `\dT+` and `\dd` both use. Recorded the same way.
+        if self.peek().is_kw("CAST") && matches!(self.peek_at(1), Tok::Punct('(')) {
+            self.pos += 2;
+            let inner = self.parse_expr()?;
+            self.expect_kw("AS")?;
+            let mut ty = match self.next() {
+                Tok::Word { raw, .. } => raw,
+                Tok::Quoted(s) => s,
+                other => bail!("expected a type name in CAST, got {:?}", other),
+            };
+            while self.eat_punct('.') {
+                match self.next() {
+                    Tok::Word { raw, .. } => ty = raw,
+                    Tok::Quoted(s) => ty = s,
+                    other => bail!("expected a type name after ., got {:?}", other),
+                }
+            }
+            while self.eat_punct('[') {
+                self.expect_punct(']')?;
+                ty.push_str("[]");
+            }
+            self.expect_punct(')')?;
+            return Ok(Expr::Cast { expr: Box::new(inner), ty });
         }
 
         // CASE
@@ -865,6 +1150,31 @@ impl Parser {
     // ── the statement ───────────────────────────────────────────────────────
 
     fn parse_table_ref(&mut self) -> Result<TableRef> {
+        let lateral = self.eat_kw("LATERAL");
+        // `( SELECT ... ) AS t` — a derived table. psql's `\dd` is one.
+        if self.eat_punct('(') {
+            if !self.peek().is_kw("SELECT") {
+                bail!("expected a subquery after '(' in FROM, got {:?}", self.peek());
+            }
+            let sub = self.parse_query()?;
+            self.expect_punct(')')?;
+            let (alias, col_aliases) = self.parse_table_alias()?;
+            if alias.is_none() {
+                bail!("a subquery in FROM must have an alias");
+            }
+            return Ok(TableRef {
+                name: "(subquery)".into(),
+                alias,
+                sub: Some(Box::new(sub)),
+                args: None,
+                col_aliases,
+                lateral,
+            });
+        }
+        if lateral {
+            bail!("LATERAL applies to a subquery in FROM; write LATERAL (SELECT ...)");
+        }
+
         let mut parts = vec![match self.next() {
             Tok::Word { raw, .. } => raw,
             Tok::Quoted(s) => s,
@@ -879,9 +1189,34 @@ impl Parser {
         }
         let name = parts.join(".");
 
-        // `AS alias`, or a bare alias. A bare alias must not swallow a
-        // keyword that starts the next clause, or `FROM t WHERE x` reads `t`
-        // aliased as `WHERE`.
+        // `generate_series(0, n) s` / `unnest(arr) AS t(x)` — a table
+        // function. The schema qualification is dropped, as for scalar calls.
+        if self.eat_punct('(') {
+            let mut args = vec![];
+            if !self.eat_punct(')') {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if self.eat_punct(',') {
+                        continue;
+                    }
+                    self.expect_punct(')')?;
+                    break;
+                }
+            }
+            let fname = name.rsplit('.').next().unwrap_or(&name).to_lowercase();
+            let (alias, col_aliases) = self.parse_table_alias()?;
+            return Ok(TableRef { name: fname, alias, sub: None, args: Some(args), col_aliases, lateral: false });
+        }
+
+        let (alias, col_aliases) = self.parse_table_alias()?;
+        Ok(TableRef { name, alias, sub: None, args: None, col_aliases, lateral: false })
+    }
+
+    /// `AS alias`, or a bare alias, optionally followed by `(col, col)`.
+    ///
+    /// A bare alias must not swallow a keyword that starts the next clause,
+    /// or `FROM t WHERE x` reads `t` aliased as `WHERE`.
+    fn parse_table_alias(&mut self) -> Result<(Option<String>, Vec<String>)> {
         let alias = if self.eat_kw("AS") {
             match self.next() {
                 Tok::Word { raw, .. } => Some(raw),
@@ -901,112 +1236,61 @@ impl Parser {
                 _ => None,
             }
         };
-        Ok(TableRef { name, alias })
+        let mut col_aliases = vec![];
+        if alias.is_some() && self.eat_punct('(') {
+            loop {
+                match self.next() {
+                    Tok::Word { raw, .. } => col_aliases.push(raw),
+                    Tok::Quoted(s) => col_aliases.push(s),
+                    other => bail!("expected a column alias, got {:?}", other),
+                }
+                if self.eat_punct(',') {
+                    continue;
+                }
+                self.expect_punct(')')?;
+                break;
+            }
+        }
+        Ok((alias, col_aliases))
     }
 
-    fn parse_select(&mut self) -> Result<Select> {
-        self.expect_kw("SELECT")?;
-        let distinct = self.eat_kw("DISTINCT");
-        if distinct && self.peek().is_kw("ON") {
-            bail!("DISTINCT ON is not supported");
-        }
-        let _ = self.eat_kw("ALL");
-
-        let mut items = vec![];
+    /// A full query: one or more SELECT bodies joined by set operations, then
+    /// the ORDER BY / LIMIT / OFFSET that apply to the whole.
+    ///
+    /// The tail is parsed HERE and not in the body, because after `a UNION b
+    /// ORDER BY 1` the ORDER BY sorts the union — attaching it to `b` would
+    /// sort one arm and leave the result unordered while reporting success.
+    fn parse_query(&mut self) -> Result<Select> {
+        let mut first = self.parse_select_body()?;
         loop {
-            let expr = self.parse_expr()?;
-            // `AS "Name"`, or a bare alias that is not a clause keyword.
-            let alias = if self.eat_kw("AS") {
-                match self.next() {
-                    Tok::Word { raw, .. } => Some(raw),
-                    Tok::Quoted(s) => Some(s),
-                    other => bail!("expected an alias after AS, got {:?}", other),
-                }
+            let op = if self.eat_kw("UNION") {
+                SetOp::Union
+            } else if self.eat_kw("INTERSECT") {
+                SetOp::Intersect
+            } else if self.eat_kw("EXCEPT") {
+                SetOp::Except
             } else {
-                match self.peek().clone() {
-                    Tok::Word { upper, raw } if !is_clause_keyword(&upper) => {
-                        self.pos += 1;
-                        Some(raw)
-                    }
-                    Tok::Quoted(s) => {
-                        self.pos += 1;
-                        Some(s)
-                    }
-                    _ => None,
-                }
+                break;
             };
-            items.push(SelectItem { expr, alias });
-            if self.eat_punct(',') {
-                continue;
+            let all = self.eat_kw("ALL");
+            if !all {
+                let _ = self.eat_kw("DISTINCT");
             }
-            break;
+            // A parenthesised arm: `UNION (SELECT ...)`.
+            let query = if self.eat_punct('(') {
+                let q = self.parse_query()?;
+                self.expect_punct(')')?;
+                q
+            } else {
+                self.parse_select_body()?
+            };
+            first.set_ops.push(SetArm { op, all, query });
         }
+        self.parse_query_tail(&mut first)?;
+        Ok(first)
+    }
 
-        let mut from = None;
-        let mut joins = vec![];
-        if self.eat_kw("FROM") {
-            from = Some(self.parse_table_ref()?);
-            // A comma-separated FROM list is an implicit CROSS JOIN.
-            while self.eat_punct(',') {
-                let table = self.parse_table_ref()?;
-                joins.push(Join { kind: JoinKind::Cross, table, on: None });
-            }
-            loop {
-                let kind = if self.peek().is_kw("JOIN") {
-                    self.pos += 1;
-                    JoinKind::Inner
-                } else if self.peek().is_kw("INNER") && self.peek_at(1).is_kw("JOIN") {
-                    self.pos += 2;
-                    JoinKind::Inner
-                } else if self.peek().is_kw("CROSS") && self.peek_at(1).is_kw("JOIN") {
-                    self.pos += 2;
-                    JoinKind::Cross
-                } else if self.peek().is_kw("LEFT") {
-                    self.pos += 1;
-                    let _ = self.eat_kw("OUTER");
-                    self.expect_kw("JOIN")?;
-                    JoinKind::Left
-                } else if self.peek().is_kw("RIGHT") {
-                    self.pos += 1;
-                    let _ = self.eat_kw("OUTER");
-                    self.expect_kw("JOIN")?;
-                    JoinKind::Right
-                } else if self.peek().is_kw("FULL") {
-                    self.pos += 1;
-                    let _ = self.eat_kw("OUTER");
-                    self.expect_kw("JOIN")?;
-                    JoinKind::Full
-                } else {
-                    break;
-                };
-                let table = self.parse_table_ref()?;
-                let on = if self.eat_kw("ON") {
-                    Some(self.parse_expr()?)
-                } else if self.peek().is_kw("USING") {
-                    bail!("JOIN ... USING is not supported — write ON a.col = b.col");
-                } else {
-                    None
-                };
-                if on.is_none() && !matches!(kind, JoinKind::Cross) {
-                    bail!("a {:?} JOIN needs an ON clause", kind);
-                }
-                joins.push(Join { kind, table, on });
-            }
-        }
-
-        let where_ = if self.eat_kw("WHERE") {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        if self.peek().is_kw("GROUP") {
-            bail!("GROUP BY is not supported by this SELECT path");
-        }
-        if self.peek().is_kw("HAVING") {
-            bail!("HAVING is not supported by this SELECT path");
-        }
-
+    fn parse_query_tail(&mut self, sel: &mut Select) -> Result<()> {
         let mut order_by = vec![];
         if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
@@ -1069,13 +1353,132 @@ impl Parser {
             }
             break;
         }
+        sel.order_by = order_by;
+        sel.limit = limit;
+        sel.offset = offset;
+        Ok(())
+    }
 
-        let _ = self.eat_punct(';');
-        if !matches!(self.peek(), Tok::Eof) {
-            bail!("unexpected trailing tokens: {:?}", self.peek());
+    /// One `SELECT ... FROM ... WHERE ...` body, without the query tail.
+    fn parse_select_body(&mut self) -> Result<Select> {
+        self.expect_kw("SELECT")?;
+        let distinct = self.eat_kw("DISTINCT");
+        if distinct && self.peek().is_kw("ON") {
+            bail!("DISTINCT ON is not supported");
+        }
+        let _ = self.eat_kw("ALL");
+
+        let mut items = vec![];
+        loop {
+            let expr = self.parse_expr()?;
+            // `AS "Name"`, or a bare alias that is not a clause keyword.
+            let alias = if self.eat_kw("AS") {
+                match self.next() {
+                    Tok::Word { raw, .. } => Some(raw),
+                    Tok::Quoted(s) => Some(s),
+                    other => bail!("expected an alias after AS, got {:?}", other),
+                }
+            } else {
+                match self.peek().clone() {
+                    Tok::Word { upper, raw } if !is_clause_keyword(&upper) => {
+                        self.pos += 1;
+                        Some(raw)
+                    }
+                    Tok::Quoted(s) => {
+                        self.pos += 1;
+                        Some(s)
+                    }
+                    _ => None,
+                }
+            };
+            items.push(SelectItem { expr, alias });
+            if self.eat_punct(',') {
+                continue;
+            }
+            break;
         }
 
-        Ok(Select { distinct, items, from, joins, where_, order_by, limit, offset })
+        let mut from = None;
+        let mut joins = vec![];
+        if self.eat_kw("FROM") {
+            from = Some(self.parse_table_ref()?);
+            loop {
+                // A comma-separated FROM item is an implicit CROSS JOIN, and
+                // it may INTERLEAVE with explicit joins: psql's `\dF+` writes
+                // `FROM c LEFT JOIN n ON ..., p LEFT JOIN np ON ...`. Reading
+                // the commas first and the joins second would parse that as
+                // trailing tokens.
+                if self.eat_punct(',') {
+                    let table = self.parse_table_ref()?;
+                    joins.push(Join { kind: JoinKind::Cross, table, on: None });
+                    continue;
+                }
+                let kind = if self.peek().is_kw("JOIN") {
+                    self.pos += 1;
+                    JoinKind::Inner
+                } else if self.peek().is_kw("INNER") && self.peek_at(1).is_kw("JOIN") {
+                    self.pos += 2;
+                    JoinKind::Inner
+                } else if self.peek().is_kw("CROSS") && self.peek_at(1).is_kw("JOIN") {
+                    self.pos += 2;
+                    JoinKind::Cross
+                } else if self.peek().is_kw("LEFT") {
+                    self.pos += 1;
+                    let _ = self.eat_kw("OUTER");
+                    self.expect_kw("JOIN")?;
+                    JoinKind::Left
+                } else if self.peek().is_kw("RIGHT") {
+                    self.pos += 1;
+                    let _ = self.eat_kw("OUTER");
+                    self.expect_kw("JOIN")?;
+                    JoinKind::Right
+                } else if self.peek().is_kw("FULL") {
+                    self.pos += 1;
+                    let _ = self.eat_kw("OUTER");
+                    self.expect_kw("JOIN")?;
+                    JoinKind::Full
+                } else {
+                    break;
+                };
+                let table = self.parse_table_ref()?;
+                let on = if self.eat_kw("ON") {
+                    Some(self.parse_expr()?)
+                } else if self.peek().is_kw("USING") {
+                    bail!("JOIN ... USING is not supported — write ON a.col = b.col");
+                } else {
+                    None
+                };
+                if on.is_none() && !matches!(kind, JoinKind::Cross) {
+                    bail!("a {:?} JOIN needs an ON clause", kind);
+                }
+                joins.push(Join { kind, table, on });
+            }
+        }
+
+        let where_ = if self.eat_kw("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        if self.peek().is_kw("GROUP") {
+            bail!("GROUP BY is not supported by this SELECT path");
+        }
+        if self.peek().is_kw("HAVING") {
+            bail!("HAVING is not supported by this SELECT path");
+        }
+
+        Ok(Select {
+            distinct,
+            items,
+            from,
+            joins,
+            where_,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            set_ops: vec![],
+        })
     }
 
     fn parse_count(&mut self, what: &str) -> Result<usize> {
@@ -1103,11 +1506,49 @@ fn is_clause_keyword(upper: &str) -> bool {
     )
 }
 
-/// Parse one `SELECT` statement.
+/// Parse one `SELECT` statement — possibly a compound one.
 pub fn parse(sql: &str) -> Result<Select> {
     let toks = lex(sql)?;
     let mut p = Parser { toks, pos: 0 };
-    p.parse_select()
+    // A statement wrapped in parentheses: `(SELECT ...) UNION (SELECT ...)`.
+    let sel = if matches!(p.peek(), Tok::Punct('(')) && p.peek_at(1).is_kw("SELECT") {
+        p.pos += 1;
+        let mut first = p.parse_query()?;
+        p.expect_punct(')')?;
+        // Set operations may follow the parenthesised head.
+        loop {
+            let op = if p.eat_kw("UNION") {
+                SetOp::Union
+            } else if p.eat_kw("INTERSECT") {
+                SetOp::Intersect
+            } else if p.eat_kw("EXCEPT") {
+                SetOp::Except
+            } else {
+                break;
+            };
+            let all = p.eat_kw("ALL");
+            if !all {
+                let _ = p.eat_kw("DISTINCT");
+            }
+            let query = if p.eat_punct('(') {
+                let q = p.parse_query()?;
+                p.expect_punct(')')?;
+                q
+            } else {
+                p.parse_select_body()?
+            };
+            first.set_ops.push(SetArm { op, all, query });
+        }
+        p.parse_query_tail(&mut first)?;
+        first
+    } else {
+        p.parse_query()?
+    };
+    let _ = p.eat_punct(';');
+    if !matches!(p.peek(), Tok::Eof) {
+        bail!("unexpected trailing tokens: {:?}", p.peek());
+    }
+    Ok(sel)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1124,14 +1565,40 @@ pub fn parse(sql: &str) -> Result<Select> {
 /// matching row".
 pub struct Bound<'a> {
     pub parts: Vec<(String, Option<&'a Value>)>,
+    /// What this row may reach beyond itself — see [`EvalCtx`].
+    pub ctx: EvalCtx<'a>,
+}
+
+/// What an expression may reach beyond its own row.
+///
+/// Both fields exist for subqueries. The resolver is what lets a subquery
+/// RUN from inside an expression, and `outer` is the enclosing query's row, so
+/// `WHERE attrelid = c.oid` inside `ARRAY(SELECT ... FROM pg_attribute a ...)`
+/// can see `c` — a correlated subquery, which is what every one of psql's
+/// subqueries is.
+///
+/// Scoping follows SQL: a name resolves in the innermost query that binds it,
+/// and only then in the enclosing one. That matters for the bare column in
+/// `\dp`'s `WHERE oid = ANY (polroles)`: `oid` is the inner `pg_roles`
+/// row's, `polroles` is the outer `pg_policy` row's, and neither is qualified.
+#[derive(Clone, Copy, Default)]
+pub struct EvalCtx<'a> {
+    pub resolver: Option<&'a Resolver<'a>>,
+    pub outer: Option<&'a Bound<'a>>,
 }
 
 impl<'a> Bound<'a> {
+    /// A row with no enclosing scope and no way to run a subquery.
+    pub fn new(parts: Vec<(String, Option<&'a Value>)>) -> Self {
+        Bound { parts, ctx: EvalCtx::default() }
+    }
+
     /// Resolve a column reference.
     ///
-    /// A qualified name looks only at its own binding. A bare name scans the
-    /// bindings in order and takes the first that actually HAS the key —
-    /// which is how SQL resolves an unambiguous bare column across a join.
+    /// A qualified name looks only at its own binding, then at the enclosing
+    /// query's. A bare name scans the bindings in order and takes the first
+    /// that actually HAS the key — which is how SQL resolves an unambiguous
+    /// bare column across a join — and falls back to the enclosing query.
     fn column(&self, qual: Option<&str>, name: &str) -> Value {
         match qual {
             Some(q) => {
@@ -1143,7 +1610,10 @@ impl<'a> Bound<'a> {
                             .unwrap_or(Value::Null);
                     }
                 }
-                Value::Null
+                match self.ctx.outer {
+                    Some(o) if o.has_binding(q) => o.column(qual, name),
+                    _ => Value::Null,
+                }
             }
             None => {
                 for (_, row) in &self.parts {
@@ -1151,16 +1621,21 @@ impl<'a> Bound<'a> {
                         return v.clone();
                     }
                 }
-                Value::Null
+                match self.ctx.outer {
+                    Some(o) => o.column(None, name),
+                    None => Value::Null,
+                }
             }
         }
     }
 
-    /// Is `qual` a binding in this row at all? Used to tell "unknown table
-    /// alias" (a query bug, worth an error) from "column absent in this row"
-    /// (ordinary schemaless behaviour, worth a NULL).
+    /// Is `qual` a binding in this row — or in an enclosing query's row — at
+    /// all? Used to tell "unknown table alias" (a query bug, worth an error)
+    /// from "column absent in this row" (ordinary schemaless behaviour, worth
+    /// a NULL).
     fn has_binding(&self, qual: &str) -> bool {
         self.parts.iter().any(|(b, _)| b.eq_ignore_ascii_case(qual))
+            || self.ctx.outer.is_some_and(|o| o.has_binding(qual))
     }
 
     /// Every column of every bound row, for `SELECT *`.
@@ -1248,6 +1723,23 @@ fn as_text(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         Value::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+        // Postgres's array text form, so `polroles <> '{0}'` compares like
+        // for like and `arr::text` reads as a client expects.
+        Value::Array(items) => {
+            let inner: Vec<String> = items
+                .iter()
+                .map(|i| match i {
+                    Value::Null => "NULL".to_string(),
+                    Value::String(s) if s.is_empty()
+                        || s.chars().any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\')) =>
+                    {
+                        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+                    }
+                    other => as_text(other),
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
         other => other.to_string(),
     }
 }
@@ -1352,79 +1844,7 @@ pub fn eval(e: &Expr, row: &Bound) -> Result<Value> {
 
             let l = eval(left, row)?;
             let r = eval(right, row)?;
-
-            // Every comparison over NULL is UNKNOWN — including `NULL = NULL`.
-            let compare = |ord: fn(std::cmp::Ordering) -> bool| -> Value {
-                match cmp_values(&l, &r) {
-                    None => Value::Null,
-                    Some(o) => Value::Bool(ord(o)),
-                }
-            };
-
-            match op.as_str() {
-                "=" => compare(|o| o.is_eq()),
-                "!=" | "<>" => compare(|o| o.is_ne()),
-                "<" => compare(|o| o.is_lt()),
-                "<=" => compare(|o| o.is_le()),
-                ">" => compare(|o| o.is_gt()),
-                ">=" => compare(|o| o.is_ge()),
-
-                "~" | "~*" | "!~" | "!~*" => {
-                    if l.is_null() || r.is_null() {
-                        Value::Null
-                    } else {
-                        let pat = as_text(&r);
-                        if let Some(bad) = crate::nql::unsupported_regex_char_pub(&pat) {
-                            bail!(
-                                "regex {:?} uses {:?}, which this engine does not \
-                                 implement. The supported subset is ^ $ . and \
-                                 literal text",
-                                pat, bad
-                            );
-                        }
-                        let hit = crate::nql::regex_match_pub(
-                            &as_text(&l), &pat, op.ends_with('*'));
-                        Value::Bool(hit != op.starts_with('!'))
-                    }
-                }
-
-                "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
-                    if l.is_null() || r.is_null() {
-                        Value::Null
-                    } else {
-                        let hit = crate::nql::like_match_pub(
-                            &as_text(&l), &as_text(&r), op.ends_with("ILIKE"));
-                        Value::Bool(hit != op.starts_with("NOT"))
-                    }
-                }
-
-                // String concatenation. NULL propagates, as in Postgres.
-                "||" => {
-                    if l.is_null() || r.is_null() {
-                        Value::Null
-                    } else {
-                        Value::String(format!("{}{}", as_text(&l), as_text(&r)))
-                    }
-                }
-
-                "+" | "-" | "*" | "/" | "%" => match (num(&l), num(&r)) {
-                    (Some(a), Some(b)) => match op.as_str() {
-                        "+" => from_f64(a + b),
-                        "-" => from_f64(a - b),
-                        "*" => from_f64(a * b),
-                        // Division by zero is an ERROR in Postgres, not
-                        // infinity. Returning inf would be a wrong number.
-                        "/" if b == 0.0 => bail!("division by zero"),
-                        "/" => from_f64(a / b),
-                        "%" if b == 0.0 => bail!("division by zero"),
-                        "%" => from_f64(a % b),
-                        _ => unreachable!(),
-                    },
-                    _ => Value::Null,
-                },
-
-                other => bail!("unsupported operator {:?}", other),
-            }
+            apply_op(op, l, r)?
         }
 
         Expr::IsNull { expr, negated } => {
@@ -1439,29 +1859,97 @@ pub fn eval(e: &Expr, row: &Bound) -> Result<Value> {
             if v.is_null() {
                 return Ok(Value::Null);
             }
-            let mut any_null = false;
-            let mut found = false;
+            let mut items = Vec::with_capacity(list.len());
             for item in list {
-                let iv = eval(item, row)?;
-                if iv.is_null() {
-                    any_null = true;
-                    continue;
-                }
-                if matches!(cmp_values(&v, &iv), Some(std::cmp::Ordering::Equal)) {
-                    found = true;
-                    break;
+                items.push(eval(item, row)?);
+            }
+            in_values(&v, &items, *negated)?
+        }
+
+        // ── subqueries ──────────────────────────────────────────────────────
+        Expr::Subquery(q) => {
+            let (cols, rows) = run_sub(q, row)?;
+            if cols.len() != 1 {
+                bail!("a subquery used as an expression must return exactly one \
+                       column, this one returns {}", cols.len());
+            }
+            match rows.len() {
+                0 => Value::Null,
+                1 => rows[0].get(&cols[0].key).cloned().unwrap_or(Value::Null),
+                n => bail!("more than one row returned by a subquery used as an \
+                            expression ({} rows)", n),
+            }
+        }
+        Expr::Exists { query, negated } => {
+            let (_, rows) = run_sub(query, row)?;
+            Value::Bool(!rows.is_empty() != *negated)
+        }
+        Expr::ArrayQuery(q) => Value::Array(first_column(q, row)?),
+        Expr::InSubquery { expr, query, negated } => {
+            let v = eval(expr, row)?;
+            if v.is_null() {
+                return Ok(Value::Null);
+            }
+            let items = first_column(query, row)?;
+            in_values(&v, &items, *negated)?
+        }
+        Expr::Quantified { op, left, all, right } => {
+            let l = eval(left, row)?;
+            let r = eval(right, row)?;
+            let items = match r {
+                Value::Null => return Ok(Value::Null),
+                Value::Array(items) => items,
+                other => bail!(
+                    "{} requires an array or a subquery on its right side, got {}",
+                    if *all { "ALL" } else { "ANY" },
+                    as_text(&other)
+                ),
+            };
+            // ANY: true if any element compares true; false if all compare
+            // false; else UNKNOWN. ALL is the dual. An empty array is false
+            // for ANY and true for ALL, as SQL says.
+            let mut saw_true = false;
+            let mut saw_false = false;
+            let mut saw_null = false;
+            for item in items {
+                match truthy(&apply_op(op, l.clone(), item)?) {
+                    Some(true) => saw_true = true,
+                    Some(false) => saw_false = true,
+                    None => saw_null = true,
                 }
             }
-            // `x NOT IN (1, NULL)` is UNKNOWN rather than true when x is not
-            // 1 — because x might equal the NULL. Postgres agrees, and this
-            // is the classic NOT IN trap.
-            if found {
-                Value::Bool(!*negated)
-            } else if any_null {
+            if *all {
+                if saw_false {
+                    Value::Bool(false)
+                } else if saw_null {
+                    Value::Null
+                } else {
+                    Value::Bool(true)
+                }
+            } else if saw_true {
+                Value::Bool(true)
+            } else if saw_null {
                 Value::Null
             } else {
-                Value::Bool(*negated)
+                Value::Bool(false)
             }
+        }
+        Expr::Index { expr, index } => {
+            let arr = eval(expr, row)?;
+            let i = eval(index, row)?;
+            match (arr, num(&i)) {
+                (Value::Array(items), Some(n)) if n >= 1.0 => {
+                    items.get(n as usize - 1).cloned().unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            }
+        }
+        Expr::ArrayLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for i in items {
+                out.push(eval(i, row)?);
+            }
+            Value::Array(out)
         }
 
         Expr::Case { operand, whens, else_ } => {
@@ -1493,6 +1981,145 @@ pub fn eval(e: &Expr, row: &Bound) -> Result<Value> {
         }
 
         Expr::Func { name, args } => eval_func(name, args, row)?,
+    })
+}
+
+/// `x [NOT] IN (values)` over already-evaluated values.
+fn in_values(v: &Value, items: &[Value], negated: bool) -> Result<Value> {
+    let mut any_null = false;
+    let mut found = false;
+    for iv in items {
+        if iv.is_null() {
+            any_null = true;
+            continue;
+        }
+        if matches!(cmp_values(v, iv), Some(std::cmp::Ordering::Equal)) {
+            found = true;
+            break;
+        }
+    }
+    // `x NOT IN (1, NULL)` is UNKNOWN rather than true when x is not 1 —
+    // because x might equal the NULL. Postgres agrees, and this is the
+    // classic NOT IN trap.
+    Ok(if found {
+        Value::Bool(!negated)
+    } else if any_null {
+        Value::Null
+    } else {
+        Value::Bool(negated)
+    })
+}
+
+/// Run a subquery in the scope of `row`.
+///
+/// The row is the subquery's OUTER scope: its own relations bind first, and
+/// anything they do not bind resolves against `row`. That is a correlated
+/// subquery, evaluated the direct way — once per outer row. Honest for the
+/// catalogue relations this engine serves (tens of rows squared), and the
+/// executor refuses to route a large collection through it.
+fn run_sub(q: &Select, row: &Bound) -> Result<(Vec<OutCol>, Vec<Value>)> {
+    let Some(resolve) = row.ctx.resolver else {
+        bail!("a subquery cannot run here: this evaluation has no relation resolver");
+    };
+    let (cols, rows, _) = execute_inner(q, resolve, Opts::default(), Some(row))?;
+    Ok((cols, rows))
+}
+
+/// The first column of a subquery's every row — what `ARRAY(SELECT ...)`,
+/// `IN (SELECT ...)` and `= ANY (SELECT ...)` all consume.
+fn first_column(q: &Select, row: &Bound) -> Result<Vec<Value>> {
+    let (cols, rows) = run_sub(q, row)?;
+    let Some(first) = cols.first() else {
+        bail!("the subquery returns no columns");
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get(&first.key).cloned().unwrap_or(Value::Null))
+        .collect())
+}
+
+/// A binary operator over two evaluated operands. Shared by `Expr::Binary`
+/// and the element-wise `ANY` / `ALL`, so the two cannot disagree about what
+/// `=` means.
+fn apply_op(op: &str, l: Value, r: Value) -> Result<Value> {
+    // Every comparison over NULL is UNKNOWN — including `NULL = NULL`.
+    let compare = |ord: fn(std::cmp::Ordering) -> bool| -> Value {
+        match cmp_values(&l, &r) {
+            None => Value::Null,
+            Some(o) => Value::Bool(ord(o)),
+        }
+    };
+
+    Ok(match op {
+        "IS DISTINCT FROM" | "IS NOT DISTINCT FROM" => {
+            let distinct = match (l.is_null(), r.is_null()) {
+                (true, true) => false,
+                (true, false) | (false, true) => true,
+                (false, false) => !matches!(cmp_values(&l, &r), Some(std::cmp::Ordering::Equal)),
+            };
+            Value::Bool(distinct != op.starts_with("IS NOT"))
+        }
+        "=" => compare(|o| o.is_eq()),
+                "!=" | "<>" => compare(|o| o.is_ne()),
+                "<" => compare(|o| o.is_lt()),
+                "<=" => compare(|o| o.is_le()),
+                ">" => compare(|o| o.is_gt()),
+                ">=" => compare(|o| o.is_ge()),
+
+                "~" | "~*" | "!~" | "!~*" => {
+                    if l.is_null() || r.is_null() {
+                        Value::Null
+                    } else {
+                        let pat = as_text(&r);
+                        if let Some(why) = crate::nql::regex_error_pub(&pat) {
+                            bail!(
+                                "{} — in {:?}. The supported subset is ^ $ . | ( ) \
+                                 [ ] * + ? and literal text",
+                                why, pat
+                            );
+                        }
+                        let hit = crate::nql::regex_match_pub(
+                            &as_text(&l), &pat, op.ends_with('*'));
+                        Value::Bool(hit != op.starts_with('!'))
+                    }
+                }
+
+                "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
+                    if l.is_null() || r.is_null() {
+                        Value::Null
+                    } else {
+                        let hit = crate::nql::like_match_pub(
+                            &as_text(&l), &as_text(&r), op.ends_with("ILIKE"));
+                        Value::Bool(hit != op.starts_with("NOT"))
+                    }
+                }
+
+                // String concatenation. NULL propagates, as in Postgres.
+                "||" => {
+                    if l.is_null() || r.is_null() {
+                        Value::Null
+                    } else {
+                        Value::String(format!("{}{}", as_text(&l), as_text(&r)))
+                    }
+                }
+
+                "+" | "-" | "*" | "/" | "%" => match (num(&l), num(&r)) {
+                    (Some(a), Some(b)) => match op {
+                        "+" => from_f64(a + b),
+                        "-" => from_f64(a - b),
+                        "*" => from_f64(a * b),
+                        // Division by zero is an ERROR in Postgres, not
+                        // infinity. Returning inf would be a wrong number.
+                        "/" if b == 0.0 => bail!("division by zero"),
+                        "/" => from_f64(a / b),
+                        "%" if b == 0.0 => bail!("division by zero"),
+                        "%" => from_f64(a % b),
+                        _ => unreachable!(),
+                    },
+                    _ => Value::Null,
+                },
+
+                other => bail!("unsupported operator {:?}", other),
     })
 }
 
@@ -1568,6 +2195,131 @@ fn eval_func(name: &str, args: &[Expr], row: &Bound) -> Result<Value> {
             }
         }
         "quote_ident" => Value::String(as_text(&arg(0)?)),
+        "quote_literal" => Value::String(format!("'{}'", as_text(&arg(0)?).replace('\'', "''"))),
+        // `format('%s FROM %s', a, b)` — psql's `\dX` builds a definition
+        // with it. `%s` is text, `%I` an identifier, `%L` a quoted literal;
+        // anything else is refused rather than passed through as garbage.
+        "format" => {
+            let fmt = as_text(&arg(0)?);
+            let mut out = String::new();
+            let mut next = 1usize;
+            let mut chars = fmt.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '%' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('%') => out.push('%'),
+                    Some(spec @ ('s' | 'I' | 'L')) => {
+                        let v = arg(next)?;
+                        next += 1;
+                        match (spec, &v) {
+                            ('L', Value::Null) => out.push_str("NULL"),
+                            ('L', v) => out.push_str(&format!("'{}'", as_text(v).replace('\'', "''"))),
+                            (_, v) => out.push_str(&as_text(v)),
+                        }
+                    }
+                    other => bail!("format(): unsupported conversion %{}", other.map(String::from).unwrap_or_default()),
+                }
+            }
+            Value::String(out)
+        }
+
+        // ── arrays ──────────────────────────────────────────────────────────
+        // NULL for a NULL or empty array, as Postgres answers — which is what
+        // makes psql's `CASE WHEN array_length(acl, 1) = 0` fall to its ELSE.
+        "array_length" | "array_upper" | "cardinality" => match arg(0)? {
+            Value::Array(items) if !items.is_empty() => from_f64(items.len() as f64),
+            Value::Array(_) if name == "cardinality" => from_f64(0.0),
+            _ => Value::Null,
+        },
+        "array_lower" => match arg(0)? {
+            Value::Array(items) if !items.is_empty() => from_f64(1.0),
+            _ => Value::Null,
+        },
+
+        // ── sizes ───────────────────────────────────────────────────────────
+        // NEDB does not track a per-collection on-disk size the way Postgres
+        // tracks a heap's, and inventing one would be a plausible number that
+        // is wrong. NULL renders as a blank cell in `\dt+`, which is the
+        // truthful "not known" — the same policy the catalogue module states
+        // for statistics.
+        "pg_table_size" | "pg_total_relation_size" | "pg_relation_size"
+        | "pg_indexes_size" | "pg_database_size" => Value::Null,
+        "pg_size_pretty" => match num(&arg(0)?) {
+            None => Value::Null,
+            Some(n) => {
+                let units = ["bytes", "kB", "MB", "GB", "TB", "PB"];
+                let mut v = n;
+                let mut u = 0usize;
+                while v.abs() >= 10240.0 && u + 1 < units.len() {
+                    v /= 1024.0;
+                    u += 1;
+                }
+                Value::String(format!("{} {}", v.round() as i64, units[u]))
+            }
+        },
+
+        // ── more definition getters, all honestly NULL ──────────────────────
+        // NEDB has no triggers, rules, statistics objects, functions or
+        // publications, so every relation these are called on is empty and
+        // the call is never reached with a real row. NULL keeps the query
+        // shape valid without fabricating a definition.
+        "pg_get_triggerdef" | "pg_get_ruledef" | "pg_get_statisticsobjdef"
+        | "pg_get_statisticsobjdef_columns" | "pg_get_function_result"
+        | "pg_get_function_arguments" | "pg_get_function_identity_arguments"
+        | "pg_get_functiondef" | "pg_get_serial_sequence" | "pg_get_partition_constraintdef"
+        | "pg_relation_filepath" | "pg_tablespace_location" => Value::Null,
+        "pg_relation_is_publishable" => Value::Bool(true),
+        "pg_statistics_obj_is_visible" | "pg_opfamily_is_visible" | "pg_collation_is_visible"
+        | "pg_ts_config_is_visible" | "pg_ts_dict_is_visible" | "pg_ts_parser_is_visible"
+        | "pg_ts_template_is_visible" | "has_table_privilege" | "has_schema_privilege"
+        | "has_database_privilege" | "pg_has_role" => Value::Bool(true),
+        // The settings a driver or psql actually asks for. Anything else is
+        // refused by name, exactly as Postgres refuses an unrecognised one.
+        "current_setting" => match arg(0)? {
+            Value::Null => Value::Null,
+            v => match as_text(&v).to_lowercase().as_str() {
+                "server_version" => Value::String(crate::pgwire::version_string()),
+                "server_encoding" | "client_encoding" => Value::String("UTF8".into()),
+                "standard_conforming_strings" | "integer_datetimes" | "is_superuser" => {
+                    Value::String("on".into())
+                }
+                "timezone" | "log_timezone" => Value::String("UTC".into()),
+                "search_path" => Value::String("\"$user\", public".into()),
+                "intervalstyle" => Value::String("postgres".into()),
+                "datestyle" => Value::String("ISO, MDY".into()),
+                "session_authorization" => Value::String("nedb".into()),
+                "application_name" | "default_transaction_read_only" => Value::String(String::new()),
+                "transaction_isolation" | "default_transaction_isolation" => {
+                    Value::String("read committed".into())
+                }
+                "max_identifier_length" => Value::String("63".into()),
+                other => {
+                    // `current_setting(name, true)` returns NULL for a
+                    // missing setting instead of erroring.
+                    if truthy(&arg(1)?) == Some(true) {
+                        Value::Null
+                    } else {
+                        bail!("unrecognized configuration parameter \"{}\"", other)
+                    }
+                }
+            },
+        },
+        "pg_backend_pid" => from_f64(std::process::id() as f64),
+        "pg_is_in_recovery" => Value::Bool(false),
+        "txid_current" => from_f64(0.0),
+        "now" | "current_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+            Value::String(now_iso())
+        }
+        "to_char" => match arg(0)? {
+            Value::Null => Value::Null,
+            v => Value::String(as_text(&v)),
+        },
+        "generate_series" | "unnest" => bail!(
+            "{}() returns a set of rows — write it in FROM, not in the select list", name
+        ),
 
         // ── null handling ───────────────────────────────────────────────────
         "coalesce" => {
@@ -1601,12 +2353,246 @@ fn eval_func(name: &str, args: &[Expr], row: &Bound) -> Result<Value> {
             v => Value::String(as_text(&v)),
         },
 
+        other if is_aggregate(other) => bail!(
+            "{}() is an aggregate, which is only meaningful over a whole result set — \
+             it is evaluated by the executor, never per row",
+            other
+        ),
+
         other => bail!(
             "the function {}() is not implemented. It is refused rather than \
              answered with NULL, because a NULL column reads as missing DATA \
              rather than a missing feature",
             other
         ),
+    })
+}
+
+/// An ISO-8601 wall-clock timestamp, for the handful of clients that ask.
+fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Civil-from-days (Howard Hinnant's algorithm), UTC.
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}+00", y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Aggregates without GROUP BY
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AGGREGATES: &[&str] = &[
+    "count", "sum", "avg", "min", "max", "string_agg", "array_agg", "bool_and",
+    "bool_or", "every",
+];
+
+fn is_aggregate(name: &str) -> bool {
+    AGGREGATES.iter().any(|a| a.eq_ignore_ascii_case(name))
+}
+
+/// Does this expression call an aggregate at ITS level — not inside a
+/// subquery, whose aggregates belong to the subquery?
+pub fn has_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Func { name, args } => is_aggregate(name) || args.iter().any(has_aggregate),
+        Expr::Binary { left, right, .. } => has_aggregate(left) || has_aggregate(right),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            has_aggregate(expr)
+        }
+        Expr::InList { expr, list, .. } => has_aggregate(expr) || list.iter().any(has_aggregate),
+        Expr::Case { operand, whens, else_ } => {
+            operand.as_deref().is_some_and(has_aggregate)
+                || whens.iter().any(|(c, t)| has_aggregate(c) || has_aggregate(t))
+                || else_.as_deref().is_some_and(has_aggregate)
+        }
+        Expr::Quantified { left, right, .. } => has_aggregate(left) || has_aggregate(right),
+        Expr::Index { expr, index } => has_aggregate(expr) || has_aggregate(index),
+        Expr::ArrayLit(items) => items.iter().any(has_aggregate),
+        Expr::InSubquery { expr, .. } => has_aggregate(expr),
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::ArrayQuery(_) => false,
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) => false,
+    }
+}
+
+/// Reduce one aggregate call over every row.
+fn aggregate(name: &str, args: &[Expr], rows: &[JoinedRow], ctx: EvalCtx) -> Result<Value> {
+    let lname = name.to_lowercase();
+    // `count(*)` and a bare `count()` count rows; everything else evaluates
+    // its first argument per row and skips NULLs, as SQL aggregates do.
+    if lname == "count" && (args.is_empty() || matches!(args[0], Expr::Star)) {
+        return Ok(from_f64(rows.len() as f64));
+    }
+    let Some(target) = args.first() else {
+        bail!("{}() needs an argument", name);
+    };
+    let mut vals: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut all_vals: Vec<Value> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let v = eval(target, &bind(r, ctx))?;
+        if !v.is_null() {
+            vals.push(v.clone());
+        }
+        all_vals.push(v);
+    }
+    Ok(match lname.as_str() {
+        "count" => from_f64(vals.len() as f64),
+        "sum" | "avg" => {
+            let nums: Vec<f64> = vals.iter().filter_map(num).collect();
+            if nums.is_empty() {
+                Value::Null
+            } else if lname == "sum" {
+                from_f64(nums.iter().sum())
+            } else {
+                from_f64(nums.iter().sum::<f64>() / nums.len() as f64)
+            }
+        }
+        "min" | "max" => {
+            let mut best: Option<Value> = None;
+            for v in vals {
+                best = Some(match best {
+                    None => v,
+                    Some(b) => {
+                        let take = match cmp_values(&v, &b) {
+                            Some(o) if lname == "min" => o.is_lt(),
+                            Some(o) => o.is_gt(),
+                            None => false,
+                        };
+                        if take { v } else { b }
+                    }
+                });
+            }
+            best.unwrap_or(Value::Null)
+        }
+        "string_agg" => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                // The separator is a constant in every real call, so it is
+                // evaluated once with no row in scope.
+                let sep = match args.get(1) {
+                    Some(e) => as_text(&eval(e, &Bound { parts: vec![], ctx })?),
+                    None => String::new(),
+                };
+                Value::String(vals.iter().map(as_text).collect::<Vec<_>>().join(&sep))
+            }
+        }
+        // array_agg keeps NULLs, as Postgres does.
+        "array_agg" => {
+            if all_vals.is_empty() { Value::Null } else { Value::Array(all_vals) }
+        }
+        "bool_and" | "every" => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                Value::Bool(vals.iter().all(|v| truthy(v) == Some(true)))
+            }
+        }
+        "bool_or" => {
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                Value::Bool(vals.iter().any(|v| truthy(v) == Some(true)))
+            }
+        }
+        _ => unreachable!("is_aggregate gates this"),
+    })
+}
+
+/// Replace every aggregate call in `e` with the literal it reduces to, so the
+/// remainder can be evaluated by the ordinary evaluator against no row at all.
+///
+/// A column outside an aggregate has no single value across the result set,
+/// and Postgres refuses it with the message reproduced here rather than
+/// picking a row arbitrarily.
+fn fold_aggregates(e: &Expr, rows: &[JoinedRow], ctx: EvalCtx) -> Result<Expr> {
+    Ok(match e {
+        Expr::Func { name, args } if is_aggregate(name) => {
+            Expr::Literal(aggregate(name, args, rows, ctx)?)
+        }
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args.iter().map(|a| fold_aggregates(a, rows, ctx)).collect::<Result<_>>()?,
+        },
+        Expr::Column { qual, name } => bail!(
+            "column \"{}{}\" must appear in the GROUP BY clause or be used in an \
+             aggregate function",
+            qual.as_ref().map(|q| format!("{q}.")).unwrap_or_default(),
+            name
+        ),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: op.clone(),
+            left: Box::new(fold_aggregates(left, rows, ctx)?),
+            right: Box::new(fold_aggregates(right, rows, ctx)?),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: op.clone(),
+            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+        },
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            ty: ty.clone(),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            negated: *negated,
+        },
+        Expr::InList { expr, list, negated } => Expr::InList {
+            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            list: list.iter().map(|i| fold_aggregates(i, rows, ctx)).collect::<Result<_>>()?,
+            negated: *negated,
+        },
+        Expr::Case { operand, whens, else_ } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(fold_aggregates(o, rows, ctx)?)),
+                None => None,
+            },
+            whens: whens
+                .iter()
+                .map(|(c, t)| Ok((fold_aggregates(c, rows, ctx)?, fold_aggregates(t, rows, ctx)?)))
+                .collect::<Result<_>>()?,
+            else_: match else_ {
+                Some(x) => Some(Box::new(fold_aggregates(x, rows, ctx)?)),
+                None => None,
+            },
+        },
+        Expr::Quantified { op, left, all, right } => Expr::Quantified {
+            op: op.clone(),
+            left: Box::new(fold_aggregates(left, rows, ctx)?),
+            all: *all,
+            right: Box::new(fold_aggregates(right, rows, ctx)?),
+        },
+        Expr::Index { expr, index } => Expr::Index {
+            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            index: Box::new(fold_aggregates(index, rows, ctx)?),
+        },
+        Expr::ArrayLit(items) => Expr::ArrayLit(
+            items.iter().map(|i| fold_aggregates(i, rows, ctx)).collect::<Result<_>>()?,
+        ),
+        Expr::InSubquery { expr, query, negated } => Expr::InSubquery {
+            expr: Box::new(fold_aggregates(expr, rows, ctx)?),
+            query: query.clone(),
+            negated: *negated,
+        },
+        Expr::Star | Expr::QualifiedStar(_) => {
+            bail!("`*` cannot be mixed with an aggregate outside count(*)")
+        }
+        // Constants and subqueries evaluate the same way in either mode.
+        Expr::Literal(_) | Expr::Subquery(_) | Expr::Exists { .. } | Expr::ArrayQuery(_) => {
+            e.clone()
+        }
     })
 }
 
@@ -1675,9 +2661,10 @@ fn unique_key(taken: &[OutCol], name: &str) -> String {
 /// A joined row, owned: `(binding, row-or-NULL)` per source table.
 type JoinedRow = Vec<(String, Option<Value>)>;
 
-fn bind<'a>(row: &'a JoinedRow) -> Bound<'a> {
+fn bind<'a>(row: &'a JoinedRow, ctx: EvalCtx<'a>) -> Bound<'a> {
     Bound {
         parts: row.iter().map(|(b, v)| (b.clone(), v.as_ref())).collect(),
+        ctx,
     }
 }
 
@@ -1694,6 +2681,14 @@ fn derived_name(e: &Expr) -> String {
         Expr::Func { name, .. } => name.clone(),
         Expr::Cast { expr, .. } => derived_name(expr),
         Expr::Case { .. } => "case".to_string(),
+        Expr::ArrayQuery(_) | Expr::ArrayLit(_) => "array".to_string(),
+        Expr::Exists { .. } => "exists".to_string(),
+        // A scalar subquery is named after its single output column.
+        Expr::Subquery(q) => q
+            .items
+            .first()
+            .map(|i| i.alias.clone().unwrap_or_else(|| derived_name(&i.expr)))
+            .unwrap_or_else(|| "?column?".to_string()),
         _ => "?column?".to_string(),
     }
 }
@@ -1830,6 +2825,120 @@ pub fn execute_opts(
     resolve: &Resolver,
     opts: Opts,
 ) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
+    execute_inner(sel, resolve, opts, None)
+}
+
+/// A distinct-key for a projected row: its output values, in column order.
+fn row_key(cols: &[OutCol], obj: &Map<String, Value>) -> String {
+    cols.iter()
+        .map(|c| format!("{:?}", obj.get(&c.key).unwrap_or(&Value::Null)))
+        .collect::<Vec<_>>()
+        .join("\u{1}")
+}
+
+/// Combine the arms of a compound query.
+///
+/// Each arm runs as its own complete query, its columns are matched to the
+/// first arm's BY POSITION (as SQL says — the names come from the first
+/// arm), and the rows are combined per operator. `ORDER BY` / `LIMIT` then
+/// apply to the whole, which is why the parser refused to attach them to the
+/// last arm.
+fn execute_set_ops<'a>(
+    sel: &Select,
+    resolve: &'a Resolver<'a>,
+    opts: Opts,
+    outer: Option<&'a Bound<'a>>,
+) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
+    let ctx = EvalCtx { resolver: Some(resolve), outer };
+    let mut head = sel.clone();
+    head.set_ops.clear();
+    head.order_by.clear();
+    head.limit = None;
+    head.offset = None;
+    let (cols, rows, mut plan) = execute_inner(&head, resolve, opts, outer)?;
+    let mut left: Vec<Map<String, Value>> = rows
+        .into_iter()
+        .map(|r| match r {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        })
+        .collect();
+
+    for arm in &sel.set_ops {
+        let (acols, arows, _) = execute_inner(&arm.query, resolve, opts, outer)?;
+        let op_name = match arm.op {
+            SetOp::Union => "UNION",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        };
+        if acols.len() != cols.len() {
+            bail!(
+                "each {} query must have the same number of columns: {} vs {}",
+                op_name, cols.len(), acols.len()
+            );
+        }
+        // Positional remap onto the first arm's keys.
+        let right: Vec<Map<String, Value>> = arows
+            .into_iter()
+            .map(|r| {
+                let m = match r {
+                    Value::Object(m) => m,
+                    _ => Map::new(),
+                };
+                let mut out = Map::new();
+                for (i, c) in cols.iter().enumerate() {
+                    out.insert(c.key.clone(), m.get(&acols[i].key).cloned().unwrap_or(Value::Null));
+                }
+                out
+            })
+            .collect();
+        let (nl, nr) = (left.len(), right.len());
+        let right_keys: std::collections::HashSet<String> =
+            right.iter().map(|m| row_key(&cols, m)).collect();
+        let mut combined: Vec<Map<String, Value>> = match arm.op {
+            SetOp::Union => {
+                left.extend(right);
+                left
+            }
+            SetOp::Intersect => left.into_iter().filter(|m| right_keys.contains(&row_key(&cols, m))).collect(),
+            SetOp::Except => left.into_iter().filter(|m| !right_keys.contains(&row_key(&cols, m))).collect(),
+        };
+        if !arm.all {
+            let mut seen = std::collections::HashSet::new();
+            combined.retain(|m| seen.insert(row_key(&cols, m)));
+        }
+        plan.notes.push(format!(
+            "{}{}: {} + {} rows -> {} (each arm planned separately; only the first arm's plan is shown)",
+            op_name, if arm.all { " ALL" } else { "" }, nl, nr, combined.len()
+        ));
+        left = combined;
+    }
+
+    // The combined rows have no source row; ORDER BY by name resolves against
+    // the output row itself under an anonymous binding.
+    let projected: Vec<(Map<String, Value>, JoinedRow)> = left
+        .into_iter()
+        .map(|m| {
+            let src: JoinedRow = vec![(String::new(), Some(Value::Object(m.clone())))];
+            (m, src)
+        })
+        .collect();
+    let out = finish(sel, &cols, projected, ctx, &mut plan)?;
+    Ok((cols, out, plan))
+}
+
+/// One query, in an optional enclosing scope. `outer` is `Some` for a
+/// correlated subquery and `None` at the top level.
+fn execute_inner<'a>(
+    sel: &Select,
+    resolve: &'a Resolver<'a>,
+    opts: Opts,
+    outer: Option<&'a Bound<'a>>,
+) -> Result<(Vec<OutCol>, Vec<Value>, Plan)> {
+    if !sel.set_ops.is_empty() {
+        return execute_set_ops(sel, resolve, opts, outer);
+    }
+    let ctx = EvalCtx { resolver: Some(resolve), outer };
     let exec = opts.exec;
     let pushdown = opts.pushdown;
     let mut plan = Plan::default();
@@ -1907,14 +3016,14 @@ pub fn execute_opts(
     // inner side of each join is materialised, because it genuinely has to
     // be: a hash join builds its table before probing, and a nested loop
     // re-scans it per left row.
-    let mut left_src: Box<dyn LeftSource> = match &sel.from {
+    let mut left_src: Box<dyn LeftSource + 'a> = match &sel.from {
         None => {
             // `SELECT 1` with no FROM is one row with no columns — which is
             // how a client's liveness probe is written.
             Box::new(VecLeft { rows: vec![vec![]], at: 0 })
         }
         Some(t) => {
-            let rel = fetch(&t.name, resolve)?;
+            let rel = fetch(t, resolve, ctx)?;
             let binding = t.binding();
             // Placeholder counts, patched once the pull is over. A streamed
             // relation cannot report its `actual rows` before it is read, and
@@ -1936,7 +3045,7 @@ pub fn execute_opts(
                     out_rows: 0,
                 });
             }
-            Box::new(StreamLeft { rel, binding, preds, pulled: 0, kept: 0 })
+            Box::new(StreamLeft { rel, binding, preds, pulled: 0, kept: 0, ctx })
         }
     };
 
@@ -1955,21 +3064,56 @@ pub fn execute_opts(
     let mut base_kept: Option<usize> = None;
 
     for (ji, join) in sel.joins.iter().enumerate() {
-        let right_rel = fetch(&join.table.name, resolve)?;
+        let is_last = ji == last;
         let rb = join.table.binding();
+
+        // `LATERAL (SELECT ...)` reads the rows to its left, so it cannot be
+        // materialised once: it runs again for every left row, in that row's
+        // scope. A nested loop by definition, and reported as one.
+        if join.table.lateral {
+            let post = if fuse && is_last { sel.where_.as_ref() } else { None };
+            let join_budget = if is_last { budget } else { None };
+            let (out, removed, consumed, produced) = join_lateral(
+                left_src.as_mut(), join, resolve, join_budget, post, ctx,
+            )?;
+            plan.push(Stage::Scan { table: join.table.name.clone(), binding: rb.clone(), rows: produced });
+            plan.push(Stage::Join {
+                kind: join.kind,
+                table: join.table.name.clone(),
+                binding: rb.clone(),
+                strategy: Strategy::NestedLoop,
+                keys: 0,
+                left_rows: consumed,
+                right_rows: produced,
+                out_rows: out.len(),
+                early_stopped: join_budget.is_some_and(|b| out.len() >= b),
+                post_filter_removed: post.map(|_| removed),
+            });
+            plan.notes.push(format!("LATERAL {}: the subquery ran once per left row ({} times)", rb, consumed));
+            left_bindings.push(rb);
+            if ji == 0 {
+                if let Some((pulled, kept)) = left_src.stats() {
+                    base_pulled = Some(pulled);
+                    base_kept = Some(kept);
+                }
+            }
+            left_src = Box::new(VecLeft { rows: out, at: 0 });
+            continue;
+        }
+
+        let right_rel = fetch(&join.table, resolve, ctx)?;
         let right_all = drain(right_rel)?;
         plan.push(Stage::Scan {
             table: join.table.name.clone(),
             binding: rb.clone(),
             rows: right_all.len(),
         });
-        let right_rows = prefilter(right_all, &rb, &push, &mut plan)?;
+        let right_rows = prefilter(right_all, &rb, &push, &mut plan, ctx)?;
 
         // The filter can only be evaluated once every binding it reads is
         // bound, so it fuses into the FINAL join and nowhere earlier. The
         // budget likewise applies only there: capping an intermediate join
         // can starve a later one of rows it needed.
-        let is_last = ji == last;
         let post = if fuse && is_last { sel.where_.as_ref() } else { None };
         let join_budget = if is_last { budget } else { None };
 
@@ -1982,11 +3126,11 @@ pub fn execute_opts(
         let (out, removed, consumed) = match strategy {
             Strategy::NestedLoop => join_nested_loop(
                 left_src.as_mut(), &left_bindings, join, &right_rows, &rb,
-                join_budget, post,
+                join_budget, post, ctx,
             )?,
             Strategy::Hash => join_hash(
                 left_src.as_mut(), &left_bindings, join, &right_rows, &rb, &keys,
-                join_budget, post,
+                join_budget, post, ctx,
             )?,
         };
 
@@ -2042,12 +3186,37 @@ pub fn execute_opts(
             // Only TRUE keeps a row. UNKNOWN excludes it, which is what makes
             // `WHERE n.nspname <> 'x'` drop a LEFT JOIN's unmatched rows the
             // way Postgres does.
-            if truthy(&eval(pred, &bind(&r))?) == Some(true) {
+            if truthy(&eval(pred, &bind(&r, ctx))?) == Some(true) {
                 kept.push(r);
             }
         }
         rows = kept;
         plan.push(Stage::Filter { in_rows, out_rows: rows.len() });
+    }
+
+    // ── 2b. aggregates ──────────────────────────────────────────────────────
+    // A select list with an aggregate and no GROUP BY collapses every row into
+    // ONE. `count(*)`, `string_agg(...)` and friends are what psql's
+    // publication and subscription queries write; each call is reduced over
+    // the rows first, then the remainder of the expression is evaluated with
+    // the reductions in place.
+    if sel.items.iter().any(|i| has_aggregate(&i.expr)) {
+        let mut cols: Vec<OutCol> = vec![];
+        let mut obj = Map::new();
+        let empty: JoinedRow = vec![];
+        for item in &sel.items {
+            let folded = fold_aggregates(&item.expr, &rows, ctx)?;
+            let name = item.alias.clone().unwrap_or_else(|| derived_name(&item.expr));
+            let key = unique_key(&cols, &name);
+            let v = eval(&folded, &bind(&empty, ctx))?;
+            obj.insert(key.clone(), v);
+            cols.push(OutCol { key, name });
+        }
+        plan.notes.push(format!("Aggregate over {} rows -> 1 row", rows.len()));
+        plan.push(Stage::Project { columns: cols.len(), out_rows: 1 });
+        let projected = vec![(obj, empty)];
+        let out = finish(sel, &cols, projected, ctx, &mut plan)?;
+        return Ok((cols, out, plan));
     }
 
     // ── 3. the output shape ─────────────────────────────────────────────────
@@ -2067,7 +3236,7 @@ pub fn execute_opts(
         match &item.expr {
             Expr::Star => {
                 if let Some(first) = rows.first() {
-                    for (n, _) in bind(first).flatten() {
+                    for (n, _) in bind(first, ctx).flatten() {
                         // A star never emits the same column twice.
                         if !cols.iter().any(|c| c.name == n) {
                             cols.push(OutCol { key: n.clone(), name: n });
@@ -2077,7 +3246,7 @@ pub fn execute_opts(
             }
             Expr::QualifiedStar(q) => {
                 if let Some(first) = rows.first() {
-                    for (n, _) in bind(first).flatten_binding(q) {
+                    for (n, _) in bind(first, ctx).flatten_binding(q) {
                         if !cols.iter().any(|c| c.name == n) {
                             cols.push(OutCol { key: n.clone(), name: n });
                         }
@@ -2103,7 +3272,7 @@ pub fn execute_opts(
     // sort on an expression over columns that are NOT in the select list.
     let mut projected: Vec<(Map<String, Value>, JoinedRow)> = Vec::with_capacity(rows.len());
     for r in rows {
-        let b = bind(&r);
+        let b = bind(&r, ctx);
         let mut obj = Map::new();
         for (i, item) in sel.items.iter().enumerate() {
             let (start, end) = spans[i];
@@ -2138,25 +3307,25 @@ pub fn execute_opts(
     // ── 5. DISTINCT ─────────────────────────────────────────────────────────
     if sel.distinct {
         let in_rows = projected.len();
-        let mut seen: Vec<String> = vec![];
-        let mut kept = vec![];
-        for (obj, src) in projected {
-            // Keyed on the PROJECTED values in output order, which is what
-            // DISTINCT means — not on the source rows.
-            let key = cols
-                .iter()
-                .map(|c| format!("{:?}", obj.get(&c.key).unwrap_or(&Value::Null)))
-                .collect::<Vec<_>>()
-                .join("\u{1}");
-            if !seen.contains(&key) {
-                seen.push(key);
-                kept.push((obj, src));
-            }
-        }
-        projected = kept;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Keyed on the PROJECTED values in output order, which is what
+        // DISTINCT means — not on the source rows.
+        projected.retain(|(obj, _)| seen.insert(row_key(&cols, obj)));
         plan.push(Stage::Distinct { in_rows, out_rows: projected.len() });
     }
 
+    let out = finish(sel, &cols, projected, ctx, &mut plan)?;
+    Ok((cols, out, plan))
+}
+
+/// `ORDER BY`, then `OFFSET` / `LIMIT` — the tail every query shape shares.
+fn finish(
+    sel: &Select,
+    cols: &[OutCol],
+    mut projected: Vec<(Map<String, Value>, JoinedRow)>,
+    ctx: EvalCtx,
+    plan: &mut Plan,
+) -> Result<Vec<Value>> {
     // ── 6. ORDER BY ─────────────────────────────────────────────────────────
     if !sel.order_by.is_empty() {
         // Sort keys are precomputed so the comparator cannot fail halfway
@@ -2175,11 +3344,21 @@ pub fn execute_opts(
                         })?;
                         obj.get(&c.key).cloned().unwrap_or(Value::Null)
                     }
+                    // `ORDER BY "Schema"` — a bare name that is an OUTPUT
+                    // column sorts by the projected value, as SQL says; psql's
+                    // `\dP+` orders by its aliases. Only when no output column
+                    // has the name does it fall through to the source row.
+                    (None, Some(Expr::Column { qual: None, name }))
+                        if cols.iter().any(|c| c.name == *name) =>
+                    {
+                        let c = cols.iter().find(|c| c.name == *name).expect("checked");
+                        obj.get(&c.key).cloned().unwrap_or(Value::Null)
+                    }
                     (None, Some(e)) => {
                         // An ORDER BY expression may name a column that is not
                         // in the select list, so it is evaluated against the
                         // SOURCE row.
-                        eval(e, &bind(&src))?
+                        eval(e, &bind(&src, ctx))?
                     }
                     (None, None) => Value::Null,
                 };
@@ -2245,7 +3424,7 @@ pub fn execute_opts(
         });
     }
 
-    Ok((cols, out, plan))
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2280,10 +3459,10 @@ pub fn execute_opts(
 /// that synthesised row, inventing output that the unfused pipeline never
 /// produces. It is the same trap that made the first predicate-pushdown
 /// attempt wrong, in a different place.
-fn keep_row(cand: &JoinedRow, post: Option<&Expr>, removed: &mut usize) -> Result<bool> {
+fn keep_row(cand: &JoinedRow, post: Option<&Expr>, removed: &mut usize, ctx: EvalCtx) -> Result<bool> {
     let Some(p) = post else { return Ok(true) };
     // Only TRUE keeps a row, exactly as a standalone `WHERE` stage does.
-    if truthy(&eval(p, &bind(cand))?) == Some(true) {
+    if truthy(&eval(p, &bind(cand, ctx))?) == Some(true) {
         Ok(true)
     } else {
         *removed += 1;
@@ -2296,6 +3475,7 @@ fn keep_row(cand: &JoinedRow, post: Option<&Expr>, removed: &mut usize) -> Resul
 ///
 /// Shared by both strategies so the two cannot drift apart on the subtlest
 /// part of outer-join semantics.
+#[allow(clippy::too_many_arguments)]
 fn emit_unmatched_right(
     out: &mut Vec<JoinedRow>,
     kind: JoinKind,
@@ -2305,6 +3485,7 @@ fn emit_unmatched_right(
     rb: &str,
     post: Option<&Expr>,
     removed: &mut usize,
+    ctx: EvalCtx,
 ) -> Result<()> {
     if !matches!(kind, JoinKind::Right | JoinKind::Full) {
         return Ok(());
@@ -2317,11 +3498,78 @@ fn emit_unmatched_right(
         cand.push((rb.to_string(), Some(right.clone())));
         // Outer rows face the post-join filter too — it is a `WHERE`, and a
         // `WHERE` applies to every row the join produced.
-        if keep_row(&cand, post, removed)? {
+        if keep_row(&cand, post, removed, ctx)? {
             out.push(cand);
         }
     }
     Ok(())
+}
+
+/// `LATERAL`: the right side is a subquery re-run for each left row, with
+/// that row as its scope. INNER and CROSS keep matched pairs; LEFT keeps a
+/// left row with a NULL right side when the subquery produced nothing.
+///
+/// Returns `(rows, removed by the post filter, left rows consumed, right rows
+/// produced in total)`.
+fn join_lateral(
+    left_src: &mut dyn LeftSource,
+    join: &Join,
+    resolve: &Resolver,
+    budget: Option<usize>,
+    post: Option<&Expr>,
+    ctx: EvalCtx,
+) -> Result<(Vec<JoinedRow>, usize, usize, usize)> {
+    let sub = join
+        .table
+        .sub
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("LATERAL requires a subquery"))?;
+    let rb = join.table.binding();
+    let mut out: Vec<JoinedRow> = vec![];
+    let mut removed = 0usize;
+    let mut consumed = 0usize;
+    let mut produced = 0usize;
+    while let Some(left) = {
+        if budget.is_some_and(|b| out.len() >= b) { None } else { left_src.next_left()? }
+    } {
+        consumed += 1;
+        let scope = bind(&left, ctx);
+        let (cols, rows, _) = execute_inner(sub, resolve, Opts::default(), Some(&scope))?;
+        produced += rows.len();
+        let mut matched = false;
+        for r in rows {
+            let m = match r {
+                Value::Object(m) => m,
+                _ => Map::new(),
+            };
+            let mut named = Map::new();
+            for (i, c) in cols.iter().enumerate() {
+                let name = join.table.col_aliases.get(i).cloned().unwrap_or_else(|| c.name.clone());
+                named.entry(name).or_insert(m.get(&c.key).cloned().unwrap_or(Value::Null));
+            }
+            let mut cand = left.clone();
+            cand.push((rb.clone(), Some(Value::Object(named))));
+            let on_ok = match &join.on {
+                Some(on) => truthy(&eval(on, &bind(&cand, ctx))?) == Some(true),
+                None => true,
+            };
+            if !on_ok {
+                continue;
+            }
+            matched = true;
+            if keep_row(&cand, post, &mut removed, ctx)? {
+                out.push(cand);
+            }
+        }
+        if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
+            let mut cand = left.clone();
+            cand.push((rb.clone(), None));
+            if keep_row(&cand, post, &mut removed, ctx)? {
+                out.push(cand);
+            }
+        }
+    }
+    Ok((out, removed, consumed, produced))
 }
 
 /// The reference strategy: consider every pair.
@@ -2329,6 +3577,7 @@ fn emit_unmatched_right(
 /// Quadratic, and kept forever anyway. It is the semantic fallback for
 /// predicates the hash path cannot key on, the implementation of record for
 /// non-equality joins, and the oracle the differential tests compare against.
+#[allow(clippy::too_many_arguments)]
 fn join_nested_loop(
     left_src: &mut dyn LeftSource,
     left_bindings: &[String],
@@ -2337,6 +3586,7 @@ fn join_nested_loop(
     rb: &str,
     budget: Option<usize>,
     post: Option<&Expr>,
+    ctx: EvalCtx,
 ) -> Result<(Vec<JoinedRow>, usize, usize)> {
     let mut out: Vec<JoinedRow> = vec![];
     let mut removed = 0usize;
@@ -2367,12 +3617,12 @@ fn join_nested_loop(
                 // An ON that evaluates to UNKNOWN does NOT join, exactly
                 // as in SQL. Treating UNKNOWN as a match would invent
                 // pairings out of missing data.
-                Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
+                Some(on) => truthy(&eval(on, &bind(&cand, ctx))?) == Some(true),
             };
             if joins_here {
                 matched = true;
                 right_matched[ri] = true;
-                if keep_row(&cand, post, &mut removed)? {
+                if keep_row(&cand, post, &mut removed, ctx)? {
                     out.push(cand);
                 }
             }
@@ -2381,7 +3631,7 @@ fn join_nested_loop(
         if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
             let mut cand: JoinedRow = left.clone();
             cand.push((rb.to_string(), None));
-            if keep_row(&cand, post, &mut removed)? {
+            if keep_row(&cand, post, &mut removed, ctx)? {
                 out.push(cand);
             }
         }
@@ -2394,7 +3644,7 @@ fn join_nested_loop(
     if !budget.is_some_and(|b| out.len() >= b) {
         emit_unmatched_right(
             &mut out, join.kind, left_bindings, right_rows, &right_matched, rb, post,
-            &mut removed,
+            &mut removed, ctx,
         )?;
     }
     Ok((out, removed, consumed))
@@ -2407,6 +3657,7 @@ fn join_nested_loop(
 /// the same call the nested loop makes — so the two strategies answer with the
 /// same expression evaluated on the same rows. See [`crate::sqljoin`] for why
 /// bucketing alone would be unsound here.
+#[allow(clippy::too_many_arguments)]
 fn join_hash(
     left_src: &mut dyn LeftSource,
     left_bindings: &[String],
@@ -2416,6 +3667,7 @@ fn join_hash(
     keys: &[(Expr, Expr)],
     budget: Option<usize>,
     post: Option<&Expr>,
+    ctx: EvalCtx,
 ) -> Result<(Vec<JoinedRow>, usize, usize)> {
     debug_assert!(!keys.is_empty(), "the planner must not choose Hash with no keys");
 
@@ -2424,7 +3676,7 @@ fn join_hash(
         // A right key reads only the right binding — that is what the planner
         // proved — so binding the row alone is sufficient and correct.
         let one: JoinedRow = vec![(rb.to_string(), Some(right_rows[i].clone()))];
-        let b = bind(&one);
+        let b = bind(&one, ctx);
         let mut k = Vec::with_capacity(keys.len());
         for (_, right_expr) in keys {
             match sqljoin::hkey(&eval(right_expr, &b)?) {
@@ -2451,7 +3703,7 @@ fn join_hash(
     } {
         consumed += 1;
         let left = &left;
-        let lb = bind(left);
+        let lb = bind(left, ctx);
         let mut lk = Vec::with_capacity(keys.len());
         let mut null_key = false;
         for (left_expr, _) in keys {
@@ -2475,12 +3727,12 @@ fn join_hash(
                 // Confirm. The bucket only suggested this pair.
                 let joins_here = match &join.on {
                     None => true,
-                    Some(on) => truthy(&eval(on, &bind(&cand))?) == Some(true),
+                    Some(on) => truthy(&eval(on, &bind(&cand, ctx))?) == Some(true),
                 };
                 if joins_here {
                     matched = true;
                     right_matched[ri] = true;
-                    if keep_row(&cand, post, &mut removed)? {
+                    if keep_row(&cand, post, &mut removed, ctx)? {
                         out.push(cand);
                     }
                 }
@@ -2489,7 +3741,7 @@ fn join_hash(
         if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
             let mut cand: JoinedRow = left.clone();
             cand.push((rb.to_string(), None));
-            if keep_row(&cand, post, &mut removed)? {
+            if keep_row(&cand, post, &mut removed, ctx)? {
                 out.push(cand);
             }
         }
@@ -2500,7 +3752,7 @@ fn join_hash(
     if !budget.is_some_and(|b| out.len() >= b) {
         emit_unmatched_right(
             &mut out, join.kind, left_bindings, right_rows, &right_matched, rb, post,
-            &mut removed,
+            &mut removed, ctx,
         )?;
     }
     Ok((out, removed, consumed))
@@ -2517,6 +3769,7 @@ fn prefilter(
     binding: &str,
     push: &Pushdown,
     plan: &mut Plan,
+    ctx: EvalCtx,
 ) -> Result<Vec<Value>> {
     let Some(preds) = push.for_binding(binding) else { return Ok(rows) };
     if preds.is_empty() {
@@ -2526,7 +3779,7 @@ fn prefilter(
     let mut kept = Vec::with_capacity(rows.len());
     for row in rows {
         let one: JoinedRow = vec![(binding.to_string(), Some(row))];
-        let b = bind(&one);
+        let b = bind(&one, ctx);
         let mut keep = true;
         for p in preds {
             // Only TRUE keeps a row, exactly as in `WHERE`. Treating UNKNOWN
@@ -2555,12 +3808,101 @@ fn prefilter(
     Ok(kept)
 }
 
-fn fetch(name: &str, resolve: &Resolver) -> Result<Box<dyn Relation>> {
-    match resolve(name)? {
+/// Materialise one FROM item: a named relation through the resolver, a
+/// derived table by running its query, or a table function by evaluating it.
+fn fetch(t: &TableRef, resolve: &Resolver, ctx: EvalCtx) -> Result<Box<dyn Relation>> {
+    // `FROM (SELECT ...) AS t` — the relation IS the subquery's output, keyed
+    // by output NAME (what the enclosing query addresses), with `AS t(a, b)`
+    // renaming positionally.
+    if let Some(sub) = &t.sub {
+        let (cols, rows, _) = execute_inner(sub, resolve, Opts::default(), ctx.outer)?;
+        let out = rows
+            .into_iter()
+            .map(|r| {
+                let m = match r {
+                    Value::Object(m) => m,
+                    _ => Map::new(),
+                };
+                let mut named = Map::new();
+                for (i, c) in cols.iter().enumerate() {
+                    let name = t.col_aliases.get(i).cloned().unwrap_or_else(|| c.name.clone());
+                    // Duplicate output names keep the FIRST, as an unqualified
+                    // reference to an ambiguous name would resolve to.
+                    named.entry(name).or_insert(m.get(&c.key).cloned().unwrap_or(Value::Null));
+                }
+                Value::Object(named)
+            })
+            .collect();
+        return Ok(from_vec(out));
+    }
+
+    // A table function. Its arguments may read the ENCLOSING row — psql's
+    // `\dy` writes `unnest(evttags)` over the outer relation's column — so
+    // they are evaluated in the outer scope.
+    if let Some(args) = &t.args {
+        let empty: JoinedRow = vec![];
+        let scope = bind(&empty, ctx);
+        let col = |i: usize, default: &str| -> String {
+            t.col_aliases.get(i).cloned().unwrap_or_else(|| default.to_string())
+        };
+        let rows: Vec<Value> = match t.name.as_str() {
+            "generate_series" => {
+                let a = num(&eval(args.first().ok_or_else(|| anyhow::anyhow!("generate_series() needs a start"))?, &scope)?);
+                let b = num(&eval(args.get(1).ok_or_else(|| anyhow::anyhow!("generate_series() needs a stop"))?, &scope)?);
+                let step = match args.get(2) {
+                    Some(e) => num(&eval(e, &scope)?).unwrap_or(1.0),
+                    None => 1.0,
+                };
+                match (a, b) {
+                    // A NULL bound yields no rows, as Postgres answers.
+                    (Some(a), Some(b)) if step != 0.0 => {
+                        let mut out = vec![];
+                        let mut x = a;
+                        while (step > 0.0 && x <= b) || (step < 0.0 && x >= b) {
+                            let mut m = Map::new();
+                            m.insert(col(0, "generate_series"), from_f64(x));
+                            out.push(Value::Object(m));
+                            x += step;
+                            if out.len() > 1_000_000 {
+                                bail!("generate_series() would produce more than a million rows");
+                            }
+                        }
+                        out
+                    }
+                    (Some(_), Some(_)) => bail!("generate_series() step cannot equal zero"),
+                    _ => vec![],
+                }
+            }
+            "unnest" => match eval(args.first().ok_or_else(|| anyhow::anyhow!("unnest() needs an array"))?, &scope)? {
+                Value::Array(items) => items
+                    .into_iter()
+                    .map(|v| {
+                        let mut m = Map::new();
+                        m.insert(col(0, "unnest"), v);
+                        Value::Object(m)
+                    })
+                    .collect(),
+                // unnest(NULL) is no rows.
+                _ => vec![],
+            },
+            // NEDB has no partitioning, so a partition tree is empty for every
+            // relation — the truthful answer, and what lets `\dP+` run.
+            "pg_partition_tree" | "pg_partition_ancestors" => vec![],
+            other => bail!(
+                "the table function {}() is not implemented. It is refused rather \
+                 than answered with no rows, because an empty relation reads as \
+                 missing DATA rather than a missing feature",
+                other
+            ),
+        };
+        return Ok(from_vec(rows));
+    }
+
+    match resolve(&t.name)? {
         Some(rel) => Ok(rel),
         // Named rather than silently empty: an unknown table that answered
         // with no rows would look exactly like an empty one.
-        None => bail!("relation {:?} does not exist", name),
+        None => bail!("relation {:?} does not exist", t.name),
     }
 }
 
@@ -2587,10 +3929,11 @@ trait LeftSource {
 /// Pulling lazily is the whole point: with a row budget, a `LIMIT 20` over a
 /// join stops asking for rows long before the source is exhausted, so the
 /// source never has to produce the rest.
-struct StreamLeft {
+struct StreamLeft<'a> {
     rel: Box<dyn Relation>,
     binding: String,
     preds: Vec<Expr>,
+    ctx: EvalCtx<'a>,
     /// Rows actually requested from the source. Reported as the scan's
     /// `actual rows`, which for a streamed relation is the honest number —
     /// the total is not merely unknown, it is irrelevant to what happened.
@@ -2598,13 +3941,13 @@ struct StreamLeft {
     kept: usize,
 }
 
-impl LeftSource for StreamLeft {
+impl<'a> LeftSource for StreamLeft<'a> {
     fn next_left(&mut self) -> Result<Option<JoinedRow>> {
         while let Some(row) = self.rel.next_row()? {
             self.pulled += 1;
             let one: JoinedRow = vec![(self.binding.clone(), Some(row))];
             if !self.preds.is_empty() {
-                let b = bind(&one);
+                let b = bind(&one, self.ctx);
                 let mut keep = true;
                 for p in &self.preds {
                     if truthy(&eval(p, &b)?) != Some(true) {
@@ -2859,9 +4202,9 @@ mod parser_tests {
 
     #[test]
     fn a_tables_binding_is_its_alias_else_its_bare_name() {
-        let t = TableRef { name: "pg_catalog.pg_class".into(), alias: Some("c".into()) };
+        let t = TableRef::named("pg_catalog.pg_class", Some("c".into()));
         assert_eq!(t.binding(), "c");
-        let t = TableRef { name: "pg_catalog.pg_class".into(), alias: None };
+        let t = TableRef::named("pg_catalog.pg_class", None);
         assert_eq!(t.binding(), "pg_class", "the schema is not how a column is addressed");
     }
 
@@ -3166,7 +4509,7 @@ mod eval_tests {
 
     /// One binding named `t` holding `row`.
     fn one(row: &Value) -> Bound<'_> {
-        Bound { parts: vec![("t".to_string(), Some(row))] }
+        Bound::new(vec![("t".to_string(), Some(row))])
     }
 
     fn ev(sql_expr: &str, row: &Value) -> Result<Value> {
@@ -3301,8 +4644,16 @@ mod eval_tests {
         assert_eq!(v("s !~ '^zz'", &r), json!(true));
         // NULL propagates.
         assert_eq!(v("nosuch ~ '^x'", &r), Value::Null);
-        // And an unsupported metacharacter is refused, not approximated.
-        assert!(ev("s ~ 'a+b'", &r).is_err());
+        // The ERE subset: groups, alternation, quantifiers — what `\d orders`
+        // sends (`^(orders)$`) and `\d pg_*` would (`^(pg_.*)$`).
+        assert_eq!(v("s ~ '^(pg_catalog)$'", &r), json!(true));
+        assert_eq!(v("s ~ '^(pg_.*)$'", &r), json!(true));
+        assert_eq!(v("s ~ '^(public|pg_catalog)$'", &r), json!(true));
+        assert_eq!(v("s ~ '^pg_[a-z]+$'", &r), json!(true));
+        assert_eq!(v("s ~ '^pg_[0-9]+$'", &r), json!(false));
+        // And an unsupported construct is refused BY NAME, not approximated.
+        let e = ev("s ~ 'a{2}'", &r).unwrap_err().to_string();
+        assert!(e.contains("interval"), "{}", e);
     }
 
     #[test]
@@ -3439,9 +4790,7 @@ mod eval_tests {
         // silently read the wrong table's column.
         let a = json!({"name": "left", "x": 1});
         let b = json!({"name": "right", "y": 2});
-        let row = Bound {
-            parts: vec![("a".into(), Some(&a)), ("b".into(), Some(&b))],
-        };
+        let row = Bound::new(vec![("a".into(), Some(&a)), ("b".into(), Some(&b))]);
         let get = |e: &str| {
             let s = parse(&format!("SELECT {} FROM x", e)).unwrap();
             eval(&s.items[0].expr, &row).unwrap()
@@ -3458,9 +4807,7 @@ mod eval_tests {
         // The distinction is what makes `n.nspname IS NULL` answer correctly
         // for a row that found no match.
         let a = json!({"x": 1});
-        let row = Bound {
-            parts: vec![("a".into(), Some(&a)), ("b".into(), None)],
-        };
+        let row = Bound::new(vec![("a".into(), Some(&a)), ("b".into(), None)]);
         let get = |e: &str| {
             let s = parse(&format!("SELECT {} FROM x", e)).unwrap();
             eval(&s.items[0].expr, &row).unwrap()
@@ -3891,18 +5238,273 @@ mod operator_syntax_tests {
     }
 
     #[test]
-    fn a_subquery_an_ARRAY_constructor_and_EXISTS_are_all_refused_BY_NAME() {
-        // "expected ')', got SELECT" is a parser internal and tells the reader
-        // nothing about what to change. These are the constructs `\d` and
-        // `\dp` actually hinge on, so these are the messages someone reads.
-        for (sql, needle) in [
-            ("SELECT a FROM t WHERE x = (SELECT 1)", "subquery"),
-            ("SELECT array_to_string(ARRAY(SELECT a FROM b), ',') FROM t", "ARRAY"),
-            ("SELECT a FROM t WHERE EXISTS (SELECT 1)", "EXISTS"),
-        ] {
-            let e = parse(sql).unwrap_err().to_string();
-            assert!(e.contains(needle), "{} -> {}", sql, e);
+    fn a_subquery_an_ARRAY_constructor_and_EXISTS_all_PARSE() {
+        // These used to be refused by name. They are the constructs `\d`,
+        // `\dp` and `\dT` hinge on, and now each has a variant of its own.
+        let s = parse("SELECT a FROM t WHERE x = (SELECT 1)").unwrap();
+        assert!(matches!(s.where_, Some(Expr::Binary { ref right, .. }) if matches!(**right, Expr::Subquery(_))));
+        let s = parse("SELECT array_to_string(ARRAY(SELECT a FROM b), ',') FROM t").unwrap();
+        assert!(matches!(&s.items[0].expr, Expr::Func { args, .. } if matches!(args[0], Expr::ArrayQuery(_))));
+        let s = parse("SELECT a FROM t WHERE EXISTS (SELECT 1)").unwrap();
+        assert!(matches!(s.where_, Some(Expr::Exists { negated: false, .. })));
+        let s = parse("SELECT a FROM t WHERE NOT EXISTS (SELECT 1)").unwrap();
+        assert!(matches!(s.where_, Some(Expr::Unary { ref expr, .. }) if matches!(**expr, Expr::Exists { .. })));
+        // Quantified comparisons, subscripts, CAST(), IS DISTINCT FROM.
+        let s = parse("SELECT a FROM t WHERE oid = ANY (polroles) AND 'd' = any(kinds) AND x <> ALL (SELECT y FROM u)").unwrap();
+        assert!(s.where_.is_some());
+        let s = parse("SELECT prattrs[s] FROM t").unwrap();
+        assert!(matches!(s.items[0].expr, Expr::Index { .. }));
+        let s = parse("SELECT CAST('tuple' AS pg_catalog.text), CAST(n AS int2[]) FROM t").unwrap();
+        assert!(matches!(&s.items[0].expr, Expr::Cast { ty, .. } if ty == "text"));
+        assert!(matches!(&s.items[1].expr, Expr::Cast { ty, .. } if ty == "int2[]"));
+        let s = parse("SELECT a FROM t WHERE a IS DISTINCT FROM b").unwrap();
+        assert!(matches!(s.where_, Some(Expr::Binary { ref op, .. }) if op == "IS DISTINCT FROM"));
+        // A comma FROM list interleaved with joins, as `\dF+` writes it.
+        let s = parse("SELECT 1 FROM c LEFT JOIN n ON n.oid = c.ns, p LEFT JOIN np ON np.oid = p.ns").unwrap();
+        assert_eq!(s.joins.len(), 3);
+        assert!(matches!(s.joins[1].kind, JoinKind::Cross));
+        // LATERAL and a derived table.
+        let s = parse("SELECT 1 FROM c, LATERAL (SELECT 2 AS two) s").unwrap();
+        assert!(s.joins[0].table.lateral && s.joins[0].table.sub.is_some());
+        let s = parse("SELECT tt.a FROM (SELECT 1 AS a UNION ALL SELECT 2) AS tt ORDER BY 1").unwrap();
+        assert_eq!(s.from.as_ref().unwrap().sub.as_ref().unwrap().set_ops.len(), 1);
+    }
+
+    #[test]
+    fn a_compound_query_keeps_ORDER_BY_for_the_whole() {
+        let s = parse("SELECT a FROM t UNION SELECT b FROM u UNION ALL SELECT c FROM v ORDER BY 1 LIMIT 5").unwrap();
+        assert_eq!(s.set_ops.len(), 2);
+        assert_eq!(s.set_ops[0].op, SetOp::Union);
+        assert!(!s.set_ops[0].all);
+        assert!(s.set_ops[1].all);
+        assert_eq!(s.order_by.len(), 1);
+        assert_eq!(s.limit, Some(5));
+        assert!(s.set_ops[1].query.order_by.is_empty(), "the tail belongs to the whole, not the last arm");
+    }
+}
+
+#[cfg(test)]
+mod subquery_exec_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tables(defs: Vec<(&str, Vec<Value>)>) -> impl Fn(&str) -> Result<Option<Box<dyn Relation>>> {
+        let owned: Vec<(String, Vec<Value>)> =
+            defs.into_iter().map(|(n, r)| (n.to_string(), r)).collect();
+        move |name: &str| {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            Ok(owned.iter().find(|(n, _)| n == name || n == bare).map(|(_, r)| from_vec(r.clone())))
         }
+    }
+
+    fn go(sql: &str, r: &Resolver) -> (Vec<String>, Vec<Value>) {
+        let (cols, rows) = run(sql, r).unwrap_or_else(|e| panic!("{}\n  -> {}", sql, e));
+        (cols.into_iter().map(|c| c.name).collect(), rows)
+    }
+
+    fn col(rows: &[Value], name: &str) -> Vec<Value> {
+        rows.iter().map(|r| r.get(name).cloned().unwrap_or(Value::Null)).collect()
+    }
+
+    fn shop() -> impl Fn(&str) -> Result<Option<Box<dyn Relation>>> {
+        tables(vec![
+            ("c", vec![
+                json!({"id": 1, "name": "ann", "tags": ["a", "b"]}),
+                json!({"id": 2, "name": "bob", "tags": []}),
+                json!({"id": 3, "name": "cyd", "tags": null}),
+            ]),
+            ("o", vec![
+                json!({"oid": 10, "cid": 1, "total": 5}),
+                json!({"oid": 11, "cid": 1, "total": 7}),
+                json!({"oid": 12, "cid": 2, "total": 9}),
+            ]),
+        ])
+    }
+
+    #[test]
+    fn a_correlated_scalar_subquery_sees_the_outer_row() {
+        let t = shop();
+        let (_, rows) = go(
+            "SELECT c.name, (SELECT sum(o.total) FROM o WHERE o.cid = c.id) AS spent FROM c ORDER BY c.id",
+            &t,
+        );
+        assert_eq!(col(&rows, "spent"), vec![json!(12), json!(9), Value::Null]);
+        // A scalar subquery returning two rows is an error, as in Postgres.
+        let e = run("SELECT (SELECT o.total FROM o WHERE o.cid = c.id) FROM c", &t).unwrap_err().to_string();
+        assert!(e.contains("more than one row"), "{}", e);
+        // And two columns is an error too.
+        let e = run("SELECT (SELECT oid, total FROM o) FROM c", &t).unwrap_err().to_string();
+        assert!(e.contains("exactly one column"), "{}", e);
+    }
+
+    #[test]
+    fn EXISTS_and_NOT_EXISTS_are_never_unknown() {
+        let t = shop();
+        let (_, rows) = go("SELECT c.name FROM c WHERE EXISTS (SELECT 1 FROM o WHERE o.cid = c.id) ORDER BY 1", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("ann"), json!("bob")]);
+        let (_, rows) = go("SELECT c.name FROM c WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.cid = c.id)", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("cyd")]);
+    }
+
+    #[test]
+    fn ARRAY_of_a_subquery_and_array_to_string_compose_like_psql_dp() {
+        let t = shop();
+        let (_, rows) = go(
+            "SELECT c.name, array_to_string(ARRAY(SELECT o.total FROM o WHERE o.cid = c.id ORDER BY o.total), ',') AS totals FROM c ORDER BY c.id",
+            &t,
+        );
+        // An empty ARRAY joins to the empty string, not NULL — as Postgres.
+        assert_eq!(col(&rows, "totals"), vec![json!("5,7"), json!("9"), json!("")]);
+        let (_, rows) = go("SELECT array_length(ARRAY(SELECT oid FROM o), 1) AS n FROM c WHERE c.id = 1", &t);
+        assert_eq!(col(&rows, "n"), vec![json!(3)]);
+    }
+
+    #[test]
+    fn ANY_ALL_and_IN_over_arrays_and_subqueries() {
+        let t = shop();
+        let (_, rows) = go("SELECT c.name FROM c WHERE 'a' = ANY (c.tags) ORDER BY 1", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("ann")]);
+        // ANY over an empty array is false; over NULL is NULL — neither row.
+        let (_, rows) = go("SELECT c.name FROM c WHERE 'zz' = ANY (c.tags)", &t);
+        assert!(rows.is_empty());
+        let (_, rows) = go("SELECT c.name FROM c WHERE c.id = ANY (SELECT o.cid FROM o) ORDER BY 1", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("ann"), json!("bob")]);
+        let (_, rows) = go("SELECT c.name FROM c WHERE c.id <> ALL (SELECT o.cid FROM o)", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("cyd")]);
+        let (_, rows) = go("SELECT c.name FROM c WHERE c.id IN (SELECT o.cid FROM o WHERE o.total > 6) ORDER BY 1", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("ann"), json!("bob")]);
+        let (_, rows) = go("SELECT c.name FROM c WHERE c.id NOT IN (SELECT o.cid FROM o)", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("cyd")]);
+        // Subscripts are one-based.
+        let (_, rows) = go("SELECT c.tags[2] AS second FROM c WHERE c.id = 1", &t);
+        assert_eq!(col(&rows, "second"), vec![json!("b")]);
+    }
+
+    #[test]
+    fn set_operations_combine_arms_and_sort_the_whole() {
+        let t = shop();
+        let (names, rows) = go("SELECT c.id AS k FROM c UNION ALL SELECT o.cid FROM o ORDER BY 1", &t);
+        assert_eq!(names, vec!["k"], "column names come from the first arm");
+        assert_eq!(col(&rows, "k"), vec![json!(1), json!(1), json!(1), json!(2), json!(2), json!(3)]);
+        let (_, rows) = go("SELECT c.id AS k FROM c UNION SELECT o.cid FROM o ORDER BY 1", &t);
+        assert_eq!(col(&rows, "k"), vec![json!(1), json!(2), json!(3)]);
+        let (_, rows) = go("SELECT c.id AS k FROM c INTERSECT SELECT o.cid FROM o ORDER BY 1", &t);
+        assert_eq!(col(&rows, "k"), vec![json!(1), json!(2)]);
+        let (_, rows) = go("SELECT c.id AS k FROM c EXCEPT SELECT o.cid FROM o", &t);
+        assert_eq!(col(&rows, "k"), vec![json!(3)]);
+        let (_, rows) = go("SELECT c.id AS k FROM c UNION ALL SELECT o.cid FROM o ORDER BY 1 DESC LIMIT 2", &t);
+        assert_eq!(col(&rows, "k"), vec![json!(3), json!(2)]);
+        let e = run("SELECT c.id FROM c UNION SELECT o.oid, o.cid FROM o", &t).unwrap_err().to_string();
+        assert!(e.contains("same number of columns"), "{}", e);
+    }
+
+    #[test]
+    fn a_derived_table_is_a_relation_and_LATERAL_sees_its_left() {
+        let t = shop();
+        let (_, rows) = go(
+            "SELECT tt.who FROM (SELECT c.name AS who FROM c WHERE c.id < 3) AS tt ORDER BY 1",
+            &t,
+        );
+        assert_eq!(col(&rows, "who"), vec![json!("ann"), json!("bob")]);
+        // Column aliases rename positionally.
+        let (_, rows) = go("SELECT tt.x FROM (SELECT c.name FROM c WHERE c.id = 1) AS tt(x)", &t);
+        assert_eq!(col(&rows, "x"), vec![json!("ann")]);
+        // LATERAL: one aggregate per left row, then ORDER BY an output alias.
+        let (_, rows) = go(
+            "SELECT c.name AS \"Name\", s.n AS \"Orders\" FROM c, LATERAL (SELECT count(*) AS n FROM o WHERE o.cid = c.id) s ORDER BY \"Orders\" DESC, \"Name\"",
+            &t,
+        );
+        assert_eq!(col(&rows, "Name"), vec![json!("ann"), json!("bob"), json!("cyd")]);
+        assert_eq!(col(&rows, "Orders"), vec![json!(2), json!(1), json!(0)]);
+    }
+
+    #[test]
+    fn table_functions_generate_series_and_unnest() {
+        let t = shop();
+        let (_, rows) = go("SELECT s.generate_series AS n FROM generate_series(1, 3) s", &t);
+        assert_eq!(col(&rows, "n"), vec![json!(1), json!(2), json!(3)]);
+        let (_, rows) = go("SELECT x FROM pg_catalog.unnest(ARRAY['p', 'q']) AS t(x)", &t);
+        assert_eq!(col(&rows, "x"), vec![json!("p"), json!("q")]);
+        // unnest over the OUTER row's column, as `\dy` writes it.
+        let (_, rows) = go(
+            "SELECT c.name, array_to_string(array(select x from pg_catalog.unnest(c.tags) as t(x)), ', ') AS tags FROM c ORDER BY c.id",
+            &t,
+        );
+        assert_eq!(col(&rows, "tags"), vec![json!("a, b"), json!(""), json!("")]);
+        let e = run("SELECT 1 FROM nosuchfn(1) f", &t).unwrap_err().to_string();
+        assert!(e.contains("table function nosuchfn()"), "{}", e);
+    }
+
+    #[test]
+    fn aggregates_without_GROUP_BY_collapse_to_one_row() {
+        let t = shop();
+        let (names, rows) = go(
+            "SELECT count(*), count(c.tags) AS tagged, min(c.name), max(c.name) AS hi, string_agg(c.name, '|') AS all FROM c",
+            &t,
+        );
+        assert_eq!(names, vec!["count", "tagged", "min", "hi", "all"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["count"], json!(3));
+        assert_eq!(rows[0]["tagged"], json!(2), "count(x) skips NULL");
+        assert_eq!(rows[0]["min"], json!("ann"));
+        assert_eq!(rows[0]["hi"], json!("cyd"));
+        assert_eq!(rows[0]["all"], json!("ann|bob|cyd"));
+        // Over no rows: count is 0, everything else NULL.
+        let (_, rows) = go("SELECT count(*) AS n, sum(o.total) AS s FROM o WHERE o.total > 100", &t);
+        assert_eq!(rows[0]["n"], json!(0));
+        assert_eq!(rows[0]["s"], Value::Null);
+        // Arithmetic around an aggregate works; a bare column beside one is
+        // refused with Postgres's own message.
+        let (_, rows) = go("SELECT sum(o.total) / count(*) AS avg_total, avg(o.total) AS a FROM o", &t);
+        assert_eq!(rows[0]["avg_total"], json!(7));
+        assert_eq!(rows[0]["a"], json!(7));
+        let e = run("SELECT c.name, count(*) FROM c", &t).unwrap_err().to_string();
+        assert!(e.contains("must appear in the GROUP BY clause"), "{}", e);
+    }
+
+    #[test]
+    fn IS_DISTINCT_FROM_is_null_safe() {
+        let t = shop();
+        let (_, rows) = go("SELECT c.name FROM c WHERE c.tags IS DISTINCT FROM NULL ORDER BY 1", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("ann"), json!("bob")]);
+        let (_, rows) = go("SELECT c.name FROM c WHERE c.tags IS NOT DISTINCT FROM NULL", &t);
+        assert_eq!(col(&rows, "name"), vec![json!("cyd")]);
+    }
+
+    #[test]
+    fn THE_dT_QUERY_RUNS_over_a_catalogue_fixture() {
+        // psql 17's \dT, verbatim: two correlated subqueries and NOT EXISTS.
+        let t = tables(vec![
+            ("pg_namespace", vec![
+                json!({"oid": 11, "nspname": "pg_catalog"}),
+                json!({"oid": 2200, "nspname": "public"}),
+            ]),
+            ("pg_type", vec![
+                json!({"oid": 25, "typname": "text", "typnamespace": 11, "typrelid": 0, "typelem": 0, "typarray": 1009}),
+                json!({"oid": 1009, "typname": "_text", "typnamespace": 11, "typrelid": 0, "typelem": 25, "typarray": 0}),
+                json!({"oid": 70000, "typname": "mood", "typnamespace": 2200, "typrelid": 0, "typelem": 0, "typarray": 70001}),
+                json!({"oid": 70001, "typname": "_mood", "typnamespace": 2200, "typrelid": 0, "typelem": 70000, "typarray": 0}),
+            ]),
+            ("pg_class", vec![]),
+        ]);
+        let (_, rows) = go(
+            r#"SELECT n.nspname as "Schema",
+                 pg_catalog.format_type(t.oid, NULL) AS "Name",
+                 pg_catalog.obj_description(t.oid, 'pg_type') as "Description"
+               FROM pg_catalog.pg_type t
+                    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+               WHERE (t.typrelid = 0 OR (SELECT c.relkind = 'c' FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid))
+                 AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_type el WHERE el.oid = t.typelem AND el.typarray = t.oid)
+                 AND n.nspname <> 'pg_catalog'
+                 AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_type_is_visible(t.oid)
+               ORDER BY 1, 2;"#,
+            &t,
+        );
+        // `_mood` is hidden by NOT EXISTS (its element type's typarray is
+        // it), `text` and `_text` by the schema filter — `mood` remains.
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert_eq!(col(&rows, "Schema"), vec![json!("public")]);
     }
 }
 
