@@ -209,6 +209,25 @@ fn walk(e: &Expr, known: &[String], seen: &mut Vec<String>, why: &mut Option<&'s
                 walk(i, known, seen, why);
             }
         }
+        Expr::Index { expr, index } => {
+            walk(expr, known, seen, why);
+            walk(index, known, seen, why);
+        }
+        Expr::ArrayLit(items) => {
+            for i in items {
+                walk(i, known, seen, why);
+            }
+        }
+        // A subquery may read ANY binding of the enclosing query through
+        // correlation, and which ones cannot be told without running it. So a
+        // predicate containing one is never pushed below a join.
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::ArrayQuery(_) | Expr::InSubquery { .. } => {
+            *why = Some("contains a subquery")
+        }
+        Expr::Quantified { left, right, .. } => {
+            walk(left, known, seen, why);
+            walk(right, known, seen, why);
+        }
     }
 }
 
