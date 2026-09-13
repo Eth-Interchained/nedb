@@ -31,6 +31,23 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
+## What's next — [neSQL](https://github.com/Eth-Interchained/neSQL)
+
+Nobody should have to learn a query language to use a database. NEDB's PostgreSQL
+endpoint already answers `psql`, SQLAlchemy Core **and** ORM, asyncpg and
+node-postgres against a live store — but it gets there by *translating* SQL into
+NQL, and a translation can only reach as far as the target language's shape.
+
+**[neSQL](https://github.com/Eth-Interchained/neSQL)** removes the translation:
+PostgreSQL's real grammar, vendored with its licence intact, extended with NEDB's
+temporal and causal clauses. Two front-ends, one plan. NQL folded in, not deleted.
+
+[![neSQL on PyPI](https://img.shields.io/pypi/v/nesql?label=nesql%20·%20PyPI&color=a855f7)](https://pypi.org/project/nesql/)
+[![neSQL on crates.io](https://img.shields.io/crates/v/nesql?label=nesql%20·%20crates.io&color=a855f7)](https://crates.io/crates/nesql)
+[![neSQL on npm](https://img.shields.io/npm/v/nesql-engine?label=nesql-engine%20·%20npm&color=a855f7)](https://www.npmjs.com/package/nesql-engine)
+
+---
+
 ## New in 3.3.0 — the query language grew up
 
 `WHERE` was six operators wide (`= != > < >= <=`) joined by an implicit `AND`.
@@ -178,16 +195,51 @@ SELECT _id, _hash, _seq FROM audit ORDER BY _seq;
 ```
 
 **This is not "NEDB speaks SQL", and the endpoint is careful to say so.** It is
-a documented subset of `SELECT` translated to NQL:
+a documented subset of `SELECT` **translated** to NQL — and that word is doing
+all the work in this sentence. Every refusal below traces to the same cause:
+NQL is the engine's native language, so SQL has to be rewritten into it, and a
+rewrite can only ever reach as far as the target language's shape.
 
-| Supported | Refused, with the reason |
-| --- | --- |
-| `*`, a column list, `COUNT(*)`, `SUM`/`AVG`/`MIN`/`MAX(col)` | `JOIN` — NQL is single-collection |
-| `WHERE` — the whole NQL predicate surface | subqueries, `UNION`, window functions |
-| `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET` | expressions in the select list |
-| `AS OF SYSTEM TIME <seq>` | DDL, `TRUNCATE`, `GRANT`/`REVOKE` |
-| `INSERT` / `UPDATE` / `DELETE`, all with `RETURNING` | an `INSERT` with no column list |
-| `_caused_by` / `_valid_from` / `_valid_to` as INSERT columns | values that are expressions, not literals |
+| Supported today | Refused, with the reason | neSQL |
+| --- | --- | --- |
+| `*`, a column list, `COUNT(*)`, `SUM`/`AVG`/`MIN`/`MAX(col)` | `JOIN` — NQL is single-collection | ✅ joins already exist in the executor |
+| `WHERE` — the whole NQL predicate surface | subqueries, `UNION`, window functions | ✅ subqueries + set ops exist; windows arrive with the grammar |
+| `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET` | expressions in the select list | ✅ |
+| one named aggregate per grouped row | `sum(x), avg(x)` in one query — NQL's grouped row holds *one* | ✅ the row-model cap goes away |
+| `AS OF SYSTEM TIME <seq>` | DDL, `TRUNCATE`, `GRANT`/`REVOKE` | ⛔️ still refused, and always will be |
+| `INSERT` / `UPDATE` / `DELETE`, all with `RETURNING` | an `INSERT` with no column list | ✅ |
+| `_caused_by` / `_valid_from` / `_valid_to` as INSERT columns | values that are expressions, not literals | ✅ |
+
+The `⛔️` row is the one that is not a limitation. `TRUNCATE` is refused because
+NEDB is append-only *so that history cannot be discarded* — that is the product,
+not a gap — and DDL is refused because collections are created by the first write
+to them. Those answers do not change.
+
+### Every other row on that table is a translation artefact, and it is going away
+
+> ### 🆕 [**neSQL**](https://github.com/Eth-Interchained/neSQL) — PostgreSQL's grammar, NEDB's memory
+>
+> We stopped translating. neSQL vendors PostgreSQL's **real grammar** — `gram.y`,
+> 19,513 lines and 492 keywords, from PostgreSQL 17.4, licence intact — and extends
+> it with the clauses NEDB needs, rather than rewriting SQL into a language that
+> cannot express it.
+>
+> It is worth knowing *why* this was never free: `SYSTEM_TIME`, `PERIOD` and
+> `PORTION` appear **zero** times in PostgreSQL's grammar. Postgres has no temporal
+> SQL at all. `AS OF SYSTEM TIME` is a CockroachDB extension, which means NEDB's
+> temporal clauses are additions to the vendored grammar rather than deviations
+> from it — the same road CockroachDB, Materialize and RisingWave took.
+>
+> ```bash
+> pip install nesql   ·   cargo add nesql   ·   npm install nesql-engine
+> ```
+>
+> Names reserved, grammar vendored, executor foundations already shipping inside
+> this engine. Each package loads and answers `is_release() == false`, because a
+> package that imports cleanly and then lies is worse than one that isn't published.
+>
+> **NQL is not being deleted.** It gets folded in: two front-ends compiling to one
+> plan, so nothing translates and neither language is a second-class guest.
 
 Every refusal names the boundary instead of saying "syntax error", and a
 grouped query that projects a column SQL would reject gets Postgres's own

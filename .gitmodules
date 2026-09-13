@@ -6,3 +6,7 @@
 	path = distributions/aof-db
 	url = https://github.com/nitro-db/aof-DB
 	branch = master
+[submodule "nesql"]
+	path = nesql
+	url = https://github.com/Eth-Interchained/neSQL.git
+	branch = master
