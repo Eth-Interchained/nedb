@@ -401,12 +401,26 @@ pub struct TableRef {
     /// before it, so it is re-evaluated once per row of those. psql's `\dP+`
     /// sizes each partitioned table this way.
     pub lateral: bool,
+    /// `FROM orders AS OF SYSTEM TIME 42` — read this relation at that NEDB
+    /// sequence instead of at the tip.
+    ///
+    /// It hangs on the TABLE rather than on the query for two reasons. It is
+    /// where PostgreSQL's own grammar would take it (`relation_expr`, the
+    /// production `table_ref` is built from), and it is the only placement that
+    /// can express the query worth having: one relation AS OF a past sequence
+    /// joined against another at the tip, which is how you ask what changed.
+    ///
+    /// A sequence, never a wall-clock time. NEDB's history is
+    /// sequence-addressed and never garbage-collected, so a seq is exact where
+    /// a timestamp would be approximate — the same refusal the translator has
+    /// always made, made in the same words.
+    pub as_of: Option<u64>,
 }
 
 impl TableRef {
     /// A plain named relation.
     pub fn named(name: impl Into<String>, alias: Option<String>) -> Self {
-        TableRef { name: name.into(), alias, sub: None, args: None, col_aliases: vec![], lateral: false }
+        TableRef { name: name.into(), alias, sub: None, args: None, col_aliases: vec![], lateral: false, as_of: None }
     }
 
     /// How this table's columns are addressed: the alias when given, else the
@@ -1226,6 +1240,7 @@ impl Parser {
                 args: None,
                 col_aliases,
                 lateral,
+                as_of: None,
             });
         }
         if lateral {
@@ -1262,11 +1277,33 @@ impl Parser {
             }
             let fname = name.rsplit('.').next().unwrap_or(&name).to_lowercase();
             let (alias, col_aliases) = self.parse_table_alias()?;
-            return Ok(TableRef { name: fname, alias, sub: None, args: Some(args), col_aliases, lateral: false });
+            return Ok(TableRef { name: fname, alias, sub: None, args: Some(args), col_aliases, lateral: false, as_of: None });
         }
 
+        // `AS OF SYSTEM TIME <seq>` is read BEFORE the alias, because `AS` is
+        // the first token of both this and `AS <alias>`. The word after `AS`
+        // decides which one it is, and `parse_table_alias` would otherwise
+        // consume `OF` as the alias and leave `SYSTEM TIME 42` in the stream.
+        let as_of = if self.peek().is_kw("AS") && self.peek_at(1).is_kw("OF") {
+            self.next();
+            self.next();
+            self.expect_kw("SYSTEM")?;
+            self.expect_kw("TIME")?;
+            match self.next() {
+                Tok::Num(n) if n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
+                other => bail!(
+                    "AS OF SYSTEM TIME takes a NEDB sequence number here, not a timestamp \
+                     (got {:?}). NEDB's history is sequence-addressed and never \
+                     garbage-collected, so a seq is exact where a wall-clock time would be \
+                     approximate",
+                    other
+                ),
+            }
+        } else {
+            None
+        };
         let (alias, col_aliases) = self.parse_table_alias()?;
-        Ok(TableRef { name, alias, sub: None, args: None, col_aliases, lateral: false })
+        Ok(TableRef { name, alias, sub: None, args: None, col_aliases, lateral: false, as_of })
     }
 
     /// `AS alias`, or a bare alias, optionally followed by `(col, col)`.
@@ -4479,6 +4516,57 @@ mod parser_tests {
         assert_eq!(s.items.len(), 2);
         assert_eq!(s.items[0].expr, col(None, "a"));
         assert_eq!(s.from.unwrap().name, "t");
+    }
+
+    /// `AS OF SYSTEM TIME <seq>` hangs on the TABLE, which is what makes the
+    /// query worth having expressible: one relation in the past joined against
+    /// another at the tip.
+    #[test]
+    fn as_of_system_time_is_read_per_table() {
+        let s = parse("SELECT total FROM orders AS OF SYSTEM TIME 42").unwrap();
+        assert_eq!(s.from.clone().unwrap().as_of, Some(42));
+        assert_eq!(s.from.unwrap().alias, None);
+
+        // The alias still follows the temporal qualifier.
+        let s = parse("SELECT o.total FROM orders AS OF SYSTEM TIME 42 o").unwrap();
+        let t = s.from.unwrap();
+        assert_eq!((t.as_of, t.alias.as_deref()), (Some(42), Some("o")));
+
+        // ...and `AS <alias>` is still an alias. `AS` starts both, and the
+        // word after it is the only thing that tells them apart -- without
+        // that lookahead `parse_table_alias` eats `OF` as the alias and leaves
+        // `SYSTEM TIME 42` in the token stream.
+        let t = parse("SELECT x FROM orders AS o").unwrap().from.unwrap();
+        assert_eq!((t.as_of, t.alias.as_deref()), (None, Some("o")));
+
+        // Two relations, one in the past: the shape the per-table placement
+        // exists for.
+        let s = parse(
+            "SELECT o.total, n.total FROM orders AS OF SYSTEM TIME 1 o \
+             JOIN orders n ON o._id = n._id").unwrap();
+        assert_eq!(s.from.unwrap().as_of, Some(1));
+        assert_eq!(s.joins[0].table.as_of, None);
+
+        // A WHERE after the qualifier still parses.
+        let s = parse("SELECT total FROM orders AS OF SYSTEM TIME 7 WHERE _id = '1'").unwrap();
+        assert_eq!(s.from.unwrap().as_of, Some(7));
+        assert!(s.where_.is_some());
+    }
+
+    #[test]
+    fn a_wall_clock_as_of_is_refused_with_the_reason() {
+        // NEDB's history is sequence-addressed, so a timestamp would be an
+        // approximation of an exact thing. Same refusal the translator makes,
+        // in the same words, because a client should not learn two answers.
+        for sql in [
+            "SELECT total FROM orders AS OF SYSTEM TIME '2026-01-01'",
+            "SELECT total FROM orders AS OF SYSTEM TIME now()",
+            "SELECT total FROM orders AS OF SYSTEM TIME -1",
+            "SELECT total FROM orders AS OF SYSTEM TIME 1.5",
+        ] {
+            let e = parse(sql).unwrap_err().to_string();
+            assert!(e.contains("sequence number"), "{} -> {}", sql, e);
+        }
     }
 
     #[test]
