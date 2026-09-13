@@ -1202,12 +1202,25 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
                 agg_srcs.push(src);
                 continue;
             }
-            if expr.contains('(') {
+            // A paren used to be the whole test for "is this an expression",
+            // and it let every paren-free one through: `total * 2` became a
+            // FIELD NAME, no document had a field called "total * 2", and the
+            // column came back blank for every row with no error. Same silent
+            // class as the qualified-WHERE bug -- a wrong answer that looks
+            // like data. So the test is now the positive one: what survives
+            // has to BE a column reference.
+            let bare = expr.rsplit('.').next().unwrap_or(expr).trim_matches('"');
+            let is_column = !bare.is_empty()
+                && !bare.starts_with(|c: char| c.is_ascii_digit())
+                && bare.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            if !is_column {
                 return Err(format!(
                     "expressions in the select list are not supported ({:?}) — \
-                     supported: *, a column list, COUNT(*), or SUM/AVG/MIN/MAX(col)", p));
+                     supported: *, a column list, COUNT(*), or SUM/AVG/MIN/MAX(col). \
+                     Compute it in your client, or read the column and map it there",
+                    p));
             }
-            let name = expr.rsplit('.').next().unwrap_or(expr).trim_matches('"');
+            let name = bare;
             project.push(Col::renamed(name, alias.unwrap_or(name)));
         }
     }
@@ -1308,6 +1321,7 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     // NULL. Silently answering NULL for a column the query cannot produce is
     // the exact failure shape this engine keeps getting bitten by, so it is an
     // error, using Postgres's own wording so the message is already familiar.
+    let mut gkey: Option<String> = None;
     let tu_all = tail.to_uppercase();
     if let Some(gb_at) = find_kw(&tu_all, "GROUP BY") {
         let head = tail[..gb_at].trim_end().to_string();
@@ -1315,6 +1329,7 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
         let key_end = after.find(|c: char| c == ' ' || c == ',').unwrap_or(after.len());
         let group_key = after[..key_end].trim().trim_matches('"').to_string();
         let after_key = after[key_end..].trim_start();
+        gkey = Some(group_key.clone());
 
         // NQL groups by ONE field. Taking the first key and leaving the rest
         // in the tail would group by something narrower than the query asked
@@ -1356,6 +1371,80 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
             .join(" ");
         agg_clause.clear();
     }
+
+    // ── HAVING <agg> → the spelling NQL's grouped row actually carries ──────
+    //
+    // NQL's grouped row has fields named `count` and `<agg>_<field>`, and its
+    // HAVING matches on those. Every SQL client writes something else:
+    //
+    //   HAVING count(*) > 1   -> NQL parse error (loud, fine)
+    //   HAVING COUNT > 1      -> ZERO ROWS, no error
+    //   HAVING n > 1          -> ZERO ROWS, no error  (`n` being the SQL alias)
+    //
+    // The last two are the dangerous ones: HAVING is advertised as supported,
+    // and a filter that silently matches nothing reads as "no groups qualified"
+    // rather than "your predicate named a field that does not exist". So the
+    // aggregate spellings are translated, and anything left that is not a
+    // group-key or aggregate field is refused BY NAME.
+    let tu_hav = tail.to_uppercase();
+    if let Some(h_at) = find_kw(&tu_hav, "HAVING") {
+        let start = h_at + "HAVING".len();
+        let end = ["ORDER BY", "LIMIT", "OFFSET"]
+            .iter()
+            .filter_map(|k| find_kw(&tu_hav[start..], k).map(|at| start + at))
+            .min()
+            .unwrap_or(tail.len());
+        let clause = tail[start..end].to_string();
+        // The left-hand side of the first comparison is the key being filtered.
+        let lhs_end = clause
+            .find(|c: char| "<>=!".contains(c))
+            .unwrap_or(clause.len());
+        let lhs = clause[..lhs_end].trim();
+        if !lhs.is_empty() {
+            let lu = lhs.to_uppercase();
+            // `count(*)`, `COUNT(*)`, `count`, or the alias the query gave the
+            // count -- all mean NQL's `count`.
+            // The alias test has to tie THIS column to the count. Asking only
+            // "is there a count anywhere in the projection" matched the GROUP
+            // BY key too, so `HAVING status > 'a'` -- a perfectly legitimate
+            // filter on the group key -- was rewritten into `count > 'a'`.
+            let is_count = lu == "COUNT" || lu.replace(' ', "") == "COUNT(*)"
+                || project.iter().any(|c| c.out.eq_ignore_ascii_case(lhs) && c.src == "count");
+            let mapped = if is_count {
+                Some("count".to_string())
+            } else {
+                // A named aggregate, by its NQL source name or by its alias.
+                agg_srcs.iter().find(|s| s.eq_ignore_ascii_case(lhs)).cloned().or_else(|| {
+                    project.iter()
+                        .find(|c| c.out.eq_ignore_ascii_case(lhs) && agg_srcs.contains(&c.src))
+                        .map(|c| c.src.clone())
+                })
+            };
+            match mapped {
+                Some(m) => {
+                    // The space matters: `count> 1` happens to parse today, but
+                    // relying on the tokenizer being forgiving is how a rewrite
+                    // breaks the next time the grammar tightens.
+                    let rewritten = format!("{} {}", m, clause[lhs_end..].trim());
+                    tail = format!("{} HAVING {} {}",
+                        tail[..h_at].trim(), rewritten.trim(), tail[end..].trim())
+                        .trim().to_string();
+                }
+                None if gkey.as_deref().map(|g| g.eq_ignore_ascii_case(lhs)) == Some(true) => {}
+                None => {
+                    return Err(format!(
+                        "HAVING names {:?}, which this grouped row does not carry. \
+                         It has the group key{}{}. Filtering on anything else would \
+                         answer zero rows rather than report a mistake",
+                        lhs,
+                        gkey.as_deref().map(|g| format!(" ({:?})", g)).unwrap_or_default(),
+                        if agg_srcs.is_empty() { String::new() }
+                        else { format!(", plus {}", agg_srcs.join(", ")) }));
+                }
+            }
+        }
+    }
+
 
     let tail = sql_literals_to_nql(&tail);
     let nql = format!("FROM {}{}{}", coll,
@@ -3963,6 +4052,75 @@ mod tests {
         // A wall-clock timestamp is refused with the reason, not silently ignored.
         let e = translate("SELECT * FROM orders AS OF SYSTEM TIME '2026-01-01'").unwrap_err();
         assert!(e.contains("sequence number"), "{}", e);
+    }
+
+    /// A select-list item that is not a column reference must be REFUSED, not
+    /// turned into a field name.
+    ///
+    /// The guard used to be `expr.contains('(')`, which only catches expressions
+    /// that happen to have a paren. `total * 2` sailed through, became the field
+    /// name "total * 2", matched no document, and the column came back EMPTY for
+    /// every row with no error. Same silent class as the qualified-WHERE bug: a
+    /// wrong answer wearing the shape of data.
+    #[test]
+    fn a_select_list_expression_is_refused_rather_than_answered_blank() {
+        for sql in [
+            "SELECT total * 2 FROM orders",
+            "SELECT total, total*2 AS doubled FROM orders",
+            "SELECT total + 1 FROM orders",
+            "SELECT status || 'x' FROM orders",
+            "SELECT -total FROM orders",
+            "SELECT lower(status) FROM orders",
+        ] {
+            let e = translate(sql).unwrap_err();
+            assert!(e.contains("expressions in the select list"), "{} -> {}", sql, e);
+        }
+        // ...and the things that ARE column references still pass, or the fix
+        // would have bought correctness by refusing everything.
+        assert_eq!(q("SELECT _id, status FROM orders"), "FROM orders");
+        assert_eq!(q("SELECT \"status\" FROM orders"), "FROM orders");
+        assert_eq!(q("SELECT orders.status FROM orders"), "FROM orders");
+        assert_eq!(q("SELECT o.status FROM orders o"), "FROM orders");
+        assert_eq!(q("SELECT total AS t FROM orders"), "FROM orders");
+        assert!(translate("SELECT count(*) FROM orders").is_ok());
+        assert!(translate("SELECT sum(total) FROM orders").is_ok());
+    }
+
+    /// HAVING has to reach NQL in the spelling NQL's grouped row actually uses.
+    ///
+    /// An NQL grouped row carries `count` and `<agg>_<field>`. SQL clients write
+    /// `count(*)`, or the alias they gave it. `count(*)` failed LOUDLY (fine),
+    /// but `COUNT` and an alias both passed through verbatim and answered ZERO
+    /// ROWS — which reads as "no groups qualified" rather than "your predicate
+    /// named a field that does not exist".
+    #[test]
+    fn having_is_translated_to_nqls_spelling_and_refuses_an_unknown_key() {
+        // Every spelling a client might send for the count.
+        for sql in [
+            "SELECT status, count(*) AS n FROM orders GROUP BY status HAVING count(*) > 1",
+            "SELECT status, count(*) AS n FROM orders GROUP BY status HAVING n > 1",
+            "SELECT status, count(*) FROM orders GROUP BY status HAVING COUNT > 1",
+            "SELECT status, count(*) FROM orders GROUP BY status HAVING count > 1",
+        ] {
+            let got = q(sql);
+            assert_eq!(got, "FROM orders GROUP BY status COUNT HAVING count > 1",
+                       "{} -> {}", sql, got);
+        }
+        // A named aggregate, by its alias -- NQL calls the field `sum_total`.
+        assert_eq!(q("SELECT status, sum(total) AS s FROM orders GROUP BY status HAVING s > 100"),
+                   "FROM orders GROUP BY status SUM total HAVING sum_total > 100");
+        // ...and by NQL's own name for it, which must not be rewritten twice.
+        assert_eq!(q("SELECT status, sum(total) FROM orders GROUP BY status HAVING sum_total > 100"),
+                   "FROM orders GROUP BY status SUM total HAVING sum_total > 100");
+        // Filtering on the group key itself is legitimate and passes through
+        // untouched -- the SQL literal becomes an NQL one, as everywhere else.
+        assert_eq!(q("SELECT status, count(*) FROM orders GROUP BY status HAVING status > 'a'"),
+                   "FROM orders GROUP BY status COUNT HAVING status > \"a\"");
+        // A key the grouped row cannot carry is an ERROR, not zero rows.
+        let e = translate(
+            "SELECT status, count(*) FROM orders GROUP BY status HAVING nosuch > 1").unwrap_err();
+        assert!(e.contains("HAVING names") && e.contains("nosuch"), "{}", e);
+        assert!(e.contains("zero rows"), "the message must say what it prevented: {}", e);
     }
 
     #[test]
