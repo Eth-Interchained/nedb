@@ -241,8 +241,12 @@ def run_suite(cur):
     # ── clauses a catalogue cannot honour must be REFUSED ───────────────────
     section("a catalogue has no history — say so, do not fake it")
 
+    # All three qualifiers, because the SQL parser learned each of them at a
+    # different time and each one arrived able to be silently ignored here.
     for sql, why in [
         ("SELECT relname FROM pg_class AS OF SYSTEM TIME 0", "AS OF"),
+        ("SELECT relname FROM pg_class VALID AS OF '2026-01-01'", "VALID AS OF"),
+        ("SELECT relname FROM pg_class SEARCH 'orders'", "SEARCH"),
     ]:
         try:
             q(sql)

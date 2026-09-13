@@ -3309,6 +3309,41 @@ fn try_catalog_select(
 
     let resolve = |name: &str| -> anyhow::Result<Option<Box<dyn crate::sqlselect::Relation>>> {
         let cname = catalog_name(name);
+        // A catalogue relation is SYNTHESISED from the current shape of the
+        // store: it has no log, so it has no history, and there is nothing for
+        // a temporal or full-text qualifier to mean.
+        //
+        // Refused rather than ignored, and the difference is the entire point.
+        // Ignoring `AS OF SYSTEM TIME 0` answers a question about the past with
+        // present-day rows and looks like it worked — and that is exactly what
+        // started happening here the moment the SQL parser learned `AS OF`:
+        // before, the statement failed to parse and fell through to the
+        // translator, which refused it properly. Teaching one layer a clause
+        // silently un-taught another layer's refusal, and a test written long
+        // before this change is what caught it.
+        {
+            let k = cname.to_ascii_lowercase();
+            let bad = if temporal.contains_key(&k) {
+                Some("AS OF SYSTEM TIME")
+            } else {
+                match nql_verbs.get(&k) {
+                    Some((Some(_), _)) => Some("VALID AS OF"),
+                    Some((_, Some(_))) => Some("SEARCH"),
+                    _ => None,
+                }
+            };
+            if let Some(clause) = bad {
+                if crate::pgcatalog::is_catalog(&cname) {
+                    anyhow::bail!(
+                        "{} is not supported on the catalogue relation {:?} — a catalogue is \
+                         synthesised from the store's current shape rather than read from the \
+                         log, so it has no history to reach and no document text to search. \
+                         Ignoring the clause would answer your question with present-day rows \
+                         and look like it worked",
+                        clause, cname);
+                }
+            }
+        }
         if let Some(rows) = crate::pgcatalog::rows(&cname, db) {
             // A synthesised catalogue relation is small and built eagerly;
             // wrapping it satisfies the streaming contract without pretending
