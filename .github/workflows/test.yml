@@ -372,6 +372,24 @@ jobs:
           pip install pgserver
           python3 tests/test_psql_introspection.py
 
+      # Two engines can answer a SELECT over a user collection: the SQL→NQL
+      # translator, and the real SQL evaluator behind NEDBD_SQL_ENGINE=1. The
+      # flag is default-off for one reason only — nobody had shown they agree.
+      #
+      # This boots BOTH, seeds them identically, and asserts the same rows come
+      # back everywhere both can answer. It is the gate on ever flipping that
+      # default, and it found two real divergences the first time it ran:
+      # `SELECT *` ordered its columns differently on each engine, and the
+      # evaluator built its column list from the FIRST row alone, so a field
+      # only later documents carried silently vanished.
+      #
+      # The run also asserts the two daemons really are different engines
+      # before reporting any parity, because a harness comparing one engine to
+      # itself passes perfectly and proves nothing.
+      - name: Postgres endpoint — translator vs SQL engine parity
+        run: |
+          python3 tests/test_pgwire_parity.py
+
       # The EXTENDED query protocol, driven by the drivers that only speak it.
       #
       # psycopg2 interpolates parameters client-side, so the suite above only

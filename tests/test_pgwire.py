@@ -190,8 +190,17 @@ def run_suite(pg_port, cause_hash):
     print("\n── SELECT ──")
     cols, rows = q("SELECT * FROM orders")
     check("SELECT * returns every row", len(rows) == 4, f"{len(rows)}")
-    check("the user's own fields come before provenance columns",
-          cols[:4] == ["cust", "region", "status", "total"], str(cols))
+    # The user's fields keep the DOCUMENT'S order, not the alphabet. This
+    # assertion used to pin `["cust","region","status","total"]`, which was the
+    # translator sorting them — and the SQL evaluator did NOT, so `SELECT *`
+    # answered in a different column order depending on which engine served
+    # it. A client reading by POSITION got different columns from the same
+    # query. The parity harness found it; document order is the side that
+    # stays, because the corpus pins it deliberately (serde_json's
+    # `preserve_order` is on crate-wide to make it possible) and it is what
+    # Postgres does, where `*` follows column definition order.
+    check("the user's own fields come before provenance columns, in document order",
+          cols[:4] == ["status", "total", "region", "cust"], str(cols))
     check("provenance columns are present and last",
           cols[4:] == ["_coll", "_hash", "_id", "_seq"], str(cols))
 

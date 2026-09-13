@@ -3512,9 +3512,29 @@ fn execute_inner<'a>(
     }
 
     // ── 3. the output shape ─────────────────────────────────────────────────
-    // Resolved from the FIRST row when the select list contains a `*`,
-    // because only a row knows what columns a schemaless source has. With no
-    // rows at all a `*` yields no columns, which is the honest answer.
+    // Resolved from the ROWS when the select list contains a `*`, because only
+    // the rows know what columns a schemaless source has. With no rows at all
+    // a `*` yields no columns, which is the honest answer.
+    //
+    // From EVERY row, not the first one. Taking the first row's keys loses any
+    // field that only later documents carry, and it loses it SILENTLY: two
+    // documents `{a:1}` and `{a:2, later:"x"}` answered `SELECT *` with one
+    // column, and `later` — which is right there in the store — simply did not
+    // appear. A schemaless collection has no row that speaks for the others.
+    // The translator has always taken the union (`columns_for`), and the
+    // parity harness is what surfaced the disagreement.
+    //
+    // Ordering: the user's own fields in the DOCUMENT'S OWN ORDER, then the
+    // `_`-prefixed provenance columns sorted. Document order is a deliberate
+    // property — `serde_json`'s `preserve_order` feature is on crate-wide to
+    // make it possible — and it is what Postgres does, where `*` follows
+    // column definition order rather than the alphabet. Putting provenance
+    // last keeps `_hash` from pushing `status` off the screen.
+    //
+    // The first attempt at this sorted the user's fields alphabetically to
+    // match the TRANSLATOR, which had it backwards: the corpus pins document
+    // order deliberately, so the translator was the one diverging. It now
+    // sorts nothing but the provenance block either.
     //
     // `spans` records which output columns each select ITEM owns, so the
     // projection below never has to guess. The previous version walked a
@@ -3527,12 +3547,23 @@ fn execute_inner<'a>(
         let start = cols.len();
         match &item.expr {
             Expr::Star => {
-                if let Some(first) = rows.first() {
-                    for (n, _) in bind(first, ctx).flatten() {
+                let mut plain: Vec<String> = vec![];
+                let mut meta: Vec<String> = vec![];
+                for r in &rows {
+                    for (n, _) in bind(r, ctx).flatten() {
+                        let target = if n.starts_with('_') { &mut meta } else { &mut plain };
                         // A star never emits the same column twice.
-                        if !cols.iter().any(|c| c.name == n) {
-                            cols.push(OutCol { key: n.clone(), name: n });
+                        if !target.contains(&n) {
+                            target.push(n);
                         }
+                    }
+                }
+                // Only the provenance block is sorted; the user's fields keep
+                // the document's order.
+                meta.sort();
+                for n in plain.into_iter().chain(meta) {
+                    if !cols.iter().any(|c| c.name == n) {
+                        cols.push(OutCol { key: n.clone(), name: n });
                     }
                 }
             }

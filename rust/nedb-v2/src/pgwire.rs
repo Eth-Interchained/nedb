@@ -1494,7 +1494,12 @@ fn columns_for(rows: &[Value], project: &[Col]) -> Vec<Col> {
             }
         }
     }
-    plain.sort();
+    // The user's own fields keep the DOCUMENT'S order -- `serde_json`'s
+    // `preserve_order` is on crate-wide precisely so they can, and Postgres
+    // orders `*` by column definition rather than alphabetically. Sorting them
+    // here made `SELECT *` answer in a different column order than the SQL
+    // evaluator did, so a client reading by POSITION got different columns
+    // depending on a deployment flag. Only the provenance block is sorted.
     meta.sort();
     plain.extend(meta);
     plain.into_iter().map(|k| Col::same(&k)).collect()
