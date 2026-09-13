@@ -12,10 +12,14 @@ The PostgreSQL endpoint has two ways to answer a `SELECT` over a user
 collection:
 
   * the TRANSLATOR — rewrite the SQL into NQL and let the NQL engine run it.
-    Has the index pushdown, `AS OF`, `TRACE`, `SEARCH`, and bounded scans.
-    Cannot express a join, a subquery, a set operation, or two named
-    aggregates in one grouped row, because NQL cannot.
-  * the EVALUATOR (`sqlselect`) — run the SQL for real. Has all of those.
+    Has the index pushdown and the bounded scans. Cannot express a join, a
+    subquery, a set operation, or two named aggregates in one grouped row,
+    because NQL cannot.
+  * the EVALUATOR (`sqlselect`) — run the SQL for real. Has all of those, and
+    now also parses NQL's own verbs (`AS OF SYSTEM TIME`, `VALID AS OF`,
+    `SEARCH`) as table qualifiers, rendering them back into the NQL it asks
+    the store for. So the verbs have ONE implementation and two front-ends,
+    which is what "NQL folded into neSQL" means in practice.
 
 `NEDBD_SQL_ENGINE=1` moves user collections from the first to the second, and
 it is DEFAULT OFF for exactly one reason: nobody has shown the two agree. This
@@ -33,10 +37,11 @@ because it is the expected shape of the thing:
   * evaluator-only  — a join, a subquery, `UNION`, `DISTINCT`, two aggregates.
     This is what the flag is FOR. Counting it as a failure would make the
     harness fail by succeeding.
-  * translator-only — `TRACE`, `SEARCH`, `VALID AS OF`, `TRAVERSE`. The
-    evaluator's grammar cannot parse these, so they fall through on their own.
-    An asymmetry here is fine; an asymmetry here that STOPS being one would
-    mean the evaluator started answering a question it cannot actually answer.
+  * translator-only — `TRACE` and `TRAVERSE`, which the SQL grammar still has
+    no spelling for, so they fall through to the translator on their own.
+    `SEARCH` and `VALID AS OF` USED to be in this list and are not any more:
+    the evaluator learned them, so they are held to the parity standard now
+    instead, and their answers must be identical either way.
 
 A query where both answer and they DISAGREE is the only real failure, and it is
 also the only interesting result, so it prints both answers in full.
@@ -221,6 +226,14 @@ BOTH = [
     # Time travel, which only exists because the evaluator learned AS OF.
     ("AS OF at the seeded tip",       "SELECT _id, total FROM orders AS OF SYSTEM TIME 3", False),
     ("AS OF with a predicate",        "SELECT _id FROM orders AS OF SYSTEM TIME 3 WHERE status='paid'", False),
+    # NQL's verbs composed with SQL the translator CAN also express. `count`
+    # rides along free with a named aggregate in an NQL grouped row, so this
+    # one is answered by both -- which makes it a parity assertion rather than
+    # an unlock, and a stronger claim for it.
+    ("SEARCH with count and a named aggregate",
+     "SELECT count(*), sum(total) FROM orders SEARCH 'acme'", False),
+    ("SEARCH with a predicate",
+     "SELECT _id FROM orders SEARCH 'acme' WHERE status = 'paid'", False),
 ]
 
 # Expected to work on the EVALUATOR only. Each is a thing NQL cannot express,
@@ -234,6 +247,16 @@ EVALUATOR_ONLY = [
     ("a subquery in IN",  "SELECT _id FROM orders WHERE driver IN (SELECT _id FROM drivers)"),
     ("two aggregates",    "SELECT status, sum(total), avg(total) FROM orders GROUP BY status"),
     ("an expression",     "SELECT total * 2 FROM orders"),
+    # NQL's verbs COMPOSED with SQL, which is the whole point of folding them
+    # in rather than leaving them on a separate path. The translator can say
+    # SEARCH and it can say a join; it cannot say both in one statement,
+    # because NQL is single-collection.
+    ("SEARCH joined to another collection",
+     "SELECT o._id, d.name FROM orders SEARCH 'acme' o JOIN drivers d ON o.driver = d._id"),
+    ("SEARCH with DISTINCT",
+     "SELECT DISTINCT status FROM orders SEARCH 'acme'"),
+    ("VALID AS OF with a join",
+     "SELECT o._id FROM orders VALID AS OF '2030-01-01' o JOIN drivers d ON o.driver = d._id"),
 ]
 
 # The NQL-only verbs. SQL has no spelling for them, so the SQL parser cannot

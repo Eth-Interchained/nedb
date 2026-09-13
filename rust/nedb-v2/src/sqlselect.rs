@@ -415,12 +415,22 @@ pub struct TableRef {
     /// a timestamp would be approximate — the same refusal the translator has
     /// always made, made in the same words.
     pub as_of: Option<u64>,
+    /// `FROM orders VALID AS OF '2026-01-01'` — bi-temporal: what was believed
+    /// TRUE as of that date, as distinct from what the log SAID at a sequence.
+    /// A date string, because application-time validity is a wall-clock notion
+    /// where system time is a sequence.
+    pub valid_as_of: Option<String>,
+    /// `FROM orders SEARCH 'acme'` — full-text over the document's fields.
+    ///
+    /// Per-table like the others, which is the point: one relation searched
+    /// and another joined to it is a sentence SQL can now say.
+    pub search: Option<String>,
 }
 
 impl TableRef {
     /// A plain named relation.
     pub fn named(name: impl Into<String>, alias: Option<String>) -> Self {
-        TableRef { name: name.into(), alias, sub: None, args: None, col_aliases: vec![], lateral: false, as_of: None }
+        TableRef { name: name.into(), alias, sub: None, args: None, col_aliases: vec![], lateral: false, as_of: None, valid_as_of: None, search: None }
     }
 
     /// How this table's columns are addressed: the alias when given, else the
@@ -1241,6 +1251,8 @@ impl Parser {
                 col_aliases,
                 lateral,
                 as_of: None,
+                valid_as_of: None,
+                search: None,
             });
         }
         if lateral {
@@ -1277,7 +1289,7 @@ impl Parser {
             }
             let fname = name.rsplit('.').next().unwrap_or(&name).to_lowercase();
             let (alias, col_aliases) = self.parse_table_alias()?;
-            return Ok(TableRef { name: fname, alias, sub: None, args: Some(args), col_aliases, lateral: false, as_of: None });
+            return Ok(TableRef { name: fname, alias, sub: None, args: Some(args), col_aliases, lateral: false, as_of: None, valid_as_of: None, search: None });
         }
 
         // `AS OF SYSTEM TIME <seq>` is read BEFORE the alias, because `AS` is
@@ -1302,8 +1314,55 @@ impl Parser {
         } else {
             None
         };
+        // ── NQL's own verbs, as table-level qualifiers ──────────────────────
+        //
+        // This is what "NQL folded into neSQL" means concretely: the verbs NQL
+        // has and SQL has no spelling for become qualifiers on the relation,
+        // so a SQL statement can SAY them and the SQL evaluator can compose
+        // joins, subqueries and set operations AROUND them. The NQL engine
+        // still executes them — the resolver renders them straight back into
+        // the NQL it asks for — so there is one implementation, not two.
+        //
+        // Both are UNRESERVED, and deliberately: `VALID` only starts a clause
+        // when `AS OF` follows, and `SEARCH` only when a string literal
+        // follows. So a collection aliased `search`, or a column named
+        // `valid`, keeps working — the same discipline the PostgreSQL grammar
+        // uses with `unreserved_keyword`, and the reason adding a verb does
+        // not break somebody's existing data.
+        let valid_as_of = if self.peek().is_kw("VALID")
+            && self.peek_at(1).is_kw("AS")
+            && self.peek_at(2).is_kw("OF")
+        {
+            self.next();
+            self.next();
+            self.next();
+            match self.next() {
+                Tok::Str(s) => Some(s),
+                other => bail!(
+                    "VALID AS OF takes a date string here (got {:?}). System time is a \
+                     sequence and application-time validity is a date — they are different \
+                     questions, so they take different arguments",
+                    other
+                ),
+            }
+        } else {
+            None
+        };
+
+        let search = if self.peek().is_kw("SEARCH") && matches!(self.peek_at(1), Tok::Str(_)) {
+            self.next();
+            match self.next() {
+                Tok::Str(s) => Some(s),
+                // Unreachable given the lookahead above, but an unreachable
+                // branch that bails is cheaper than one that panics.
+                other => bail!("SEARCH takes a string here, got {:?}", other),
+            }
+        } else {
+            None
+        };
+
         let (alias, col_aliases) = self.parse_table_alias()?;
-        Ok(TableRef { name, alias, sub: None, args: None, col_aliases, lateral: false, as_of })
+        Ok(TableRef { name, alias, sub: None, args: None, col_aliases, lateral: false, as_of, valid_as_of, search })
     }
 
     /// `AS alias`, or a bare alias, optionally followed by `(col, col)`.
@@ -4582,6 +4641,67 @@ mod parser_tests {
         let s = parse("SELECT total FROM orders AS OF SYSTEM TIME 7 WHERE _id = '1'").unwrap();
         assert_eq!(s.from.unwrap().as_of, Some(7));
         assert!(s.where_.is_some());
+    }
+
+    /// NQL's own verbs, said in SQL. This is what folding NQL into neSQL
+    /// means: the SQL side PARSES them and composes joins and aggregates
+    /// around them, while the NQL engine stays the one implementation that
+    /// executes them.
+    #[test]
+    fn nqls_verbs_are_table_qualifiers_in_sql() {
+        let t = parse("SELECT _id FROM orders SEARCH 'acme'").unwrap().from.unwrap();
+        assert_eq!(t.search.as_deref(), Some("acme"));
+
+        let t = parse("SELECT _id FROM orders VALID AS OF '2026-01-01'").unwrap().from.unwrap();
+        assert_eq!(t.valid_as_of.as_deref(), Some("2026-01-01"));
+
+        // All of them at once, in any order the writer chose, plus an alias.
+        let t = parse(
+            "SELECT o._id FROM orders AS OF SYSTEM TIME 9 VALID AS OF '2026-01-01' \
+             SEARCH 'acme' o").unwrap().from.unwrap();
+        assert_eq!(
+            (t.as_of, t.valid_as_of.as_deref(), t.search.as_deref(), t.alias.as_deref()),
+            (Some(9), Some("2026-01-01"), Some("acme"), Some("o")));
+
+        // Per-table, which is the point: search one relation, join another.
+        let s = parse(
+            "SELECT o._id FROM orders SEARCH 'acme' o JOIN drivers d ON o.driver = d._id")
+            .unwrap();
+        assert_eq!(s.from.unwrap().search.as_deref(), Some("acme"));
+        assert_eq!(s.joins[0].table.search, None);
+    }
+
+    /// The verbs are UNRESERVED, and this is the test that keeps them that way.
+    ///
+    /// Adding a keyword to a grammar breaks every query that already used the
+    /// word as a name. PostgreSQL solves it with `unreserved_keyword`; here the
+    /// equivalent is a lookahead — `VALID` only starts a clause when `AS OF`
+    /// follows, `SEARCH` only when a string does — so somebody's collection
+    /// aliased `search` keeps working after we ship a search verb.
+    #[test]
+    fn the_new_verbs_do_not_steal_names_that_already_worked() {
+        let t = parse("SELECT search.total FROM orders search").unwrap().from.unwrap();
+        assert_eq!((t.alias.as_deref(), t.search.as_deref()), (Some("search"), None));
+
+        let t = parse("SELECT valid.total FROM orders valid").unwrap().from.unwrap();
+        assert_eq!((t.alias.as_deref(), t.valid_as_of.as_deref()), (Some("valid"), None));
+
+        // A COLUMN called `search` or `valid` is untouched either way.
+        assert!(parse("SELECT search, valid FROM orders").is_ok());
+        assert!(parse("SELECT _id FROM orders WHERE search = 'x'").is_ok());
+
+        // And `AS OF` is still not stolen by the alias path.
+        let t = parse("SELECT x FROM orders AS valid").unwrap().from.unwrap();
+        assert_eq!(t.alias.as_deref(), Some("valid"));
+    }
+
+    #[test]
+    fn a_verbs_argument_is_refused_when_it_is_the_wrong_kind_of_thing() {
+        // `VALID AS OF 42` is a sequence where a date belongs. System time and
+        // application-time validity are different questions, so they take
+        // different arguments and the mistake is named rather than coerced.
+        let e = parse("SELECT _id FROM orders VALID AS OF 42").unwrap_err().to_string();
+        assert!(e.contains("date string"), "{}", e);
     }
 
     #[test]

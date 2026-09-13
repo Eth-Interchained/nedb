@@ -669,6 +669,16 @@ fn split_output_alias(p: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// One string, in NQL's spelling — double-quoted, inner quotes escaped.
+///
+/// These values arrive already UNQUOTED from the SQL parser, so they cannot be
+/// pasted into an NQL query as-is: a value containing `"` would close the
+/// literal early and the rest of it would be parsed as grammar. Which is the
+/// shape of an injection, not merely a syntax error.
+fn nql_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn sql_literals_to_nql(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -3240,6 +3250,38 @@ fn try_catalog_select(
         out
     };
 
+    // NQL's own verbs, per relation name: `(VALID AS OF, SEARCH)`.
+    //
+    // Same one-scan-per-name constraint as the temporal map, and the same
+    // verdict for the same reason: two different values for one scan is
+    // REFUSED, because silently picking one would answer a different question
+    // than the one asked and look like it worked.
+    let nql_verbs: std::collections::HashMap<String, (Option<String>, Option<String>)> = {
+        let mut out: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+            std::collections::HashMap::new();
+        for t in sel.from.iter().chain(sel.joins.iter().map(|j| &j.table)) {
+            let k = catalog_name(&t.name).to_ascii_lowercase();
+            let e = out.entry(k.clone()).or_default();
+            for (slot, incoming, verb) in [
+                (&mut e.0, &t.valid_as_of, "VALID AS OF"),
+                (&mut e.1, &t.search, "SEARCH"),
+            ] {
+                match (slot.as_deref(), incoming.as_deref()) {
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(err_msg("0A000", &format!(
+                            "{:?} is read with two different {} arguments in one statement \
+                             ({:?} and {:?}). This endpoint reads each collection once, so \
+                             it cannot serve both. Ask the two questions separately.",
+                            k, verb, a, b)));
+                    }
+                    (None, Some(b)) => *slot = Some(b.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        out
+    };
+
     let pushdown_prefilters: std::collections::HashMap<String, String> = {
         let refs: Vec<&crate::sqlselect::TableRef> = sel
             .from
@@ -3294,14 +3336,30 @@ fn try_catalog_select(
         // other half and is tracked in HANDOFF.
         let key = cname.to_ascii_lowercase();
         let pre = pushdown_prefilters.get(&key);
-        // NQL's clause order is `FROM <coll> [AS OF <seq>] [WHERE ...]`, and
-        // the sequence has to come before the predicate or the parser reads
-        // `AS OF` as part of the WHERE expression.
-        let nql = match (temporal.get(&key), pre) {
-            (Some(seq), Some(p)) => format!("FROM {} AS OF {} WHERE {}", cname, seq, p),
-            (Some(seq), None) => format!("FROM {} AS OF {}", cname, seq),
-            (None, Some(p)) => format!("FROM {} WHERE {}", cname, p),
-            (None, None) => format!("FROM {}", cname),
+        // Composed in NQL'S OWN CLAUSE ORDER, which its grammar fixes as
+        //
+        //     FROM coll [AS OF seq] [VALID AS OF "date"] [WHERE p] [SEARCH "t"]
+        //
+        // and which is not negotiable: emit `AS OF` after `WHERE` and the NQL
+        // parser reads it as part of the predicate expression. This is the
+        // whole mechanism behind "NQL folded into neSQL" — the SQL side parses
+        // the verbs and composes joins and subqueries around them, while the
+        // NQL engine remains the one implementation that executes them.
+        let nql = {
+            let mut q = format!("FROM {}", cname);
+            if let Some(seq) = temporal.get(&key) {
+                q.push_str(&format!(" AS OF {}", seq));
+            }
+            if let Some(d) = nql_verbs.get(&key).and_then(|v| v.0.as_deref()) {
+                q.push_str(&format!(" VALID AS OF {}", nql_string(d)));
+            }
+            if let Some(p) = pre {
+                q.push_str(&format!(" WHERE {}", p));
+            }
+            if let Some(t) = nql_verbs.get(&key).and_then(|v| v.1.as_deref()) {
+                q.push_str(&format!(" SEARCH {}", nql_string(t)));
+            }
+            q
         };
         match db {
             Some(db) => match crate::nql::query(db, &nql) {
