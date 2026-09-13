@@ -20,8 +20,9 @@ jobs:
   pypi:
     name: Publish to PyPI (universal)
     runs-on: ubuntu-latest
-    # Wait for Linux+Windows native extensions AND nedbd-v2 binaries.
-    # Mac extensions arrive from Codemagic via the GitHub release poll below.
+    # Needs the wheels matrix only so the platform wheels are known to build
+    # before this publishes -- NOT to borrow their binaries. This wheel is pure
+    # Python by design; see the note in the steps below.
     needs: [node-binaries, create-release, wheels]
     if: "!cancelled()"
     steps:
@@ -29,37 +30,58 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # ── Collect _native extensions from CI artifact store ──────────────────
-      # Each wheels job extracted nedb/_native.* from its built wheel and
-      # uploaded it as native-ext-{label}.  Download them all here.
-      - name: Download _native extension artifacts (Linux + Windows)
-        uses: actions/download-artifact@v4
-        with:
-          pattern: native-ext-*
-          merge-multiple: true
-          path: native-ext
-      - name: Stage _native extensions into python/nedb/
-        shell: bash
-        run: |
-          echo "native-ext contents:"; find native-ext -type f | sort || echo "(none)"
-          # Copy every _native.* file found into the Python package.
-          find native-ext -type f -name "_native*" | while read f; do
-            fname=$(basename "$f")
-            cp "$f" "python/nedb/$fname"
-            chmod +x "python/nedb/$fname" 2>/dev/null || true
-            echo "  staged: python/nedb/$fname"
-          done
-      # ── Wait for Mac extensions from Codemagic ────────────────────────────
-      # Codemagic uploads nedbd-v2-darwin-* AND mac _native .so files to the
-      # GitHub release.  Poll until both server binaries appear (the extensions
-      # come in the same upload), then download everything.
+      # ── The universal wheel carries NO native extension. On purpose. ───────
+      #
+      # It used to. Five `wheels` jobs each extracted their `_native` out of
+      # their platform wheel and uploaded it, and this job downloaded all of
+      # them with `merge-multiple: true` and copied every one into
+      # python/nedb/. The intent, written down at the time, was that
+      # `from nedb._native import NedbCore` should work "on any platform
+      # without needing the platform wheel installed".
+      #
+      # That is not achievable, and the reason is one line of maturin
+      # behaviour: an abi3 extension is named `nedb/_native.abi3.so` for
+      # EVERY target. x86_64-glibc, x86_64-musl, aarch64-glibc, aarch64-musl —
+      # one filename, five different architectures. `merge-multiple` collapsed
+      # them onto a single path, ONE WON NONDETERMINISTICALLY, and that one
+      # got both smoke-tested and packaged into a `py3-none-any` wheel.
+      #
+      # It shipped. `nedb_engine-4.3.2-py3-none-any.whl` contains
+      # `nedb/_native.abi3.so`, and `file` reports it as
+      # "ELF 64-bit LSB shared object, ARM aarch64" — an ARM binary inside the
+      # wheel pip hands to every platform on earth.
+      #
+      # It also explains why this only just broke. An aarch64 .so on x86_64
+      # fails to dlopen CLEANLY, the lazy import falls back to pure Python,
+      # and the smoke test passes while the broken wheel publishes silently.
+      # A musl-x86_64 .so is the right architecture and right ELF class, so it
+      # LOADS and then dies resolving glibc symbols — SIGSEGV. The pipeline
+      # did not start failing; it started failing LOUDLY.
+      #
+      # So the extension is gone from here. pip prefers the platform wheels
+      # (all seven publish from the `wheels` matrix), and this wheel is the
+      # fallback for platforms we have no binary for — where a foreign .so is
+      # worthless anyway. `nedb/__init__.py` already imports `_native` lazily
+      # and prints a genuinely useful message when it is absent.
+      #
+      # Note what the server binaries did right, three lines below: they are
+      # staged under DISTINCT per-platform names (nedbd-v2, nedbd-v2.exe,
+      # nedbd-v2-darwin-arm64, nedbd-v2-darwin-x64) and coexist correctly. The
+      # difference was never the idea, it was the filename.
+      # ── Wait for the Mac SERVER binaries from Codemagic ───────────────────
+      # Codemagic uploads nedbd-v2-darwin-arm64 / -x64 to the GitHub release.
+      # Only those are wanted here: they are per-platform files with distinct
+      # names, so all four platforms' servers coexist in one wheel and the
+      # `nedbd` console script works everywhere. Mac `_native` extensions are
+      # uploaded too and are deliberately NOT downloaded -- they belong in the
+      # macOS platform wheels, which Codemagic publishes directly.
       - name: Wait for Mac artifacts from Codemagic + download all
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           VERSION="${{ github.ref_name }}"
-          echo "Polling GitHub release for Mac nedbd-v2 + _native binaries..."
+          echo "Polling GitHub release for the Mac nedbd-v2 server binaries..."
           for i in $(seq 1 35); do
             ASSETS=$(gh release view "$VERSION" --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
             ARM=$(echo "$ASSETS" | grep -c "nedbd-v2-darwin-arm64" || true)
@@ -73,23 +95,27 @@ jobs:
             sleep 60
           done
           gh release download "$VERSION" --pattern "nedbd-v2-*" --dir . --clobber || true
-          gh release download "$VERSION" --pattern "_native*darwin*" --dir native-ext --clobber || true
           # Stage nedbd-v2 server binaries
           [ -f nedbd-v2-linux-x64 ]      && cp nedbd-v2-linux-x64      python/nedb/nedbd-v2              && chmod +x python/nedb/nedbd-v2
           [ -f nedbd-v2-win-x64.exe ]    && cp nedbd-v2-win-x64.exe    python/nedb/nedbd-v2.exe
           [ -f nedbd-v2-darwin-arm64 ]   && cp nedbd-v2-darwin-arm64   python/nedb/nedbd-v2-darwin-arm64 && chmod +x python/nedb/nedbd-v2-darwin-arm64
           [ -f nedbd-v2-darwin-x64 ]     && cp nedbd-v2-darwin-x64     python/nedb/nedbd-v2-darwin-x64   && chmod +x python/nedb/nedbd-v2-darwin-x64
-          # Stage any Mac _native extensions that Codemagic uploaded
-          find native-ext -type f -name "_native*darwin*" 2>/dev/null | while read f; do
-            fname=$(basename "$f")
-            cp "$f" "python/nedb/$fname" && chmod +x "python/nedb/$fname" || true
-            echo "  staged mac ext: python/nedb/$fname"
-          done
           echo "Final python/nedb/ contents:"
-          ls -lh python/nedb/nedbd* python/nedb/_native* 2>/dev/null || echo "(none)"
+          ls -lh python/nedb/nedbd* 2>/dev/null || echo "(none)"
+      # Runs in PURE-PYTHON mode now, which is what this wheel actually is.
+      # It used to run against whichever foreign _native won the race, so a
+      # pass meant "the import failed cleanly enough to fall back" rather than
+      # "the universal wheel works".
       - run: python3 tests/test_nedb.py
       - run: pip install --upgrade build twine
       - run: python -m build
+      # The gate. A `py3-none-any` wheel claims every platform, so ONE
+      # architecture-specific binary inside it is a lie told to all the others
+      # — and the old failure mode was silent, so discipline alone will not
+      # hold. Checked by opening the built wheel rather than by trusting the
+      # steps above not to reintroduce it.
+      - name: The universal wheel must contain no native extension
+        run: python3 scripts/assert_universal_wheel_clean.py dist
       - name: Publish to PyPI
         if: startsWith(github.ref, 'refs/tags/')
         env:
