@@ -3129,6 +3129,44 @@ fn try_catalog_select(
         return Ok(None);
     }
 
+    // The storage pre-filter, resolved per relation NAME and computed once.
+    //
+    // The resolver is handed a name (`orders`) but the WHERE clause qualifies
+    // by BINDING (`o.status` for `FROM orders o`), so the predicate has to be
+    // looked up by name and rendered against that relation's binding. Getting
+    // this wrong is silent: the pre-filter simply never matches and the scan
+    // quietly reads the whole collection, which is exactly what EXPLAIN caught
+    // the first time round — `Seq Scan on orders o (actual rows=3)` when the
+    // query wanted two.
+    //
+    // A name appearing TWICE (a self-join, `FROM t a JOIN t b`) maps to two
+    // different bindings with different predicates, and one scan cannot serve
+    // both. Those are dropped rather than guessed at.
+    let pushdown_prefilters: std::collections::HashMap<String, String> = {
+        let refs: Vec<&crate::sqlselect::TableRef> = sel
+            .from
+            .iter()
+            .chain(sel.joins.iter().map(|j| &j.table))
+            .collect();
+        let bindings: Vec<String> = refs.iter().map(|t| t.binding()).collect();
+        let nullable = crate::sqlpush::nullable_bindings(&sel);
+        let mut out = std::collections::HashMap::new();
+        let mut ambiguous: Vec<String> = vec![];
+        for t in &refs {
+            let key = catalog_name(&t.name).to_ascii_lowercase();
+            if out.contains_key(&key) || ambiguous.contains(&key) {
+                out.remove(&key);
+                ambiguous.push(key);
+                continue;
+            }
+            if let Some(p) = crate::sqlpush::nql_prefilter(
+                sel.where_.as_ref(), &t.binding(), &bindings, &nullable) {
+                out.insert(key, p);
+            }
+        }
+        out
+    };
+
     let resolve = |name: &str| -> anyhow::Result<Option<Box<dyn crate::sqlselect::Relation>>> {
         let cname = catalog_name(name);
         if let Some(rows) = crate::pgcatalog::rows(&cname, db) {
@@ -3140,14 +3178,41 @@ fn try_catalog_select(
         // A join between a catalogue relation and a real collection is
         // legitimate, so a user table still resolves.
         //
-        // NOTE: `nql::query` materialises the whole collection, so this side
-        // is eager even though the evaluator no longer requires it to be.
-        // Making the storage scan itself lazy is the other half of the work
-        // and is tracked in HANDOFF — stated here so nobody reads the
-        // streaming interface as a claim that storage is already streaming.
+        // `nql::query` materialises whatever it is asked for, so what it is
+        // ASKED for is the whole cost of this line. It used to be
+        // `FROM <collection>` — every document, unconditionally, before a
+        // single predicate ran. Free on a catalogue relation of a few dozen
+        // synthesised rows; on a user collection it is the difference between
+        // reading one document and reading all of them.
+        //
+        // `sqlpush::nql_prefilter` renders the part of the WHERE that NQL is
+        // known to evaluate identically, and the full WHERE still runs above
+        // this — so the pre-filter can only ever cost a wasted row, never an
+        // answer. See the module note in `sqlpush` for why each refused
+        // construct is refused.
+        //
+        // Still eager, and deliberately not claimed otherwise: this narrows
+        // WHAT is materialised, not WHETHER it is. A lazy storage scan is the
+        // other half and is tracked in HANDOFF.
+        let pre = pushdown_prefilters.get(&cname.to_ascii_lowercase());
+        let nql = match pre {
+            Some(p) => format!("FROM {} WHERE {}", cname, p),
+            None => format!("FROM {}", cname),
+        };
         match db {
-            Some(db) => match crate::nql::query(db, &format!("FROM {}", cname)) {
+            Some(db) => match crate::nql::query(db, &nql) {
                 Ok((rows, _)) => Ok(Some(crate::sqlselect::from_vec(rows))),
+                // A pre-filter that NQL refuses must not fail the statement:
+                // it is an optimisation, so the honest fallback is the
+                // unfiltered scan the query would have done anyway. Silently
+                // returning None here would turn a slow-but-correct query into
+                // "relation does not exist".
+                Err(_) if pre.is_some() => {
+                    match crate::nql::query(db, &format!("FROM {}", cname)) {
+                        Ok((rows, _)) => Ok(Some(crate::sqlselect::from_vec(rows))),
+                        Err(_) => Ok(None),
+                    }
+                }
                 Err(_) => Ok(None),
             },
             None => Ok(None),

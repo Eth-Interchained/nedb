@@ -82,6 +82,7 @@
 //! for `EXPLAIN` to show later.
 
 use crate::sqlselect::Expr;
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Functions safe to evaluate while pre-filtering.
@@ -314,6 +315,140 @@ pub fn plan(
     out
 }
 
+// ── storage-side pre-filter ─────────────────────────────────────────────────
+//
+// `plan()` above pushes a filter below a JOIN, which is a question about the
+// shape of the plan. This is a different question: what can be pushed all the
+// way into STORAGE, so the scan never materialises rows the query cannot want.
+//
+// It matters because the resolver that feeds this evaluator asks NQL for
+// `FROM <collection>` — the WHOLE collection, every row, before a single
+// predicate runs. On a catalogue relation that is free (a few dozen
+// synthesised rows). On a user collection it is the difference between reading
+// one document and reading all of them.
+//
+// # Why this is safe, precisely
+//
+// The pushed predicate is a PRE-filter and the full `WHERE` still runs
+// afterwards, untouched. So the only failure mode that matters is a FALSE
+// NEGATIVE: dropping a row the real `WHERE` would have kept. A false positive
+// costs a wasted row and nothing else.
+//
+// That asymmetry is the whole design. Everything below is chosen so a false
+// negative cannot happen:
+//
+//   * `NOT`, `IS NULL` and a negated `IN` are all REFUSED. Negation turns a
+//     benign false positive into a false negative — exactly the direction that
+//     is not survivable — because the two languages disagree about a missing
+//     field. SQL evaluates `NULL != 'x'` to UNKNOWN and drops the row; NQL has
+//     no NULL at all, it has an ABSENT FIELD, and a negated match over an
+//     absent field is the one case where it may keep what SQL drops. Under a
+//     `NOT` that inverts into dropping what SQL keeps.
+//   * A `NULL` literal is refused for the same reason.
+//   * `OR` requires BOTH sides to render. Half an `OR` is not a weaker filter,
+//     it is a different one.
+//   * Arithmetic, casts, functions and subqueries are refused: not because
+//     they are necessarily unsafe, but because their NQL semantics have not
+//     been verified pair-for-pair, and an unverified rewrite is how the
+//     qualified-`WHERE` bug happened.
+//
+// When nothing renders, the answer is `None` and the scan stays as it was:
+// slower, and correct.
+
+/// Render `e` as an NQL predicate over one relation, or `None` when any part
+/// of it cannot be rendered with semantics NQL is known to match.
+///
+/// `strict_qual` demands that every column name carry this relation's
+/// qualifier. With more than one relation in the query an unqualified name may
+/// belong to the other one, and pushing another relation's predicate into this
+/// scan is a false negative.
+pub fn to_nql_predicate(e: &Expr, binding: &str, strict_qual: bool) -> Option<String> {
+    match e {
+        Expr::Column { qual, name } => match qual {
+            Some(q) if q.eq_ignore_ascii_case(binding) => Some(name.clone()),
+            Some(_) => None,
+            None if strict_qual => None,
+            None => Some(name.clone()),
+        },
+        Expr::Literal(v) => nql_literal(v),
+        Expr::Binary { op, left, right } => {
+            let o = op.to_ascii_uppercase();
+            let l = to_nql_predicate(left, binding, strict_qual)?;
+            let r = to_nql_predicate(right, binding, strict_qual)?;
+            match o.as_str() {
+                // Comparisons. `<>` is spelled `!=` in NQL.
+                "=" | "!=" | ">" | "<" | ">=" | "<=" | "LIKE" => Some(format!("{} {} {}", l, o, r)),
+                "<>" => Some(format!("{} != {}", l, r)),
+                // Both sides of a boolean connective must render, or the
+                // result is a different predicate rather than a looser one.
+                "AND" => Some(format!("({} AND {})", l, r)),
+                "OR" => Some(format!("({} OR {})", l, r)),
+                _ => None,
+            }
+        }
+        Expr::InList { expr, list, negated: false } => {
+            let l = to_nql_predicate(expr, binding, strict_qual)?;
+            let mut items = Vec::with_capacity(list.len());
+            for it in list {
+                items.push(to_nql_predicate(it, binding, strict_qual)?);
+            }
+            if items.is_empty() {
+                return None;
+            }
+            Some(format!("{} IN ({})", l, items.join(", ")))
+        }
+        // Everything else, refused on purpose. See the module note above.
+        _ => None,
+    }
+}
+
+/// A literal in NQL's spelling, or `None` when it must not be pushed.
+fn nql_literal(v: &Value) -> Option<String> {
+    match v {
+        // NQL quotes strings with `"`, and a `"` inside one is escaped.
+        Value::String(s) => Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(if *b { "TRUE".into() } else { "FALSE".into() }),
+        // A NULL comparison is the one place the two languages genuinely
+        // disagree, so it never travels into the scan.
+        _ => None,
+    }
+}
+
+/// The NQL predicate to pre-filter one relation's scan with, or `None`.
+///
+/// Splits the `WHERE` into `AND` conjuncts and keeps the ones that render,
+/// which is what makes partial pushdown safe: a subset of a conjunction is a
+/// weaker filter, and a weaker pre-filter only costs rows, never answers.
+/// (A subset of a DISJUNCTION would not be, which is why `OR` is handled
+/// whole inside `to_nql_predicate` and never split here.)
+pub fn nql_prefilter(
+    where_: Option<&Expr>,
+    binding: &str,
+    bindings: &[String],
+    nullable: &[String],
+) -> Option<String> {
+    // The nullable side of an outer join must not be pre-filtered: dropping a
+    // row there changes which rows get NULL-synthesised, which changes the
+    // answer. Same hazard `plan()` refuses, for the same reason.
+    if nullable.iter().any(|n| n.eq_ignore_ascii_case(binding)) {
+        return None;
+    }
+    let w = where_?;
+    let strict = bindings.len() > 1;
+    let mut parts = vec![];
+    conjuncts(w, &mut parts);
+    let kept: Vec<String> = parts
+        .iter()
+        .filter_map(|p| to_nql_predicate(p, binding, strict))
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(" AND "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +670,96 @@ mod tests {
         let p = plan_for("SELECT 1 FROM a JOIN b ON a.x = b.x WHERE A.v > 5");
         assert_eq!(p.for_binding("a").map(|v| v.len()), Some(1));
         assert_eq!(p.for_binding("A").map(|v| v.len()), Some(1));
+    }
+
+    // ── storage-side pre-filter ─────────────────────────────────────────────
+
+    /// Render the WHERE of `sql` as a pre-filter for `binding`.
+    fn pre(sql: &str, binding: &str) -> Option<String> {
+        let sel = parse(sql).expect("parses");
+        let bindings: Vec<String> = sel
+            .from
+            .iter()
+            .map(|t| t.binding())
+            .chain(sel.joins.iter().map(|j| j.table.binding()))
+            .collect();
+        let nullable = super::nullable_bindings(&sel);
+        super::nql_prefilter(sel.where_.as_ref(), binding, &bindings, &nullable)
+    }
+
+    #[test]
+    fn the_predicate_reaches_the_scan_in_nqls_spelling() {
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status = 'paid'", "orders").as_deref(),
+                   Some("status = \"paid\""));
+        // `<>` is spelled `!=`.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE total <> 5", "orders").as_deref(),
+                   Some("total != 5"));
+        assert_eq!(pre("SELECT 1 FROM orders WHERE total >= 100", "orders").as_deref(),
+                   Some("total >= 100"));
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status LIKE 'pa%'", "orders").as_deref(),
+                   Some("status LIKE \"pa%\""));
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status IN ('paid','open')", "orders").as_deref(),
+                   Some("status IN (\"paid\", \"open\")"));
+        assert_eq!(pre("SELECT 1 FROM orders WHERE a = 1 OR b = 2", "orders").as_deref(),
+                   Some("(a = 1 OR b = 2)"));
+        // A quote inside a literal survives into NQL's spelling.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE s = 'a\"b'", "orders").as_deref(),
+                   Some("s = \"a\\\"b\""));
+    }
+
+    /// The contract: a pre-filter may cost a wasted row, never an answer. So
+    /// every construct whose NQL semantics could DROP a row SQL keeps has to
+    /// come back `None` and leave the scan alone.
+    #[test]
+    fn anything_that_could_drop_a_row_sql_keeps_is_refused() {
+        for sql in [
+            // Negation over an absent field is where the two languages part.
+            "SELECT 1 FROM orders WHERE NOT (status = 'paid')",
+            "SELECT 1 FROM orders WHERE status IS NULL",
+            "SELECT 1 FROM orders WHERE status IS NOT NULL",
+            "SELECT 1 FROM orders WHERE status NOT IN ('paid')",
+            "SELECT 1 FROM orders WHERE status = NULL",
+            // Unverified semantics: not necessarily wrong, just not proven.
+            "SELECT 1 FROM orders WHERE total + 1 > 5",
+            "SELECT 1 FROM orders WHERE lower(status) = 'paid'",
+            "SELECT 1 FROM orders WHERE total::text = '5'",
+        ] {
+            assert_eq!(pre(sql, "orders"), None, "{}", sql);
+        }
+    }
+
+    #[test]
+    fn a_conjunction_pushes_the_part_it_can_and_keeps_the_rest_above() {
+        // `lower(...)` does not render; `status = 'paid'` does. A SUBSET of a
+        // conjunction is a weaker filter, so keeping the renderable half is
+        // safe -- the full WHERE still runs above the scan.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status = 'paid' AND lower(x) = 'y'", "orders")
+                       .as_deref(),
+                   Some("status = \"paid\""));
+        // But half an OR is a DIFFERENT predicate, not a weaker one, so the
+        // whole disjunction is refused when either side cannot render.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status = 'paid' OR lower(x) = 'y'", "orders"),
+                   None);
+    }
+
+    #[test]
+    fn another_relations_predicate_never_reaches_this_scan() {
+        let sql = "SELECT 1 FROM orders o JOIN drivers d ON o.driver = d._id \
+                   WHERE o.status = 'paid' AND d.name = 'Bob'";
+        assert_eq!(pre(sql, "o").as_deref(), Some("status = \"paid\""));
+        assert_eq!(pre(sql, "d").as_deref(), Some("name = \"Bob\""));
+        // With two relations an UNQUALIFIED name could belong to either, and
+        // guessing would push one relation's filter into the other's scan.
+        assert_eq!(pre("SELECT 1 FROM a JOIN b ON a.x = b.x WHERE v > 5", "a"), None);
+        // With one relation there is nothing to confuse it with.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE v > 5", "orders").as_deref(), Some("v > 5"));
+    }
+
+    #[test]
+    fn the_nullable_side_of_an_outer_join_is_never_pre_filtered() {
+        // Pre-filtering here would change which rows get NULL-synthesised,
+        // which changes the answer -- the same hazard `plan()` refuses.
+        let sql = "SELECT 1 FROM a LEFT JOIN b ON a.x = b.x WHERE b.v = 5";
+        assert_eq!(pre(sql, "b"), None);
     }
 }
