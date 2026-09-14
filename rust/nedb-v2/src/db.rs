@@ -18,6 +18,26 @@ use crate::index::{IdIndex, OrderedValue, SortedIndexes};
 use crate::graph::GraphStore;
 use crate::migrate;
 
+// ── A note on where diagnostics go ───────────────────────────────────────
+//
+// Every startup and repair message in this crate goes to STDERR, without
+// exception. `nedb-engine` is a LIBRARY, and a library that writes to stdout
+// is corrupting somebody else's output — it just does not find out until a
+// caller needs stdout to mean something.
+//
+// It found out. `nesql --json status` emitted:
+//
+//     [nedbd] cold start — background scan will start after heap allocation
+//     { "ok": true, ... }
+//
+// which is not JSON, so every machine consumer of that command was broken by
+// a progress note. The prints were already SPLIT between the two streams
+// before this — some `println!`, some `eprintln!`, a few lines apart — which
+// is the tell that it was never a decision in the first place.
+//
+// The daemon's own banner stays on stdout. `nedbd` is an application and its
+// stdout belongs to it; `Db::open` is a function anybody may call.
+
 /// MANIFEST: cached {seq, head} written atomically after every write.
 /// On startup, if MANIFEST exists and no sorted indexes need rebuilding,
 /// startup is O(1) — just read this one file instead of scanning all objects.
@@ -322,7 +342,7 @@ impl Db {
                         self.coll_tip_hash.insert(coll.clone(), (0, hash.clone()));
                     }
                     self.startup_ready.store(true, Ordering::SeqCst);
-                    println!("  [nedbd] warm start — seq={} head={}... tip={}...",
+                    eprintln!("  [nedbd] warm start — seq={} head={}... tip={}...",
                         m.seq, &m.head[..8],
                         if m.tip_hash.is_empty() { "(pre-2.5.43, heals on flush)" }
                         else { &m.tip_hash[..8.min(m.tip_hash.len())] });
@@ -338,7 +358,7 @@ impl Db {
         // which is called from Manager::open_all() AFTER Arc::new(db) — when
         // the Db is heap-allocated and its field addresses are permanently stable.
         // Capturing field addresses here would cause UB: Db moves on return.
-        println!("  [nedbd] cold start — background scan will start after heap allocation");
+        eprintln!("  [nedbd] cold start — background scan will start after heap allocation");
         Ok(())
     }
 
@@ -355,7 +375,7 @@ impl Db {
             self_arc.startup_ready.store(true, Ordering::SeqCst);
             return;
         }
-        println!("  [nedbd] cold start — background scan starting, server accepting reads now");
+        eprintln!("  [nedbd] cold start — background scan starting, server accepting reads now");
         std::thread::spawn(move || {
             let db = self_arc;
             cold_scan_background_arc(db);
@@ -1791,7 +1811,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
         return;
     }
 
-    println!("  [nedbd] background scan — {} objects...", total);
+    eprintln!("  [nedbd] background scan — {} objects...", total);
     let t0 = std::time::Instant::now();
     let step = (total / 10).max(1000);
 
@@ -1863,7 +1883,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     // index is repaired by the explicit `rebuild_id_index()` path.
     if db.id_index.collections().is_empty() && !nodes.is_empty() {
         let restored = rebuild_id_index_from_nodes(&db, &nodes);
-        println!("  [nedbd] id index was empty — rebuilt {} entries from objects", restored);
+        eprintln!("  [nedbd] id index was empty — rebuilt {} entries from objects", restored);
     }
 
     // Merkle head + tip, through the one shared implementation so the cold scan
@@ -1880,7 +1900,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
 
     // Signal server: writes can now proceed
     ready_flag.store(true, Ordering::SeqCst);
-    println!("  [nedbd] background scan complete — seq={} objects={} MANIFEST written", max_seq, total);
+    eprintln!("  [nedbd] background scan complete — seq={} objects={} MANIFEST written", max_seq, total);
 }
 
 /// Recompute the Merkle head and the tip hash from the full object-hash set.

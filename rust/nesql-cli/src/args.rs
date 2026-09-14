@@ -16,11 +16,11 @@
 //! So intent resolution is written out, by hand, with two rules:
 //!
 //!   * **Total.** Every argument vector maps to exactly one outcome. There is
-//!     no fallthrough, no "ignored trailing argument", no flag that is silently
+//! no fallthrough, no "ignored trailing argument", no flag that is silently
 //!     dropped for a command that does not take it.
 //!   * **Refusing.** When an argument admits more than one well-formed reading,
 //!     parsing FAILS and the message names the readings it would have had to
-//!     choose between. A user who is told "42 could be seq:42 or root:42" can
+//! choose between. A user who is told "42 could be seq:42 or root:42" can
 //!     fix it in one keystroke. A user who is given the wrong answer cannot
 //!     even tell.
 //!
@@ -56,6 +56,55 @@ pub enum RootCmd {
     Inspect { at: Option<u64> },
     Verify { at: Option<u64> },
     List,
+}
+
+/// `diff` between two sequences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffArgs {
+    pub from: u64,
+    pub to: u64,
+}
+
+/// The `tag` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagCmd {
+    Create { name: String, at: u64, message: Option<String> },
+    Inspect { name: String },
+    List { include_deleted: bool },
+    Delete { name: String },
+}
+
+/// The `branch` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchCmd {
+    Create { name: String, base: u64 },
+    /// Write a document ON the branch. Invisible to the destination until
+    /// merge.
+    ///
+    /// A document-level verb rather than `branch query <NAME> <neQL>`, which
+    /// is where the reduced vocabulary would point. neQL writes run through
+    /// the engine's normal write path, and routing them into a branch overlay
+    /// instead is not a CLI change — it arrives with the child store, when a
+    /// branch has somewhere of its own to write to. Promising the nicer
+    /// spelling before it can mean what it says would be worse than the
+    /// blunter one.
+    Put { name: String, coll: String, id: String, json: String },
+    Rm { name: String, coll: String, id: String },
+    Inspect { name: String },
+    List { include_all: bool },
+    Abandon { name: String },
+}
+
+/// Which side a conflict resolution takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side { Ours, Theirs }
+
+/// The `merge` subcommands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeCmd {
+    Plan { branch: String },
+    Execute { branch: String },
+    Resolve { branch: String, coll: String, id: String, side: Side },
 }
 
 /// A command that is reserved in the grammar but not yet implemented.
@@ -94,6 +143,10 @@ pub enum Command {
     Constitution,
     Version,
     Query(String),
+    Diff(DiffArgs),
+    Tag(TagCmd),
+    Branch(BranchCmd),
+    Merge(MergeCmd),
     Help,
     NotWired(NotWired),
 }
@@ -113,6 +166,20 @@ impl Command {
             Command::Constitution => "constitution",
             Command::Version => "version",
             Command::Query(_) => "query",
+            Command::Diff(_) => "diff",
+            Command::Tag(TagCmd::Create { .. }) => "tag create",
+            Command::Tag(TagCmd::Inspect { .. }) => "tag inspect",
+            Command::Tag(TagCmd::List { .. }) => "tag list",
+            Command::Tag(TagCmd::Delete { .. }) => "tag delete",
+            Command::Branch(BranchCmd::Create { .. }) => "branch create",
+            Command::Branch(BranchCmd::Put { .. }) => "branch put",
+            Command::Branch(BranchCmd::Rm { .. }) => "branch rm",
+            Command::Branch(BranchCmd::Inspect { .. }) => "branch inspect",
+            Command::Branch(BranchCmd::List { .. }) => "branch list",
+            Command::Branch(BranchCmd::Abandon { .. }) => "branch abandon",
+            Command::Merge(MergeCmd::Plan { .. }) => "merge plan",
+            Command::Merge(MergeCmd::Execute { .. }) => "merge execute",
+            Command::Merge(MergeCmd::Resolve { .. }) => "merge resolve",
             Command::Help => "help",
             Command::NotWired(w) => w.name(),
         }
@@ -158,7 +225,7 @@ fn refuse<T>(msg: impl Into<String>) -> Result<T, UsageError> {
 /// value-ness depends on what follows it is a flag that changes meaning based
 /// on its neighbour.
 fn takes_value(flag: &str) -> bool {
-    matches!(flag, "--db" | "--limit" | "--since" | "--at")
+    matches!(flag, "--db" | "--limit" | "--since" | "--at" | "--message")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +306,8 @@ fn lex(argv: &[String]) -> Result<Vec<Tok>, UsageError> {
 fn is_known_flag(name: &str) -> bool {
     matches!(
         name,
-        "--db" | "--json" | "--human" | "--help" | "--version" | "--limit" | "--since" | "--at"
+        "--db" | "--json" | "--human" | "--help" | "--version" | "--limit" | "--since"
+            | "--at" | "--message" | "--all" | "--ours" | "--theirs" | "--nql" | "--sql"
     )
 }
 
@@ -304,6 +372,18 @@ pub fn parse(argv: &[String]) -> Result<Invocation, UsageError> {
                     db = Some(v);
                 }
                 (other, Some(v)) => flags.push((other.to_string(), v)),
+                // A valueless command-scoped flag — --ours, --all. Recorded
+                // with an empty value; `has_bare_flag` asks only whether it is
+                // present.
+                //
+                // This arm used to refuse everything, which made a flag that
+                // takes no value unrepresentable: `merge resolve … --ours`
+                // came back as "--ours needs a value". `takes_value` already
+                // knows which flags carry one, so it decides here too rather
+                // than the two lists disagreeing.
+                (other, None) if !takes_value(other) => {
+                    flags.push((other.to_string(), String::new()))
+                }
                 (other, None) => {
                     return refuse(format!("{} needs a value", other));
                 }
@@ -505,10 +585,200 @@ fn resolve(
             Ok(Command::Query(words.join(" ")))
         }
 
-        "diff" => Ok(Command::NotWired(NotWired::Diff)),
-        "tag" => Ok(Command::NotWired(NotWired::Tag)),
-        "branch" => Ok(Command::NotWired(NotWired::Branch)),
-        "merge" => Ok(Command::NotWired(NotWired::Merge)),
+        // ── diff ─────────────────────────────────────────────────────────
+        "diff" => {
+            no_flags("diff", flags)?;
+            match words.len() {
+                2 => Ok(Command::Diff(DiffArgs {
+                    from: parse_u64("diff <FROM>", &words[0])?,
+                    to: parse_u64("diff <TO>", &words[1])?,
+                })),
+                // One sequence is genuinely ambiguous — "since X" and "the
+                // last X" are both natural readings and they answer different
+                // questions. Refuse rather than pick, and name both readings
+                // so the fix is obvious.
+                1 => refuse(format!(
+                    "diff {0} is ambiguous: it could mean `diff {0} <tip>` or a range \
+                     ending at {0} — give both endpoints",
+                    words[0]
+                )),
+                0 => refuse("diff needs two sequences: diff <FROM> <TO>"),
+                n => refuse(format!("diff takes exactly two sequences, but got {}", n)),
+            }
+        }
+
+        // ── tag ──────────────────────────────────────────────────────────
+        "tag" => {
+            let sub = match words.first() {
+                Some(s) => s.as_str(),
+                None => return refuse(
+                    "tag needs a subcommand: create, inspect, list, or delete"),
+            };
+            let rest = &words[1..];
+            match sub {
+                "create" => {
+                    if rest.len() != 2 {
+                        return refuse(
+                            "tag create needs a name and a sequence: \
+                             tag create <NAME> <SEQ> [--message M]");
+                    }
+                    let message = take_flag(flags, "--message")?;
+                    reject_unused(flags, &["--message"], "tag create")?;
+                    Ok(Command::Tag(TagCmd::Create {
+                        name: rest[0].clone(),
+                        at: parse_u64("tag create <SEQ>", &rest[1])?,
+                        message,
+                    }))
+                }
+                "inspect" | "delete" => {
+                    no_flags(&format!("tag {}", sub), flags)?;
+                    if rest.len() != 1 {
+                        return refuse(format!("tag {} needs exactly one tag name", sub));
+                    }
+                    let name = rest[0].clone();
+                    Ok(Command::Tag(if sub == "inspect" {
+                        TagCmd::Inspect { name }
+                    } else {
+                        TagCmd::Delete { name }
+                    }))
+                }
+                "list" => {
+                    no_words("tag list", rest)?;
+                    let all = has_bare_flag(flags, "--all");
+                    reject_unused(flags, &["--all"], "tag list")?;
+                    Ok(Command::Tag(TagCmd::List { include_deleted: all }))
+                }
+                other => refuse(format!(
+                    "tag has no subcommand {:?}; it has create, inspect, list, delete",
+                    other
+                )),
+            }
+        }
+
+        // ── branch ───────────────────────────────────────────────────────
+        "branch" => {
+            let sub = match words.first() {
+                Some(s) => s.as_str(),
+                None => return refuse(
+                    "branch needs a subcommand: create, inspect, list, or abandon"),
+            };
+            let rest = &words[1..];
+            match sub {
+                "create" => {
+                    no_flags("branch create", flags)?;
+                    if rest.len() != 2 {
+                        return refuse(
+                            "branch create needs a name and a base sequence: \
+                             branch create <NAME> <SEQ>");
+                    }
+                    Ok(Command::Branch(BranchCmd::Create {
+                        name: rest[0].clone(),
+                        base: parse_u64("branch create <SEQ>", &rest[1])?,
+                    }))
+                }
+                "put" => {
+                    no_flags("branch put", flags)?;
+                    if rest.len() != 4 {
+                        return refuse(
+                            "branch put needs a branch, a collection, an id and a JSON \
+                             document: branch put <NAME> <COLL> <ID> <JSON>");
+                    }
+                    Ok(Command::Branch(BranchCmd::Put {
+                        name: rest[0].clone(), coll: rest[1].clone(),
+                        id: rest[2].clone(), json: rest[3].clone(),
+                    }))
+                }
+                "rm" => {
+                    no_flags("branch rm", flags)?;
+                    if rest.len() != 3 {
+                        return refuse(
+                            "branch rm needs a branch, a collection and an id: \
+                             branch rm <NAME> <COLL> <ID>");
+                    }
+                    Ok(Command::Branch(BranchCmd::Rm {
+                        name: rest[0].clone(), coll: rest[1].clone(), id: rest[2].clone(),
+                    }))
+                }
+                "inspect" | "abandon" => {
+                    no_flags(&format!("branch {}", sub), flags)?;
+                    if rest.len() != 1 {
+                        return refuse(format!("branch {} needs exactly one name", sub));
+                    }
+                    let name = rest[0].clone();
+                    Ok(Command::Branch(if sub == "inspect" {
+                        BranchCmd::Inspect { name }
+                    } else {
+                        BranchCmd::Abandon { name }
+                    }))
+                }
+                "list" => {
+                    no_words("branch list", rest)?;
+                    let all = has_bare_flag(flags, "--all");
+                    reject_unused(flags, &["--all"], "branch list")?;
+                    Ok(Command::Branch(BranchCmd::List { include_all: all }))
+                }
+                other => refuse(format!(
+                    "branch has no subcommand {:?}; it has create, put, rm, inspect, list, abandon",
+                    other
+                )),
+            }
+        }
+
+        // ── merge ────────────────────────────────────────────────────────
+        "merge" => {
+            let sub = match words.first() {
+                Some(s) => s.as_str(),
+                None => return refuse(
+                    "merge needs a subcommand: plan, execute, or resolve"),
+            };
+            let rest = &words[1..];
+            match sub {
+                "plan" | "execute" => {
+                    no_flags(&format!("merge {}", sub), flags)?;
+                    if rest.len() != 1 {
+                        return refuse(format!("merge {} needs exactly one branch name", sub));
+                    }
+                    let branch = rest[0].clone();
+                    Ok(Command::Merge(if sub == "plan" {
+                        MergeCmd::Plan { branch }
+                    } else {
+                        MergeCmd::Execute { branch }
+                    }))
+                }
+                "resolve" => {
+                    if rest.len() != 3 {
+                        return refuse(
+                            "merge resolve needs a branch, a collection and an id: \
+                             merge resolve <BRANCH> <COLL> <ID> --ours|--theirs");
+                    }
+                    let ours = has_bare_flag(flags, "--ours");
+                    let theirs = has_bare_flag(flags, "--theirs");
+                    reject_unused(flags, &["--ours", "--theirs"], "merge resolve")?;
+                    // Both or neither is refused. A default side would be this
+                    // command quietly choosing which line of history wins,
+                    // which is the one decision it exists to ask a human for.
+                    let side = match (ours, theirs) {
+                        (true, false) => Side::Ours,
+                        (false, true) => Side::Theirs,
+                        (true, true) => return refuse(
+                            "merge resolve takes --ours or --theirs, not both"),
+                        (false, false) => return refuse(
+                            "merge resolve needs --ours or --theirs: there is no default \
+                             side, because choosing one is the decision being asked for"),
+                    };
+                    Ok(Command::Merge(MergeCmd::Resolve {
+                        branch: rest[0].clone(),
+                        coll: rest[1].clone(),
+                        id: rest[2].clone(),
+                        side,
+                    }))
+                }
+                other => refuse(format!(
+                    "merge has no subcommand {:?}; it has plan, execute, resolve",
+                    other
+                )),
+            }
+        }
 
         other => refuse(format!(
             "no such command: {:?}; run `nesql grammar` for the command surface",
@@ -614,6 +884,11 @@ fn split_marker(arg: &str) -> Option<(&str, &str)> {
 }
 
 // ── Small refusing helpers ───────────────────────────────────────────────
+
+/// Was a valueless flag given? The lexer records those with an empty value.
+fn has_bare_flag(flags: &[(String, String)], name: &str) -> bool {
+    flags.iter().any(|(n, _)| n == name)
+}
 
 fn no_words(cmd: &str, words: &[String]) -> Result<(), UsageError> {
     if words.is_empty() {
@@ -759,14 +1034,26 @@ mod tests {
     }
 
     #[test]
-    fn unwired_commands_parse_to_their_own_variant() {
-        for (word, want) in [
-            ("diff", NotWired::Diff),
-            ("tag", NotWired::Tag),
-            ("branch", NotWired::Branch),
-            ("merge", NotWired::Merge),
+    fn the_version_control_verbs_parse_to_their_own_commands() {
+        // These four used to be NotWired placeholders. They are wired now, so
+        // the test that pinned them as reserved becomes the test that pins
+        // what they parse to — and that each one REQUIRES its arguments
+        // rather than defaulting to something.
+        assert_eq!(cmd("diff 1 2"), Command::Diff(DiffArgs { from: 1, to: 2 }));
+        assert_eq!(cmd("tag list"), Command::Tag(TagCmd::List { include_deleted: false }));
+        assert_eq!(cmd("branch list"), Command::Branch(BranchCmd::List { include_all: false }));
+        assert_eq!(cmd("merge plan x"),
+                   Command::Merge(MergeCmd::Plan { branch: "x".into() }));
+
+        // A bare verb names no operation, so it is refused with its options.
+        for (word, hint) in [
+            ("diff", "two sequences"),
+            ("tag", "create, inspect, list, or delete"),
+            ("branch", "create, inspect, list, or abandon"),
+            ("merge", "plan, execute, or resolve"),
         ] {
-            assert_eq!(cmd(word), Command::NotWired(want));
+            let e = err(word);
+            assert!(e.contains(hint), "{} said {:?}", word, e);
         }
     }
 
@@ -923,8 +1210,8 @@ mod tests {
     fn json_is_accepted_on_every_command_before_or_after_it() {
         for line in [
             "status", "log", "inspect users", "root create", "root inspect", "root verify",
-            "root list", "grammar", "constitution", "version", "query FROM users", "diff",
-            "tag", "branch", "merge", "help",
+            "root list", "grammar", "constitution", "version", "query FROM users",
+            "diff 1 2", "tag list", "branch list", "merge plan x", "help",
         ] {
             let after = format!("{} --json", line);
             assert!(p(&after).expect("--json after the command").json, "{}", after);

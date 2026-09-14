@@ -154,11 +154,11 @@ pub fn migrate_if_needed(
         // This shouldn't normally happen but handle it gracefully
     }
 
-    println!("  [nedb] Detected v1 log.aof — running automatic migration to v2 DAG...");
+    eprintln!("  [nedb] Detected v1 log.aof — running automatic migration to v2 DAG...");
 
     let ops = read_v1_aof(&aof_path, dek)?;
     let total = ops.len();
-    println!("  [nedb] {} op(s) to migrate", total);
+    eprintln!("  [nedb] {} op(s) to migrate", total);
 
     // Build seq → hash map as we write nodes (to resolve caused_by seq → hash)
     let mut seq_to_hash: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
@@ -212,7 +212,7 @@ pub fn migrate_if_needed(
     fs::rename(&aof_path, &bak_path)
         .context("rename log.aof to log.aof.v1.bak")?;
 
-    println!(
+    eprintln!(
         "  [nedb] Migration complete: {} op(s) → v2 DAG. Backup: {}",
         total,
         bak_path.display()

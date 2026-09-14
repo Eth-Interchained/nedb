@@ -11,13 +11,17 @@
 //! [`not_wired`] already produces the right refusal, so wiring one up means
 //! replacing one call with one module.
 
+pub mod branch;
 pub mod constitution;
+pub mod diff;
 pub mod grammar;
 pub mod inspect;
 pub mod log;
+pub mod merge;
 pub mod query;
 pub mod root;
 pub mod status;
+pub mod tag;
 pub mod version;
 
 use std::path::Path;
@@ -25,7 +29,7 @@ use std::sync::Arc;
 
 use nedb_engine::Db;
 
-use crate::args::{Command, NotWired, RootCmd};
+use crate::args::{Command, DiffArgs, NotWired, RootCmd};
 use crate::out::{Exit, Report};
 
 /// Open the database a command was pointed at.
@@ -111,6 +115,10 @@ pub fn dispatch(command: &Command, db: &Arc<Db>, path: &Path) -> Report {
         Command::Root(RootCmd::List) => root::list(db),
         Command::Constitution => constitution::run(db),
         Command::Query(q) => query::run(db, q),
+        Command::Diff(DiffArgs { from, to }) => diff::run(db, *from, *to),
+        Command::Tag(t) => tag::run(db, t),
+        Command::Branch(b) => branch::run(db, b),
+        Command::Merge(m) => merge::run(db, m),
 
         // Answered from the binary; routed here too so that `dispatch` is total
         // over `Command` and a new variant cannot be forgotten.

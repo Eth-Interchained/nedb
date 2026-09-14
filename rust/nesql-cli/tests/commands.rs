@@ -244,13 +244,21 @@ fn constitution_checks_this_cli_against_this_engine() {
     assert_eq!(r.body["constitution_digest"].as_str().unwrap().len(), 64);
 }
 
+/// The four verbs are wired now, so what this pins is that none of them acts
+/// on a bare word. Each names an operation, and a command line that names
+/// none of them is refused rather than defaulted — `merge` with no subcommand
+/// must not quietly become `merge plan`.
 #[test]
-fn reserved_but_unimplemented_commands_refuse_rather_than_succeed() {
-    for word in ["diff", "tag", "branch", "merge"] {
-        let inv = parse(&[word]);
-        let r = cmd::dispatch_dbless(&inv.command).expect("answered from the binary");
-        assert_eq!(r.exit, Exit::Usage, "{} must not look like it did something", word);
-        assert_eq!(r.body["reserved"], true);
+fn a_bare_version_control_verb_names_no_operation_and_is_refused() {
+    for (word, hint) in [
+        ("diff", "two sequences"),
+        ("tag", "create, inspect, list, or delete"),
+        ("branch", "create, inspect, list, or abandon"),
+        ("merge", "plan, execute, or resolve"),
+    ] {
+        let argv = vec![word.to_string()];
+        let e = args::parse(&argv).expect_err("a bare verb must be refused");
+        assert!(e.0.contains(hint), "{} said {:?}", word, e.0);
     }
 }
 
@@ -338,4 +346,172 @@ fn a_forced_dialect_produces_that_dialects_own_error() {
     let r = cmd::query::run_with(&db, "SELECT * FROM orders", Some(cmd::query::Dialect::Nql));
     assert_eq!(r.exit, Exit::Usage);
     assert_eq!(r.body["dialect"], "nql");
+}
+
+// ── the version-control verbs, over the real engine ───────────────────────
+
+use nesql::args::{BranchCmd, DiffArgs, MergeCmd, Side, TagCmd};
+
+/// The scenario the architecture review named, driven through the CLI.
+///
+/// Two branches make the SAME claim about the SAME document. Resolving one
+/// must leave the other untouched — a human decision about one line of
+/// history must never implicitly authorise another.
+#[test]
+fn resolving_one_branch_leaves_another_making_the_same_claim_conflicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let base = cmd::status::head_seq(&db);
+
+    for b in ["x", "y"] {
+        assert_eq!(
+            cmd::branch::run(&db, &BranchCmd::Create { name: b.into(), base }).exit,
+            Exit::Ok
+        );
+        assert_eq!(
+            cmd::branch::run(&db, &BranchCmd::Put {
+                name: b.into(), coll: "orders".into(), id: "1".into(),
+                json: r#"{"total":7}"#.into(),
+            }).exit,
+            Exit::Ok
+        );
+    }
+    db.put("orders", "1", serde_json::json!({"total": 8}), vec![], None, None).unwrap();
+
+    let px = cmd::merge::run(&db, &MergeCmd::Plan { branch: "x".into() });
+    assert_eq!(px.exit, Exit::Failure, "a conflicted plan is not clean");
+    assert_eq!(px.body["plan"]["conflicts"].as_array().unwrap().len(), 1);
+
+    let r = cmd::merge::run(&db, &MergeCmd::Resolve {
+        branch: "x".into(), coll: "orders".into(), id: "1".into(), side: Side::Ours,
+    });
+    assert_eq!(r.exit, Exit::Ok, "{}", r.human);
+
+    assert!(
+        cmd::merge::run(&db, &MergeCmd::Plan { branch: "x".into() }).body["clean"]
+            .as_bool().unwrap(),
+        "x was decided, so its plan is now clean"
+    );
+    let py = cmd::merge::run(&db, &MergeCmd::Plan { branch: "y".into() });
+    assert_eq!(py.exit, Exit::Failure, "NOBODY decided y");
+    assert_eq!(py.body["plan"]["conflicts"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn a_merged_write_names_the_branch_write_that_caused_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let base = cmd::status::head_seq(&db);
+    cmd::branch::run(&db, &BranchCmd::Create { name: "x".into(), base });
+    let put = cmd::branch::run(&db, &BranchCmd::Put {
+        name: "x".into(), coll: "orders".into(), id: "1".into(),
+        json: r#"{"total":7}"#.into(),
+    });
+    let source = put.body["write"]["source_hash"].as_str().unwrap().to_string();
+    assert!(!source.is_empty());
+
+    let done = cmd::merge::run(&db, &MergeCmd::Execute { branch: "x".into() });
+    assert_eq!(done.exit, Exit::Ok, "{}", done.human);
+
+    let node = db.get("orders", "1").expect("the replay landed");
+    assert_eq!(node.caused_by, vec![source], "the edge is on the destination node");
+}
+
+#[test]
+fn execute_refuses_while_a_conflict_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let base = cmd::status::head_seq(&db);
+    cmd::branch::run(&db, &BranchCmd::Create { name: "x".into(), base });
+    cmd::branch::run(&db, &BranchCmd::Put {
+        name: "x".into(), coll: "orders".into(), id: "1".into(),
+        json: r#"{"total":7}"#.into(),
+    });
+    db.put("orders", "1", serde_json::json!({"total": 8}), vec![], None, None).unwrap();
+
+    let before = db.get("orders", "1").unwrap().data;
+    let r = cmd::merge::run(&db, &MergeCmd::Execute { branch: "x".into() });
+    assert_eq!(r.exit, Exit::Failure);
+    assert_eq!(db.get("orders", "1").unwrap().data, before,
+               "a refused merge must not have written anything");
+}
+
+#[test]
+fn resolving_a_conflict_that_is_not_open_says_which_ones_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let base = cmd::status::head_seq(&db);
+    cmd::branch::run(&db, &BranchCmd::Create { name: "x".into(), base });
+    cmd::branch::run(&db, &BranchCmd::Put {
+        name: "x".into(), coll: "orders".into(), id: "1".into(),
+        json: r#"{"total":7}"#.into(),
+    });
+    db.put("orders", "1", serde_json::json!({"total": 8}), vec![], None, None).unwrap();
+
+    let r = cmd::merge::run(&db, &MergeCmd::Resolve {
+        branch: "x".into(), coll: "orders".into(), id: "nope".into(), side: Side::Ours,
+    });
+    assert_eq!(r.exit, Exit::NotFound);
+    assert_eq!(r.body["open_conflicts"].as_array().unwrap().len(), 1,
+               "a dead end is worse than a list of what IS open");
+}
+
+#[test]
+fn a_tag_target_is_immutable_and_a_retracted_name_is_gone_for_good() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let head = cmd::status::head_seq(&db);
+
+    assert_eq!(cmd::tag::run(&db, &TagCmd::Create {
+        name: "v1".into(), at: head, message: None }).exit, Exit::Ok);
+    assert_eq!(cmd::tag::run(&db, &TagCmd::Create {
+        name: "v1".into(), at: head - 1, message: None }).exit, Exit::Usage,
+        "a tag target never moves");
+    assert_eq!(cmd::tag::run(&db, &TagCmd::Delete { name: "v1".into() }).exit, Exit::Ok);
+    assert_eq!(cmd::tag::run(&db, &TagCmd::Create {
+        name: "v1".into(), at: head, message: None }).exit, Exit::Usage,
+        "and a retracted name is never reusable");
+
+    // Inspect still answers "what did v1 point at", which outlives the tag.
+    let seen = cmd::tag::run(&db, &TagCmd::Inspect { name: "v1".into() });
+    assert_eq!(seen.exit, Exit::Ok);
+    assert_eq!(seen.body["tag"]["deleted"], true);
+    assert_eq!(seen.body["tag"]["at_seq"], head);
+}
+
+#[test]
+fn branch_list_reports_what_is_pinning_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let base = cmd::status::head_seq(&db);
+    let empty = cmd::branch::run(&db, &BranchCmd::List { include_all: false });
+    assert!(empty.body["minimum_pinned_seq"].is_null());
+
+    cmd::branch::run(&db, &BranchCmd::Create { name: "x".into(), base });
+    let held = cmd::branch::run(&db, &BranchCmd::List { include_all: false });
+    assert_eq!(held.body["minimum_pinned_seq"], base,
+               "the operator deciding whether to reclaim space must see this");
+
+    cmd::branch::run(&db, &BranchCmd::Abandon { name: "x".into() });
+    let freed = cmd::branch::run(&db, &BranchCmd::List { include_all: false });
+    assert!(freed.body["minimum_pinned_seq"].is_null(),
+            "an abandoned branch pins nothing, so compaction is free again");
+}
+
+#[test]
+fn diff_reports_change_and_refuses_a_pruned_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let from = cmd::status::head_seq(&db);
+    db.put("orders", "1", serde_json::json!({"total": 999}), vec![], None, None).unwrap();
+    let to = cmd::status::head_seq(&db);
+
+    let d = cmd::diff::run(&db, from, to);
+    assert_eq!(d.exit, Exit::Ok, "{}", d.human);
+    assert_eq!(d.body["diff"]["documents"].as_array().unwrap().len(), 1);
+
+    db.set_history_floor(to).unwrap();
+    let pruned = cmd::diff::run(&db, from, to);
+    assert_eq!(pruned.exit.code(), 3,
+               "a pruned range is could-not-determine, not an empty diff");
 }
