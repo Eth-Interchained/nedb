@@ -737,3 +737,106 @@ workflows:
     artifacts:
       - dist/*.whl
       - "*.node"
+
+  # ── neSQL CLI on Apple hardware ───────────────────────────────────────
+  #
+  # The Mac legs for `nesql` run HERE rather than on GitHub-hosted macOS
+  # runners. Not an architectural preference — a queueing one. The
+  # github-hosted macos-14 and macos-13 pools sit queued long enough that a
+  # pull request's Mac result arrives well after its Linux and Windows
+  # results, and a signal that late stops being part of the loop. The M2 Mac
+  # Mini here picks the job up immediately.
+  #
+  # (An earlier revision of .github/workflows/nesql-cli.yml argued the
+  # opposite, on the grounds that a failure belongs next to the code rather
+  # than in another dashboard. That argument was right about WHERE a failure
+  # should surface and wrong about what it costs to wait for it. The GitHub
+  # workflow still owns Linux and Windows, so the pull request keeps two of
+  # its four legs inline.)
+  #
+  # PUSH-triggered, unlike every other workflow in this file. The others build
+  # release artifacts and fire on a v* tag; this one is a test run and has to
+  # answer while the branch is still being worked on.
+  nesql-cli-macos:
+    name: "neSQL CLI — macOS (arm64 native + x86_64 cross)"
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: "hyperagent/*"
+          include: true
+        - pattern: "master"
+          include: true
+    environment:
+      vars:
+        CARGO_TERM_COLOR: always
+        RUST_BACKTRACE: "1"
+    scripts:
+      - name: Install Rust (arm64 host + x86_64 target)
+        script: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-apple-darwin
+          echo "rustc: $(rustc --version)"
+
+      # Named explicitly: a bare workspace build drags in the napi and maturin
+      # bindings, which need toolchains this job has no reason to install.
+      - name: Build and test — arm64, natively
+        script: |
+          source "$HOME/.cargo/env"
+          cd rust
+          cargo build -p nesql-cli --verbose
+          cargo test  -p nesql-cli --verbose
+
+      # x86_64 is a BUILD check only, and says so. The host is Apple Silicon,
+      # so an Intel test binary would run under Rosetta — and "the tests pass"
+      # is a different claim from "the tests pass on Intel hardware". Compile
+      # coverage is what this leg honestly provides.
+      - name: Build — x86_64 (cross-compile; not executed)
+        script: |
+          source "$HOME/.cargo/env"
+          cd rust
+          cargo build -p nesql-cli --target x86_64-apple-darwin --verbose
+
+      # The binary has to actually run: cargo test never executes main, so a
+      # crate whose tests pass can still panic on startup.
+      - name: Smoke — version reports both dimensions
+        script: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cd rust
+          out=$(cargo run -q -p nesql-cli -- version)
+          echo "$out"
+          echo "$out" | grep -q '^nesql'  || { echo "no nesql version line";  exit 1; }
+          echo "$out" | grep -q '^engine' || { echo "no engine version line"; exit 1; }
+
+      - name: Smoke — a missing database is exit 4 and creates nothing
+        script: |
+          set -uo pipefail
+          source "$HOME/.cargo/env"
+          cd rust
+          target="$TMPDIR/definitely-not-a-database"
+          rm -rf "$target"
+          set +e
+          cargo run -q -p nesql-cli -- --db "$target" status
+          code=$?
+          set -e
+          [ "$code" -eq 4 ] || { echo "expected exit 4, got $code"; exit 1; }
+          [ ! -e "$target" ] || { echo "a read-only command created $target"; exit 1; }
+          echo "ok — exit 4, nothing created"
+
+      - name: Smoke — grammar emits a 64-character digest
+        script: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cd rust
+          out=$(cargo run -q -p nesql-cli -- grammar --json)
+          echo "$out" | grep -Eo '"digest": *"[0-9a-f]{64}"' \
+            || { echo "grammar did not emit a 64-hex digest"; echo "$out"; exit 1; }
+
+    artifacts:
+      - rust/target/debug/nesql
+      - rust/target/x86_64-apple-darwin/debug/nesql

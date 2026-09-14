@@ -1,0 +1,149 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
+# neSQL CLI — Linux and Windows. macOS runs on Codemagic.
+#
+# This file originally carried macos-14 and macos-13 legs, on the argument
+# that a failure belongs on the pull request rather than in another
+# dashboard. That argument was right about WHERE a failure should surface and
+# wrong about what it costs to wait for it: the GitHub-hosted macOS pools
+# queue long enough that the Mac verdict lands well after the Linux and
+# Windows ones, and a signal that late has stopped being part of the loop.
+#
+# The Mac legs moved to the `nesql-cli-macos` workflow in codemagic.yaml,
+# which runs on an M2 Mac Mini that picks the job up immediately. Every other
+# Codemagic workflow in that file is tag-triggered and builds release
+# artifacts; that one is push-triggered, because it is a test run and has to
+# answer while the branch is still being worked on.
+#
+# Cross-platform is not decoration for a CLI. The argument parser, the exit
+# codes and the path handling are exactly the surfaces where a Unix-only
+# assumption hides, and the one that matters most — `nesql status` on a path
+# that does not exist must be exit 4 and must not create a database — is a
+# filesystem behaviour. Windows stays here precisely because it is the
+# platform most likely to break those.
+
+name: nesql-cli
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "rust/nesql-cli/**"
+      - "rust/nedb-v2/**"
+      - "rust/Cargo.toml"
+      - ".github/workflows/nesql-cli.yml"
+  pull_request:
+    paths:
+      - "rust/nesql-cli/**"
+      - "rust/nedb-v2/**"
+      - "rust/Cargo.toml"
+      - ".github/workflows/nesql-cli.yml"
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run on the same ref. The old run's answer
+# is about code nobody is looking at any more.
+concurrency:
+  group: nesql-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug symbols are dead weight for a build whose only job is to answer
+  # "does it compile and do the tests pass".
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every target reports. Cancelling siblings on the first failure hides
+      # whether a break is platform-specific, which is the single most useful
+      # thing to know about a cross-platform failure.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: "linux x86_64" }
+          - { os: windows-latest, name: "windows x86_64" }
+          # macOS is on Codemagic — see the note at the top of this file.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: nesql-${{ matrix.os }}
+
+      # Named explicitly. A bare `cargo build` at the workspace root would drag
+      # in the napi and maturin bindings, which need toolchains this job has no
+      # reason to install — and on Windows the napi build script fails outright
+      # under the GNU target. See the note in rust/Cargo.toml.
+      # No --locked: rust/Cargo.lock is deliberately not tracked in this
+      # repository, so demanding an unchanged lockfile would fail on a clean
+      # checkout for a reason unrelated to the code.
+      - name: Build
+        working-directory: rust
+        run: cargo build -p nesql-cli --verbose
+
+      - name: Test
+        working-directory: rust
+        run: cargo test -p nesql-cli --verbose
+
+      # The binary has to actually run. A crate that compiles and whose unit
+      # tests pass can still be a binary that panics on startup, because
+      # nothing in `cargo test` executes `main`.
+      - name: Smoke — version reports both dimensions
+        working-directory: rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(cargo run -q -p nesql-cli -- version)
+          echo "$out"
+          echo "$out" | grep -q '^nesql' || { echo "::error::no nesql version line"; exit 1; }
+          echo "$out" | grep -q '^engine' || { echo "::error::no engine version line"; exit 1; }
+
+      - name: Smoke — a missing database is exit 4 and creates nothing
+        working-directory: rust
+        shell: bash
+        run: |
+          set -uo pipefail
+          target="${RUNNER_TEMP}/definitely-not-a-database"
+          rm -rf "$target"
+          set +e
+          cargo run -q -p nesql-cli -- --db "$target" status
+          code=$?
+          set -e
+          if [ "$code" -ne 4 ]; then
+            echo "::error::expected exit 4 for a missing database, got $code"
+            exit 1
+          fi
+          if [ -e "$target" ]; then
+            echo "::error::a read-only command created $target"
+            exit 1
+          fi
+          echo "ok — exit 4, nothing created"
+
+      - name: Smoke — grammar emits a 64-character digest
+        working-directory: rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          # grep rather than a python heredoc: this step runs on Windows too,
+          # and adding an interpreter dependency to a smoke test is how a
+          # smoke test starts failing for reasons that have nothing to do
+          # with the thing it is smoking.
+          out=$(cargo run -q -p nesql-cli -- grammar --json)
+          # The JSON is pretty-printed, so there is a space after the colon.
+          # The first pattern assumed none and failed on every platform at
+          # once -- which is the giveaway that it was the checker that was
+          # wrong, not four operating systems.
+          echo "$out" | grep -Eo '"digest": *"[0-9a-f]{64}"' \
+            || { echo "::error::grammar did not emit a 64-hex digest"; echo "$out"; exit 1; }

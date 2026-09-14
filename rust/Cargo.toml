@@ -6,6 +6,7 @@ members = [
     "crates/nedb-node",
     "crates/nedb-wrap",
     "nedb-v2",
+    "nesql-cli",
 ]
 
 # A bare `cargo build` at the workspace root builds the ENGINE, not the language

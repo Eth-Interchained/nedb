@@ -1,0 +1,34 @@
+[package]
+name        = "nesql-cli"
+version     = "5.0.1"
+edition     = "2021"
+license     = "BUSL-1.1"
+description = "neSQL — the query grammar and command-line surface for a NEDB v2 store"
+repository  = "https://github.com/Eth-Interchained/nedb"
+authors     = ["Eth-Interchained"]
+readme      = "README.md"
+
+[[bin]]
+name = "nesql"
+path = "src/main.rs"
+
+[lib]
+# The command functions are a library so the integration tests can call them
+# directly against a real engine database, rather than spawning a binary and
+# parsing its stdout. Tests that assert on process output test the renderer;
+# tests that call the command test the decision.
+name = "nesql"
+path = "src/lib.rs"
+
+[dependencies]
+# The engine. A VERSION REQUIREMENT is declared alongside the path so a major
+# engine bump fails this crate's build instead of being reported as a version
+# this CLI was never checked against.
+nedb-engine = { path = "../nedb-v2", version = "5.0.1" }
+
+serde_json = { version = "1", features = ["preserve_order"] }
+blake2     = "0.10"
+hex        = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
