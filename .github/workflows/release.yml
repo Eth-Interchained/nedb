@@ -81,7 +81,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ github.ref_name }}"
-          echo "Polling GitHub release for the Mac nedbd-v2 server binaries..."
+          echo "Polling GitHub release for the Mac binaries (nedbd-v2 + nesql)..."
           for i in $(seq 1 35); do
             ASSETS=$(gh release view "$VERSION" --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
             ARM=$(echo "$ASSETS" | grep -c "nedbd-v2-darwin-arm64" || true)
@@ -102,6 +102,29 @@ jobs:
           [ -f nedbd-v2-darwin-x64 ]     && cp nedbd-v2-darwin-x64     python/nedb/nedbd-v2-darwin-x64   && chmod +x python/nedb/nedbd-v2-darwin-x64
           echo "Final python/nedb/ contents:"
           ls -lh python/nedb/nedbd* 2>/dev/null || echo "(none)"
+          # ── nesql CLI: the Mac halves come from Codemagic the same way ──────
+          #
+          # The universal wheel is fat, so it carries BOTH Mac architectures
+          # under arch-suffixed names; nesql_launcher.py resolves them at
+          # runtime. Linux/Windows arrive from this workflow's own matrix jobs.
+          #
+          # Not fatal when absent. The launcher exits 5 ("unsupported") with the
+          # platform it looked for and how to fix it, which is a better outcome
+          # than failing every release because one Mac runner was slow. But it
+          # is REPORTED rather than silent -- a wheel that quietly shipped
+          # without a CLI is exactly the kind of gap nobody notices for a month.
+          gh release download "$VERSION" --pattern "nesql-darwin-*" --dir . --clobber || true
+          for a in arm64 x64; do
+            if [ -f "nesql-darwin-$a" ]; then
+              cp "nesql-darwin-$a" "python/nedb/nesql-darwin-$a"
+              chmod +x "python/nedb/nesql-darwin-$a"
+              echo "  nesql darwin-$a staged"
+            else
+              echo "  ::warning::nesql-darwin-$a absent — the Mac wheel will have no CLI for that arch"
+            fi
+          done
+          echo "Final nesql staging:"
+          ls -lh python/nedb/nesql* 2>/dev/null || echo "  (none — no platform got a CLI)"
       # Runs in PURE-PYTHON mode now, which is what this wheel actually is.
       # It used to run against whichever foreign _native won the race, so a
       # pass meant "the import failed cleanly enough to fall back" rather than
@@ -208,6 +231,62 @@ jobs:
           cd ..
           cp rust/target/release/nedbd.exe python/nedb/nedbd-v2.exe
           echo "nedbd-v2 MinGW staged: $(ls -lh python/nedb/nedbd-v2.exe)"
+      # ── nesql binary (the neSQL CLI) ────────────────────────────────────────
+      #
+      # Staged exactly like nedbd-v2, and for the same reason: the wheel and the
+      # npm tarball are the only way most users will ever get a Rust binary.
+      # Before this, `nesql` shipped to no registry at all -- its crate declared
+      # a readme that did not exist, so `cargo package` refused it, and PyPI and
+      # npm carried a 0.0.1 stub whose one function returned false.
+      #
+      # TWO destinations per build, on purpose:
+      #   python/nedb/       -> picked up by the wheel (both pyprojects declare
+      #                         a `nesql` console script -> nesql_launcher)
+      #   repo root          -> picked up by npm `files: ["nesql-*"]`, resolved
+      #                         at runtime by nesql.js
+      - name: Build nesql (neSQL CLI binary)
+        if: "!matrix.mingw"
+        shell: bash
+        run: |
+          cd rust
+          cargo build --release --bin nesql --package nesql --target ${{ matrix.target }}
+          cd ..
+          EXT=""
+          [[ "${{ matrix.target }}" == *"windows"* ]] && EXT=".exe"
+          BIN="rust/target/${{ matrix.target }}/release/nesql${EXT}"
+          # The wheel copy keeps the unsuffixed name; the Mac fat wheel adds the
+          # arch suffix in the mac job below, because one file cannot serve two
+          # architectures and a bare name would silently be the wrong one.
+          cp "$BIN" "python/nedb/nesql${EXT}"
+          chmod +x "python/nedb/nesql${EXT}" || true
+          # The npm copy is arch-named up front -- nesql.js resolves by
+          # platform-arch and has no fallback, deliberately.
+          case "${{ matrix.target }}" in
+            *linux*)   NPMNAME="nesql-linux-x64" ;;
+            *windows*) NPMNAME="nesql-win-x64.exe" ;;
+            *)         NPMNAME="" ;;
+          esac
+          if [ -n "$NPMNAME" ]; then
+            cp "$BIN" "$NPMNAME"; chmod +x "$NPMNAME" || true
+            echo "nesql staged for npm: $(ls -lh $NPMNAME)"
+          fi
+          echo "nesql staged for wheel: $(ls -lh python/nedb/nesql${EXT})"
+          # Prove the thing runs before it is packaged. A binary that builds and
+          # then panics on startup is the failure a build log cannot show you,
+          # and `cargo test` never executes `main`.
+          if [[ "${{ matrix.target }}" != *"windows"* ]]; then
+            "$BIN" version
+            "$BIN" grammar --json | head -c 80; echo
+          fi
+      - name: Build nesql (MinGW binary)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: |
+          cd rust
+          cargo build --release --bin nesql --package nesql
+          cd ..
+          cp rust/target/release/nesql.exe python/nedb/nesql.exe
+          echo "nesql MinGW staged: $(ls -lh python/nedb/nesql.exe)"
       - name: Stage Python source + binary into maturin layout
         shell: bash
         run: |

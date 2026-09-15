@@ -129,6 +129,14 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
+          # nesql CLI binary -- built here because the Mac wheel is FAT and
+          # needs an arch-suffixed file per architecture; a bare `nesql`
+          # would be one arch presented to both. release.yml downloads these.
+          ( cd rust && cargo build --release --bin nesql --package nesql )
+          cp rust/target/release/nesql nesql-darwin-arm64
+          chmod +x nesql-darwin-arm64
+          ./nesql-darwin-arm64 version   # a binary that builds can still panic on startup
+          gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber
           # _native extension (so pypi fat-wheel includes it for Mac users)
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -247,6 +255,14 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
+          # nesql CLI binary -- built here because the Mac wheel is FAT and
+          # needs an arch-suffixed file per architecture; a bare `nesql`
+          # would be one arch presented to both. release.yml downloads these.
+          ( cd rust && cargo build --release --bin nesql --package nesql )
+          cp rust/target/release/nesql nesql-darwin-x64
+          chmod +x nesql-darwin-x64
+          ./nesql-darwin-x64 version   # a binary that builds can still panic on startup
+          gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber
           # _native extension
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -364,6 +380,14 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
+          # nesql CLI binary -- built here because the Mac wheel is FAT and
+          # needs an arch-suffixed file per architecture; a bare `nesql`
+          # would be one arch presented to both. release.yml downloads these.
+          ( cd rust && cargo build --release --bin nesql --package nesql )
+          cp rust/target/release/nesql nesql-darwin-arm64
+          chmod +x nesql-darwin-arm64
+          ./nesql-darwin-arm64 version   # a binary that builds can still panic on startup
+          gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber
           # _native extension (so pypi fat-wheel includes it for Mac users)
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -485,6 +509,14 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
+          # nesql CLI binary -- built here because the Mac wheel is FAT and
+          # needs an arch-suffixed file per architecture; a bare `nesql`
+          # would be one arch presented to both. release.yml downloads these.
+          ( cd rust && cargo build --release --bin nesql --package nesql )
+          cp rust/target/release/nesql nesql-darwin-x64
+          chmod +x nesql-darwin-x64
+          ./nesql-darwin-x64 version   # a binary that builds can still panic on startup
+          gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber
           # _native extension
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -602,6 +634,14 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
+          # nesql CLI binary -- built here because the Mac wheel is FAT and
+          # needs an arch-suffixed file per architecture; a bare `nesql`
+          # would be one arch presented to both. release.yml downloads these.
+          ( cd rust && cargo build --release --bin nesql --package nesql )
+          cp rust/target/release/nesql nesql-darwin-arm64
+          chmod +x nesql-darwin-arm64
+          ./nesql-darwin-arm64 version   # a binary that builds can still panic on startup
+          gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber
           # _native extension (so pypi fat-wheel includes it for Mac users)
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -723,6 +763,14 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
+          # nesql CLI binary -- built here because the Mac wheel is FAT and
+          # needs an arch-suffixed file per architecture; a bare `nesql`
+          # would be one arch presented to both. release.yml downloads these.
+          ( cd rust && cargo build --release --bin nesql --package nesql )
+          cp rust/target/release/nesql nesql-darwin-x64
+          chmod +x nesql-darwin-x64
+          ./nesql-darwin-x64 version   # a binary that builds can still panic on startup
+          gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber
           # _native extension
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true

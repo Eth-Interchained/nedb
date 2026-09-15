@@ -35,6 +35,10 @@ dependencies = ["pycryptodome>=3.19"]
 
 [project.scripts]
 nedbd = "nedb.server:main"
+# The neSQL CLI is a Rust binary; this shim locates the one staged into
+# the wheel for this platform and execs it, so the exit code the caller
+# sees is the binary's own. See python/nedb/nesql_launcher.py.
+nesql = "nedb.nesql_launcher:main"
 
 [project.urls]
 Homepage = "https://github.com/aiassistsecure/nedb"
