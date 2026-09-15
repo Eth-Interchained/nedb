@@ -222,6 +222,44 @@ impl NedbCore {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Run **neSQL** — PostgreSQL SQL, or NQL — choosing by the leading keyword.
+    ///
+    /// `query()` above is NQL-only and stays that way: callers depend on it,
+    /// and silently widening what an existing method accepts is how a typo in
+    /// one dialect starts being parsed as the other. This is a separate door.
+    ///
+    /// Routing comes from `nedb_engine::nesql::route`, the SAME function the
+    /// `nesql` CLI and `POST /query` use. Three front doors, one decision about
+    /// what a statement means — because two would eventually disagree, and a
+    /// disagreement about MEANING shows up as nothing rather than as an error.
+    #[pyo3(signature = (statement))]
+    fn nesql(&self, statement: &str) -> PyResult<Vec<String>> {
+        use nedb_engine::nesql::{route, Dialect};
+        match route(statement).map_err(PyRuntimeError::new_err)? {
+            Dialect::Nql => nql::query(&self.inner, statement)
+                .map(|(rows, _)| rows.into_iter().map(|v| v.to_string()).collect())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+            Dialect::Sql => {
+                let db = std::sync::Arc::new(self.inner.clone());
+                nedb_engine::pgwire::execute_sql(&db, statement, false)
+                    .map(|d| d.rows.into_iter().map(|v| v.to_string()).collect())
+                    .map_err(PyRuntimeError::new_err)
+            }
+        }
+    }
+
+    /// Which half of neSQL a statement is written in: `"nql"` or `"sql"`.
+    ///
+    /// Exposed because a caller building a query UI needs to show the user what
+    /// their input was understood AS, and re-deriving that client-side would be
+    /// a second router.
+    #[pyo3(signature = (statement))]
+    fn nesql_dialect(&self, statement: &str) -> PyResult<String> {
+        nedb_engine::nesql::route(statement)
+            .map(|d| d.name().to_string())
+            .map_err(PyRuntimeError::new_err)
+    }
+
     #[pyo3(signature = (frm, rel, as_of=None))]
     fn neighbors(&self, frm: &str, rel: &str, as_of: Option<u64>) -> Vec<String> {
         let nql_str = format!(r#"FROM __links__ WHERE _from = "{}" AND _rel = "{}""#, frm, rel);

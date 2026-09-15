@@ -166,6 +166,39 @@ impl NedbCore {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
+    /// Run **neSQL** — PostgreSQL SQL, or NQL — choosing by the leading keyword.
+    ///
+    /// `query()` above is NQL-only and stays that way: callers depend on it,
+    /// and silently widening what an existing method accepts is how a typo in
+    /// one dialect starts being parsed as the other. This is a separate door.
+    ///
+    /// Routing comes from `nedb_engine::nesql::route`, the SAME function the
+    /// `nesql` CLI and `POST /query` use. Three front doors, one decision about
+    /// what a statement means.
+    #[napi]
+    pub fn nesql(&self, statement: String) -> Result<Vec<String>> {
+        use nedb_engine::nesql::{route, Dialect};
+        match route(&statement).map_err(Error::from_reason)? {
+            Dialect::Nql => nql::query(&self.inner, &statement)
+                .map(|(rows, _)| rows.into_iter().map(|v| v.to_string()).collect())
+                .map_err(|e| Error::from_reason(e.to_string())),
+            Dialect::Sql => {
+                let db = std::sync::Arc::new(self.inner.clone());
+                nedb_engine::pgwire::execute_sql(&db, &statement, false)
+                    .map(|d| d.rows.into_iter().map(|v| v.to_string()).collect())
+                    .map_err(Error::from_reason)
+            }
+        }
+    }
+
+    /// Which half of neSQL a statement is written in: `"nql"` or `"sql"`.
+    #[napi]
+    pub fn nesql_dialect(&self, statement: String) -> Result<String> {
+        nedb_engine::nesql::route(&statement)
+            .map(|d| d.name().to_string())
+            .map_err(Error::from_reason)
+    }
+
     #[napi]
     pub fn neighbors(&self, frm: String, rel: String) -> Vec<String> {
         let nql_str = format!(r#"FROM __links__ WHERE _from = "{}" AND _rel = "{}""#, frm, rel);
