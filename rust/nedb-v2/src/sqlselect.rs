@@ -658,6 +658,9 @@ fn binding_power(op: &str) -> Option<u8> {
         // because chaining them is a type error anyway.
         "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" | "~" | "~*" | "!~" | "!~*"
         | "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => 4,
+        // The escaped forms carry the escape char in the operator string.
+        o if o.starts_with("LIKE ESCAPE ") || o.starts_with("ILIKE ESCAPE ")
+             || o.starts_with("NOT LIKE ESCAPE ") || o.starts_with("NOT ILIKE ESCAPE ") => 4,
         "||" => 5,
         "+" | "-" => 6,
         "*" | "/" | "%" => 7,
@@ -779,6 +782,9 @@ impl Parser {
                 Tok::Op(o) if binding_power(o).is_some() => (o.clone(), 1usize),
                 Tok::Word { upper, .. } if upper == "AND" || upper == "OR" => (upper.clone(), 1),
                 Tok::Word { upper, .. } if upper == "LIKE" || upper == "ILIKE" => (upper.clone(), 1),
+                // `ESCAPE` terminates a LIKE rather than continuing the
+                // expression, and is consumed by the LIKE arm below.
+                Tok::Word { upper, .. } if upper == "ESCAPE" => break,
                 Tok::Word { upper, .. } if upper == "NOT" => {
                     // `NOT LIKE` / `NOT ILIKE` / `NOT IN` / `NOT BETWEEN`.
                     match self.peek_at(1) {
@@ -825,6 +831,33 @@ impl Parser {
 
             // Left-associative: the right side binds tighter than this level.
             let right = self.parse_bin(bp + 1)?;
+
+            // `LIKE <pat> ESCAPE '<c>'` — the escape char rides ON the operator
+            // string rather than widening `Expr::Binary`. That keeps every
+            // existing match arm, pushdown check and pretty-printer working on
+            // a two-operand binary, and `eval` splits it back apart. Widening
+            // the node would have meant touching every site that matches
+            // Binary, which is where a missed arm silently drops the clause.
+            let op = if matches!(op.as_str(), "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE")
+                && self.peek().is_kw("ESCAPE")
+            {
+                self.next();
+                match self.next() {
+                    Tok::Str(e) => {
+                        let mut ch = e.chars();
+                        match (ch.next(), ch.next()) {
+                            // Postgres requires exactly one character.
+                            (Some(c), None) => format!("{} ESCAPE {}", op, c),
+                            _ => bail!(
+                                "ESCAPE takes a single-character string, got {:?}", e),
+                        }
+                    }
+                    other => bail!("ESCAPE takes a string literal, got {:?}", other),
+                }
+            } else {
+                op
+            };
+
             left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
         }
 
@@ -2359,13 +2392,25 @@ fn apply_op(op: &str, l: Value, r: Value) -> Result<Value> {
                     }
                 }
 
-                "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
+                _ if op.starts_with("LIKE") || op.starts_with("ILIKE")
+                     || op.starts_with("NOT LIKE") || op.starts_with("NOT ILIKE") => {
                     if l.is_null() || r.is_null() {
                         Value::Null
                     } else {
-                        let hit = crate::nql::like_match_pub(
-                            &as_text(&l), &as_text(&r), op.ends_with("ILIKE"));
-                        Value::Bool(hit != op.starts_with("NOT"))
+                        // "NOT ILIKE ESCAPE /" -> base "NOT ILIKE", escape '/'
+                        let (base, esc): (&str, Option<char>) =
+                            match op.split_once(" ESCAPE ") {
+                                Some((b, e)) => (b, e.chars().next()),
+                                None => (&op[..], None),
+                            };
+                        let ci = base.ends_with("ILIKE");
+                        let txt = as_text(&l);
+                        let pat = as_text(&r);
+                        let hit = match esc {
+                            Some(c) => crate::nql::like_match_escape_pub(&txt, &pat, ci, c),
+                            None => crate::nql::like_match_pub(&txt, &pat, ci),
+                        };
+                        Value::Bool(hit != base.starts_with("NOT"))
                     }
                 }
 
@@ -5337,6 +5382,35 @@ mod eval_tests {
         assert_eq!(v("s LIKE 'acme%'", &r), json!(false));
         assert_eq!(v("s ILIKE 'acme%'", &r), json!(true));
         assert_eq!(v("s NOT LIKE 'zz%'", &r), json!(true));
+
+        // ── LIKE ... ESCAPE ─────────────────────────────────────────────────
+        //
+        // SQLAlchemy 2.0.53 began emitting this in the catalogue query its
+        // inspector runs ON CONNECT. 2.0.52 did not. The endpoint went from
+        // working to `expected ')', got ESCAPE` on a dependency bump nobody
+        // here made — and because an introspection query is the FIRST thing
+        // the client sends, it did not degrade a feature, it made the
+        // connection unusable.
+        //
+        // Asserted on SEMANTICS, not just on "it parses": the whole point of
+        // the clause is that the escaped character stops being a wildcard.
+        // The row here is {"s": "Acme Pool"} -- a literal space in the middle,
+        // which is what makes `_` vs escaped `_` an observable difference.
+        assert_eq!(v(r"s ILIKE 'acme_pool' ESCAPE '/'", &r), json!(true),
+                   "an unescaped _ is still a wildcard, and matches the space");
+        assert_eq!(v(r"s ILIKE 'acme/_pool' ESCAPE '/'", &r), json!(false),
+                   "escaped _ is a LITERAL underscore, which 'Acme Pool' lacks");
+        assert_eq!(v(r"s ILIKE 'acme%' ESCAPE '/'", &r), json!(true),
+                   "an unescaped % is still a wildcard");
+        assert_eq!(v(r"s ILIKE 'acme/%' ESCAPE '/'", &r), json!(false),
+                   "escaped % is a literal percent sign, not 'anything'");
+        assert_eq!(v(r"s NOT ILIKE 'acme/_pool' ESCAPE '/'", &r), json!(true),
+                   "negation composes with ESCAPE");
+        // A trailing escape char with nothing to escape: PostgreSQL errors,
+        // but refusing a catalogue query fails the client's CONNECTION, so
+        // this answers no-match instead.
+        assert_eq!(v(r"s ILIKE 'acme/' ESCAPE '/'", &r), json!(false),
+                   "a dangling escape is treated as a literal, never an error");
         assert_eq!(v("nosuch LIKE 'x'", &r), Value::Null);
     }
 

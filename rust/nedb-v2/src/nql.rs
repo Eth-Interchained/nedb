@@ -774,10 +774,55 @@ fn as_text(v: &Value) -> String {
 /// backtracking to the last `%`, which is linear in practice and needs no
 /// regex dependency. Operates on chars, so multi-byte values match correctly.
 fn like_match(value: &str, pattern: &str, ci: bool) -> bool {
+    like_match_esc(value, pattern, ci, None)
+}
+
+/// `LIKE` with an optional escape character.
+///
+/// When `esc` is set, the character following it in the pattern is LITERAL —
+/// so `ESCAPE '/'` makes `/%` mean a real percent sign rather than a wildcard.
+/// That is the whole point of the clause: it lets a caller search for the
+/// wildcards themselves, which is exactly what an introspection query does
+/// when a schema name may contain `_`.
+///
+/// Case folding happens BEFORE escape resolution, which matters: folding the
+/// escape character itself would make `ESCAPE 'A'` and `ESCAPE 'a'` differ
+/// under ILIKE, so the escape char is folded to match.
+fn like_match_esc(value: &str, pattern: &str, ci: bool, esc: Option<char>) -> bool {
     let (v, p): (Vec<char>, Vec<char>) = if ci {
         (value.to_lowercase().chars().collect(), pattern.to_lowercase().chars().collect())
     } else {
         (value.chars().collect(), pattern.chars().collect())
+    };
+
+    let esc = esc.map(|c| if ci { c.to_lowercase().next().unwrap_or(c) } else { c });
+
+    // Resolve the pattern into (char, is_literal) pairs ONCE, so the matcher
+    // below is unchanged in shape and the escape rule cannot be applied
+    // inconsistently on a backtrack.
+    //
+    // A trailing escape character with nothing after it is treated as a
+    // literal occurrence of itself rather than an error: PostgreSQL rejects
+    // it, but this endpoint's job on a malformed catalogue pattern is to
+    // answer no-rows, not to fail a client's connection.
+    let pat: Vec<(char, bool)> = {
+        let mut out: Vec<(char, bool)> = Vec::with_capacity(p.len());
+        let mut i = 0usize;
+        while i < p.len() {
+            if Some(p[i]) == esc {
+                if i + 1 < p.len() {
+                    out.push((p[i + 1], true));
+                    i += 2;
+                } else {
+                    out.push((p[i], true));
+                    i += 1;
+                }
+            } else {
+                out.push((p[i], false));
+                i += 1;
+            }
+        }
+        out
     };
 
     let mut vi = 0usize;
@@ -786,10 +831,12 @@ fn like_match(value: &str, pattern: &str, ci: bool) -> bool {
     let mut star: Option<(usize, usize)> = None;
 
     while vi < v.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+        let wild_any = pi < pat.len() && pat[pi].0 == '%' && !pat[pi].1;
+        let wild_one = pi < pat.len() && pat[pi].0 == '_' && !pat[pi].1;
+        if pi < pat.len() && (wild_one || pat[pi].0 == v[vi]) {
             vi += 1;
             pi += 1;
-        } else if pi < p.len() && p[pi] == '%' {
+        } else if wild_any {
             star = Some((pi, vi));
             pi += 1;
         } else if let Some((sp, sv)) = star {
@@ -801,9 +848,10 @@ fn like_match(value: &str, pattern: &str, ci: bool) -> bool {
             return false;
         }
     }
-    // Trailing `%`s can still match the empty remainder.
-    while pi < p.len() && p[pi] == '%' { pi += 1; }
-    pi == p.len()
+    // Trailing `%`s can still match the empty remainder — but an ESCAPED `%`
+    // is a real character and must not be skipped here.
+    while pi < pat.len() && pat[pi].0 == '%' && !pat[pi].1 { pi += 1; }
+    pi == pat.len()
 }
 
 // ── POSIX ERE, the subset psql actually writes ──────────────────────────────
@@ -1050,7 +1098,18 @@ pub fn regex_error_pub(pattern: &str) -> Option<String> {
 
 /// SQL `LIKE` matching — `%` any run, `_` exactly one char.
 pub fn like_match_pub(value: &str, pattern: &str, ci: bool) -> bool {
-    like_match(value, pattern, ci)
+    like_match_esc(value, pattern, ci, None)
+}
+
+/// `LIKE ... ESCAPE 'c'` — the escaped form.
+///
+/// Added because SQLAlchemy 2.0.53 started emitting it in the catalogue query
+/// its inspector runs on connect. 2.0.52 did not, so the endpoint went from
+/// working to refusing with `expected ')', got ESCAPE` on a dependency bump
+/// nobody here made. An introspection query is the FIRST thing a client sends,
+/// so refusing it does not degrade one feature — the connection is unusable.
+pub fn like_match_escape_pub(value: &str, pattern: &str, ci: bool, esc: char) -> bool {
+    like_match_esc(value, pattern, ci, Some(esc))
 }
 
 /// Evaluate a predicate against anything that can resolve a field name.
