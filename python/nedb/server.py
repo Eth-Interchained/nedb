@@ -62,6 +62,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 from . import __version__
 from . import namespace as _ns
+from . import nesql
 from .engine import NEDB
 from .concurrent import Sequencer
 from .log import ReplayError
@@ -351,14 +352,50 @@ def make_handler(manager: Manager, token: Optional[str]):
                     name, action = parts[2], parts[3]
                     db = manager.require(name)
                     if method == "POST" and action == "query":
-                        nql = str(self._body().get("nql", "")).strip()
-                        if not nql:
-                            raise HttpError(400, "nql is required")
+                        # THE FIELD IS STILL `nql`; ITS CONTENTS NO LONGER HAVE
+                        # TO BE. This endpoint accepts neSQL -- NQL or SQL --
+                        # matching the Rust daemon, which routes the same way
+                        # from the same vocabulary (see nedb/nesql.py and the
+                        # parity test that holds the two lists identical).
+                        #
+                        # The field name is kept because every existing client
+                        # sends it; renaming would break them to gain nothing.
+                        # Before this, a SQL statement reached the NQL parser
+                        # and came back "expected keyword FROM" -- an error
+                        # about the wrong language, which reads as "NEDB does
+                        # not understand SQL" when the truth was "this
+                        # endpoint did not".
+                        statement = str(self._body().get("nql", "")).strip()
+                        if not statement:
+                            raise HttpError(400, "a statement is required")
                         try:
-                            rows = db.query(nql)
+                            dialect = nesql.route(statement)
+                        except nesql.DialectError as e:
+                            raise HttpError(400, str(e))
+                        try:
+                            if dialect == "nql":
+                                rows = db.query(statement)
+                            else:
+                                rows = nesql.execute(db, statement)
+                                # The SQL half is a TRANSLATOR here, not the
+                                # Rust evaluator, so a write or a DDL-ish
+                                # statement can come back as something other
+                                # than a row list. Normalised rather than
+                                # returned raw, so `rows`/`count` always mean
+                                # what the response says they mean.
+                                if rows is None:
+                                    rows = []
+                                elif isinstance(rows, dict):
+                                    rows = [rows]
+                                elif not isinstance(rows, list):
+                                    rows = [rows]
+                        except HttpError:
+                            raise
                         except Exception as e:  # noqa: BLE001
-                            raise HttpError(400, f"NQL error: {e}")
-                        self._send(200, {"rows": rows, "count": len(rows), "seq": db.seq, "head": db.head})
+                            raise HttpError(400, f"{dialect.upper()} error: {e}")
+                        self._send(200, {"rows": rows, "count": len(rows),
+                                         "seq": db.seq, "head": db.head,
+                                         "dialect": dialect})
                         return
                     if method == "POST" and action == "put":
                         b = self._body()

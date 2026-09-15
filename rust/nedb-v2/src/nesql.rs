@@ -89,6 +89,29 @@ pub fn route(q: &str) -> Result<Dialect, String> {
     ))
 }
 
+/// Run a neSQL statement, routing on the leading keyword.
+///
+/// The one place in the engine that turns "here is a statement" into rows
+/// regardless of which half it is written in. `POST /query`, `/subscribe` and
+/// the language bindings all come through here, so "NEDB speaks NQL and SQL"
+/// is one function rather than a property each caller has to remember to
+/// implement.
+///
+/// Returns the error TEXT rather than a typed error because every caller
+/// surfaces it to a client as a string, and a bespoke error enum here would be
+/// converted back to a string at each of them.
+pub fn run(db: &std::sync::Arc<crate::db::Db>, statement: &str)
+    -> Result<Vec<serde_json::Value>, String>
+{
+    match route(statement)? {
+        Dialect::Nql => crate::nql::query(db, statement)
+            .map(|(rows, _)| rows)
+            .map_err(|e| e.to_string()),
+        Dialect::Sql => crate::pgwire::execute_sql(db, statement, false)
+            .map(|done| done.rows),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

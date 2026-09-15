@@ -123,10 +123,24 @@ impl Manager {
         for key in keys {
             if let Some(mut entry) = self.subs.get_mut(&key) {
                 let (nql, last_hash, tx) = entry.value_mut();
-                // Re-run the query
-                let rows = match crate::nql::query(db_arc, nql) {
-                    Ok((rows, _)) => rows,
-                    Err(_) => continue,
+                // Re-run the query -- as neSQL, so a SQL subscription keeps
+                // working on every write and not just on the first evaluation.
+                let rows = match crate::nesql::run(db_arc, nql) {
+                    Ok(rows) => rows,
+                    Err(why) => {
+                        // NOT a silent `continue`. This arm used to swallow the
+                        // error, which made a subscription whose statement
+                        // stopped being valid look identical to one whose
+                        // result had not changed: no event, no complaint, and a
+                        // client waiting forever on a feed that had quietly
+                        // died. Say which subscription and why, once per write.
+                        eprintln!(
+                            "[nedbd] subscription {}/{} could not be re-evaluated \
+                             and will not update: {} (statement: {})",
+                            key.0, key.1, why, nql
+                        );
+                        continue;
+                    }
                 };
                 // Hash the result set
                 let new_hash = format!("{:?}", rows.iter().map(|r| r.to_string()).collect::<Vec<_>>());
@@ -1131,10 +1145,34 @@ async fn subscribe_query(
         Some(db) => db,
     };
 
+    // Route BEFORE registering. A statement that begins in neither half of
+    // neSQL cannot ever produce rows, so handing it a live subscription hands
+    // the client a feed that is indistinguishable from one whose result has
+    // simply not changed yet: connection open, no events, no complaint, no way
+    // to tell "your query is wrong" from "nothing happened". Refuse it here,
+    // while there is still an HTTP status to refuse with.
+    if let Err(why) = crate::nesql::route(&body.nql) {
+        return err(StatusCode::BAD_REQUEST, &why);
+    }
+
     let (sub_id, rx) = mgr.subscribe(&name, body.nql.clone());
 
     // Send the initial query result immediately as the first SSE event
-    if let Ok((rows, _)) = crate::nql::query(&db, &body.nql) {
+    // neSQL, not NQL: a subscription is a query like any other, and a client
+    // that can POST SQL to /query must be able to subscribe to it too.
+    //
+    // Routing already succeeded above, so a failure here is an EVALUATION
+    // failure — an unknown collection, a bad comparison. It is reported rather
+    // than dropped, for the same reason the route check is: a subscription that
+    // silently sends nothing looks exactly like a quiet one.
+    let initial = crate::nesql::run(&db, &body.nql);
+    if let Err(ref why) = initial {
+        eprintln!(
+            "[nedbd] subscription {}/{} opened but its first evaluation failed: {} (statement: {})",
+            name, sub_id, why, body.nql
+        );
+    }
+    if let Ok(rows) = initial {
         let init = json!({
             "sub_id": sub_id,
             "db":     &name,

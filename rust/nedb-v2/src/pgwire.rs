@@ -273,9 +273,20 @@ pub enum Stmt {
     /// `INSERT INTO coll (cols) VALUES (…), (…) [RETURNING …]`
     Insert { coll: String, rows: Vec<InsertRow>, returning: Vec<Col> },
     /// `UPDATE coll SET … [WHERE …] [RETURNING …]` — a new version per match.
-    Update { coll: String, set: Vec<(String, Value)>, nql: String, returning: Vec<Col> },
+    Update {
+        coll: String,
+        set: Vec<(String, Value)>,
+        /// The SQL `WHERE …` as written (column qualifiers stripped), which is
+        /// what actually selects the rows. See `rows_for_write`.
+        where_sql: String,
+        /// The same predicate rendered as NQL. No longer used to SELECT
+        /// anything — kept because it is the translation the `translate_*`
+        /// tests pin, and because an operator reading a 42601 wants to see it.
+        nql: String,
+        returning: Vec<Col>,
+    },
     /// `DELETE FROM coll [WHERE …] [RETURNING …]` — a tombstone per match.
-    Delete { coll: String, nql: String, returning: Vec<Col> },
+    Delete { coll: String, where_sql: String, nql: String, returning: Vec<Col> },
     /// Answer from a fixed table — the handshake queries clients send on connect.
     Canned { cols: Vec<String>, row: Vec<String> },
     /// Nothing to do (empty statement, or a SET the client does not need honoured).
@@ -967,7 +978,7 @@ fn translate_update(sql: &str) -> Result<Stmt, String> {
     let where_raw = strip_column_qualifiers(where_raw.trim(), &coll, upd_alias.as_deref())?;
     let nql = format!("FROM {} {}", coll, sql_literals_to_nql(&where_raw))
         .trim().to_string();
-    Ok(Stmt::Update { coll, set, nql, returning })
+    Ok(Stmt::Update { coll, set, where_sql: where_raw, nql, returning })
 }
 
 /// `DELETE FROM coll [WHERE …] [RETURNING …]`
@@ -986,7 +997,7 @@ fn translate_delete(sql: &str) -> Result<Stmt, String> {
     let where_raw = strip_column_qualifiers(where_raw, &coll, del_alias.as_deref())?;
     let nql = format!("FROM {} {}", coll, sql_literals_to_nql(&where_raw))
         .trim().to_string();
-    Ok(Stmt::Delete { coll, nql, returning })
+    Ok(Stmt::Delete { coll, where_sql: where_raw, nql, returning })
 }
 
 /// Translate one SQL statement into something executable, or explain why not.
@@ -3981,6 +3992,45 @@ impl Executed {
 /// So the path the wire already takes is exposed, with the error decoded into
 /// text. Same parser, same translator, same evaluator, same decision about
 /// which engine runs a statement — one authority.
+/// The rows an `UPDATE` or `DELETE` will act on — chosen by the SQL evaluator.
+///
+/// This used to render the predicate as NQL and run `nql::query`, which meant
+/// a write could only match what the NQL parser understood, even though the
+/// statement arrived as SQL and the read path had long since stopped needing a
+/// translation. `UPDATE … WHERE _id IN (SELECT …)` was unreachable for exactly
+/// that reason: the subquery translated into NQL text the NQL parser cannot
+/// parse. Selecting with a real `SELECT` closes that gap by not having a second
+/// predicate implementation to fall short of the first.
+///
+/// Whole rows, not just `_id`: `DELETE … RETURNING` has to capture the row
+/// BEFORE the tombstone, so the selection is what it returns.
+///
+/// # The unknown-collection guard is not incidental
+///
+/// `nql::query` ERRORS on a collection that does not exist; the evaluator's
+/// scan returns no rows, because a schemaless read of an absent collection is
+/// legitimately empty. Swapping one for the other without this check would
+/// turn `UPDATE nowhere SET x = 1` from a loud 42P01 into a silent
+/// `UPDATE 0` — a write that reports success having done nothing, which is the
+/// worst available outcome and the reason this function refuses first.
+fn rows_for_write(db: &Arc<Db>, coll: &str, where_sql: &str, nql: &str)
+    -> std::result::Result<Vec<Value>, Vec<u8>>
+{
+    let known = db.collections().iter().any(|c| c == coll)
+        || !db.list_ids_including_deleted(coll).is_empty();
+    if !known {
+        return Err(err_msg("42P01", &format!("relation \"{}\" does not exist", coll)));
+    }
+    let sel = format!("SELECT * FROM {} {}", coll, where_sql).trim().to_string();
+    // read_only: this is the SELECT half of the write, and nothing it does
+    // should be able to write. The caller already passed `need_write!()`.
+    execute_sql(db, &sel, true)
+        .map(|done| done.rows)
+        .map_err(|e| err_msg("42601", &format!(
+            "{} (selecting rows with: {}; the NQL rendering of this predicate \
+             would have been: {})", e, sel, nql)))
+}
+
 pub fn execute_sql(db: &Arc<Db>, sql: &str, read_only: bool)
     -> std::result::Result<Executed, String>
 {
@@ -4166,14 +4216,13 @@ fn execute_stmt(
             })
         }
 
-        Stmt::Update { coll, set, nql, returning } => {
+        Stmt::Update { coll, set, where_sql, nql, returning } => {
             let db = need_db!();
             need_write!();
-            // Matching rows come from an ordinary NQL read, so the whole
-            // predicate surface works inside an UPDATE.
-            let (matched, _) = crate::nql::query(db, &nql).map_err(|e| {
-                err_msg("42601", &format!("{} (translated to NQL: {})", e, nql))
-            })?;
+            // Rows come from the SQL evaluator, so an UPDATE matches exactly
+            // what a SELECT with the same WHERE matches — one predicate
+            // implementation, not two.
+            let matched = rows_for_write(db, &coll, &where_sql, &nql)?;
             let mut written: Vec<Value> = vec![];
             for row in &matched {
                 let id = match row.get("_id").and_then(|v| v.as_str()) {
@@ -4211,12 +4260,10 @@ fn execute_stmt(
             })
         }
 
-        Stmt::Delete { coll, nql, returning } => {
+        Stmt::Delete { coll, where_sql, nql, returning } => {
             let db = need_db!();
             need_write!();
-            let (matched, _) = crate::nql::query(db, &nql).map_err(|e| {
-                err_msg("42601", &format!("{} (translated to NQL: {})", e, nql))
-            })?;
+            let matched = rows_for_write(db, &coll, &where_sql, &nql)?;
             // RETURNING must be captured BEFORE the delete: after the tombstone
             // the row is no longer readable by id.
             let returned = matched.clone();
