@@ -5,7 +5,8 @@
 **Content-addressed Merkle DAG · Hash-chained · Time-traveling · Bi-temporal · Causally-provable embedded database.**
 
 Replay-protected · idempotent · relational · filterable · sortable · searchable · concurrent.
-One Rust core → ships to **PyPI** and **npm** from a single source.
+One Rust core → ships to **PyPI**, **npm** and **crates.io** from a single source,
+at the same version on the same tag.
 
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
 [![crates.io](https://img.shields.io/crates/v/nedb-engine?label=crates.io&color=f97316)](https://crates.io/crates/nedb-engine)
@@ -218,7 +219,7 @@ the bar for changing that written down.
 
 ---
 
-## New in 3.3.0 — the query language grew up
+## The query language grew up  ·  *landed in 3.3.0*
 
 `WHERE` was six operators wide (`= != > < >= <=`) joined by an implicit `AND`.
 It now takes a full boolean expression, in **both** engines, and the clauses
@@ -547,7 +548,7 @@ SQL `UPDATE`, the prior value is still readable at its original sequence.
 
 ---
 
-## New in 3.2.0 — wrap the databases you already run
+## Wrap the databases you already run  ·  *landed in 3.2.0*
 
 NEDB adds **tamper-evident causal provenance to a database you already have**, in one line, without
 rip-and-replace. Five adapters, one surface:
@@ -642,7 +643,7 @@ permissive, and the two Python runtime dependencies are BSD and Apache.
 **Versions 3.0.0 – 3.3.1 stay MIT, irrevocably.** If you already have NEDB at 3.3.1 or earlier, your
 rights in that copy are untouched. This applies to 4.0.0 and later only.
 
-### Also in 3.2.0
+### Also landed in 3.2.0
 
 - **A durability defect that pinned every embedded database.** The background flush ticker held a
   strong `Arc<Db>` in an unconditional loop, so the handle was never dropped: the exclusive data-dir
@@ -662,7 +663,7 @@ rights in that copy are untouched. This applies to 4.0.0 and later only.
 
 ---
 
-## Earlier — 2.8.6 durability & recovery
+## Durability & recovery  ·  *landed in 2.8.6*
 
 Three defects found by killing a real engine at every persistence boundary and by filling a real
 filesystem to zero free blocks. **If you are on 2.8.5 or earlier, upgrade.**
@@ -707,11 +708,11 @@ value. Ten writes drain as nine records. Changing the convention would break exi
 
 ---
 
-## NEDB v3.2.0 — Production Stable
+## Distribution — three aligned distributions, one tag
 
-**Current stable: 3.2.0** — NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with native addons for **macOS (arm64 + x86_64), Linux (x86_64 + aarch64, glibc + musl) and Windows x86_64** (see [**Releasing**](#releasing) below). All native wheels (Linux + Windows on GitHub Actions; macOS on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with native addons for **macOS (arm64 + x86_64), Linux (x86_64 + aarch64, glibc + musl) and Windows x86_64** (see [**Releasing**](#releasing) below). All native wheels (Linux + Windows on GitHub Actions; macOS on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
 
-### New in 2.8.0 — Cast: the database understands English
+### Cast — the database understands English  ·  *landed in 2.8.0*
 
 `POST /v1/databases/<name>/cast` turns a short English prompt into NQL, using a **3.33M-parameter model that runs locally on CPU**. No API key, no network call, no per-token bill.
 
@@ -754,9 +755,9 @@ nedbd --dag --data ./data
 NEDBD_DAG=1 NEDB_TMK=<32-byte-hex> nedbd --data ./data
 
 curl http://127.0.0.1:7070/health
-# {"ok":true,"version":"3.2.0","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
+# {"ok":true,"version":"7.2.0","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
 
-# Tail the live event stream (new in v2.2.31)
+# Tail the live event stream (since 2.2.31)
 curl http://127.0.0.1:7070/events
 # event: scan   data: {"objects":730000,"of":1310703,"rate":21043,"eta_s":28}
 # event: ready  data: {"seq":1310703,"head":"b2:9c14e07a…"}
@@ -780,7 +781,9 @@ curl http://127.0.0.1:7070/events
 
 **v1 AOF engine is still shipped and unchanged** — `nedbd` (no flag) runs v1.
 
-**Production status:** [vision.interchained.org](https://vision.interchained.org) is live on v2.2.31 — **1,310,703 sequences** indexed in the Vision database, AES-256-GCM encrypted at rest, at block height **620,989**.
+**Production status:** [vision.interchained.org](https://vision.interchained.org) is live — verified reachable 15 Sep 2026.
+
+The deployment figures below are a **dated snapshot**, not a live readout: **1,310,703 sequences** indexed, AES-256-GCM encrypted at rest, block height **620,989**, measured on engine **v2.2.31**. The engine version a deployment runs is not exposed on its public surface, so treat the version here as the one those numbers were taken on rather than as what is running today.
 
 ---
 
@@ -1013,7 +1016,7 @@ nedbd --dag --data ./data                 # v2 DAG engine (or NEDBD_DAG=1)
 NEDBD_RESP2_PORT=6380 nedbd               # also speak RESP2 (redis-cli compatible)
 nedbd --log-level 2                       # 0=errors 1=requests 2=deploy 3=verbose
 
-# Live event stream (new in v2.2.31) — SSE: scan progress, ready, per-write head
+# Live event stream (since 2.2.31) — SSE: scan progress, ready, per-write head
 curl http://127.0.0.1:7070/events
 ```
 
@@ -1021,7 +1024,7 @@ curl http://127.0.0.1:7070/events
 
 Alongside the daemon, `cargo install nedb-engine` ships **`nedb-cli`** — operate on a store directory offline (`head`/`status`/`verify`/`get`/`scan`/`flush`/`repair`/`export`) — and **`nedb-inspector`**, a deterministic checker that warns when a durable open lacks flush-on-exit wiring. Full reference: [**docs/CLI.md**](docs/CLI.md).
 
-### Startup modes (v2.2.31)
+### Startup modes
 
 - **Warm start** — every restart after the first open reads the `MANIFEST` file and restores `seq` + Merkle `head` in **O(1)**. No scan, no replay, independent of dataset size. Boots in milliseconds.
 - **Cold start** — first open of an existing dataset spawns the integrity scan in a background thread *and accepts connections immediately*. Reads serve instantly from the content-addressed DAG; writes return `HTTP 503 startup in progress` until the `startup_ready` gate flips. Progress (objects, rate, ETA) streams over `GET /events`.

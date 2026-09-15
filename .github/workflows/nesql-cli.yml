@@ -91,11 +91,11 @@ jobs:
       # checkout for a reason unrelated to the code.
       - name: Build
         working-directory: rust
-        run: cargo build -p nesql-cli --verbose
+        run: cargo build -p nesql --verbose
 
       - name: Test
         working-directory: rust
-        run: cargo test -p nesql-cli --verbose
+        run: cargo test -p nesql --verbose
 
       # The binary has to actually run. A crate that compiles and whose unit
       # tests pass can still be a binary that panics on startup, because
@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          out=$(cargo run -q -p nesql-cli -- version)
+          out=$(cargo run -q -p nesql -- version)
           echo "$out"
           echo "$out" | grep -q '^nesql' || { echo "::error::no nesql version line"; exit 1; }
           echo "$out" | grep -q '^engine' || { echo "::error::no engine version line"; exit 1; }
@@ -118,7 +118,7 @@ jobs:
           target="${RUNNER_TEMP}/definitely-not-a-database"
           rm -rf "$target"
           set +e
-          cargo run -q -p nesql-cli -- --db "$target" status
+          cargo run -q -p nesql -- --db "$target" status
           code=$?
           set -e
           if [ "$code" -ne 4 ]; then
@@ -140,7 +140,7 @@ jobs:
           # and adding an interpreter dependency to a smoke test is how a
           # smoke test starts failing for reasons that have nothing to do
           # with the thing it is smoking.
-          out=$(cargo run -q -p nesql-cli -- grammar --json)
+          out=$(cargo run -q -p nesql -- grammar --json)
           # The JSON is pretty-printed, so there is a space after the colon.
           # The first pattern assumed none and failed on every platform at
           # once -- which is the giveaway that it was the checker that was

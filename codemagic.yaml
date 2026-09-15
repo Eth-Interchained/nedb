@@ -788,8 +788,8 @@ workflows:
         script: |
           source "$HOME/.cargo/env"
           cd rust
-          cargo build -p nesql-cli --verbose
-          cargo test  -p nesql-cli --verbose
+          cargo build -p nesql --verbose
+          cargo test  -p nesql --verbose
 
       # x86_64 is a BUILD check only, and says so. The host is Apple Silicon,
       # so an Intel test binary would run under Rosetta — and "the tests pass"
@@ -799,7 +799,7 @@ workflows:
         script: |
           source "$HOME/.cargo/env"
           cd rust
-          cargo build -p nesql-cli --target x86_64-apple-darwin --verbose
+          cargo build -p nesql --target x86_64-apple-darwin --verbose
 
       # The binary has to actually run: cargo test never executes main, so a
       # crate whose tests pass can still panic on startup.
@@ -808,7 +808,7 @@ workflows:
           set -euo pipefail
           source "$HOME/.cargo/env"
           cd rust
-          out=$(cargo run -q -p nesql-cli -- version)
+          out=$(cargo run -q -p nesql -- version)
           echo "$out"
           echo "$out" | grep -q '^nesql'  || { echo "no nesql version line";  exit 1; }
           echo "$out" | grep -q '^engine' || { echo "no engine version line"; exit 1; }
@@ -821,7 +821,7 @@ workflows:
           target="$TMPDIR/definitely-not-a-database"
           rm -rf "$target"
           set +e
-          cargo run -q -p nesql-cli -- --db "$target" status
+          cargo run -q -p nesql -- --db "$target" status
           code=$?
           set -e
           [ "$code" -eq 4 ] || { echo "expected exit 4, got $code"; exit 1; }
@@ -833,7 +833,7 @@ workflows:
           set -euo pipefail
           source "$HOME/.cargo/env"
           cd rust
-          out=$(cargo run -q -p nesql-cli -- grammar --json)
+          out=$(cargo run -q -p nesql -- grammar --json)
           echo "$out" | grep -Eo '"digest": *"[0-9a-f]{64}"' \
             || { echo "grammar did not emit a 64-hex digest"; echo "$out"; exit 1; }
 

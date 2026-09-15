@@ -1,9 +1,9 @@
 [package]
-name        = "nesql-cli"
+name        = "nesql"
 version     = "7.2.0"
 edition     = "2021"
 license     = "BUSL-1.1"
-description = "neSQL — the query grammar and command-line surface for a NEDB v2 store"
+description = "neSQL — PostgreSQL SQL plus NEDB's own clauses, and the command-line surface for a NEDB store"
 repository  = "https://github.com/Eth-Interchained/nedb"
 authors     = ["Eth-Interchained"]
 readme      = "README.md"
