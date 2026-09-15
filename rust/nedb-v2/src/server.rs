@@ -508,8 +508,8 @@ async fn query_database(
     }
     // THE FIELD IS STILL CALLED `nql`; ITS CONTENTS NO LONGER HAVE TO BE.
     //
-    // This endpoint accepts neQL — NQL or PostgreSQL SQL — and routes on the
-    // leading keyword, using the same `neql::route` the CLI uses. The field
+    // This endpoint accepts neSQL — NQL or PostgreSQL SQL — and routes on the
+    // leading keyword, using the same `nesql::route` the CLI uses. The field
     // name is kept because every existing HTTP client sends it, and renaming
     // it would break them to gain nothing; what changed is what it accepts.
     //
@@ -517,20 +517,20 @@ async fn query_database(
     // something like `expected keyword FROM, got Ident("SELECT")` — an error
     // about the wrong language, which reads as "NEDB does not understand
     // SQL" when the truth was "this endpoint did not".
-    let dialect = match crate::neql::route(&body.nql) {
+    let dialect = match crate::nesql::route(&body.nql) {
         Ok(d) => d,
         Err(why) => return err(StatusCode::BAD_REQUEST, &why),
     };
     let (seq, head) = db_seq_head(&db);
     match dialect {
-        crate::neql::Dialect::Nql => match nql::query(&db, &body.nql) {
+        crate::nesql::Dialect::Nql => match nql::query(&db, &body.nql) {
             Ok((rows, count)) => ok(json!({
                 "rows": rows, "count": count, "seq": seq, "head": head,
                 "dialect": "nql",
             })),
             Err(e) => err(StatusCode::BAD_REQUEST, &format!("NQL error: {}", e)),
         },
-        crate::neql::Dialect::Sql => match crate::pgwire::execute_sql(&db, &body.nql, false) {
+        crate::nesql::Dialect::Sql => match crate::pgwire::execute_sql(&db, &body.nql, false) {
             Ok(done) => {
                 let n = done.rows.len();
                 ok(json!({

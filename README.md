@@ -40,15 +40,31 @@ NEDB's PostgreSQL endpoint answers `psql`, SQLAlchemy Core **and** ORM, asyncpg 
 node-postgres against a live store. It used to get there by *translating* SQL into
 NQL, and a translation can only reach as far as the target language's shape.
 
-**neSQL is the name for what replaced that.** PostgreSQL's real grammar (`gram.y`,
-19,513 lines, 492 keywords, vendored from 17.4 at
-[`vendor/postgresql/`](vendor/postgresql/) with its licence intact), extended with
-NEDB's temporal and causal clauses. **Two front-ends, one plan. NQL folded in, not
-deleted.**
+**neSQL is the name for what replaced that**, and it is exactly as much of an
+addition as it sounds like:
 
-**neQL** is the name for the pair — NQL *and* PostgreSQL SQL, one language with two
-halves. Which half a statement is read as is decided **structurally**, not guessed:
-NQL statements begin `FROM`, and PostgreSQL has no statement form that begins with
+```
+neSQL  =  PostgreSQL SQL        ·  inherited whole, not reimplemented
+       +  NEDB SQL              ·  what a permanent, hash-chained store can answer
+```
+
+**We inherit, then we gain.** The left-hand side is PostgreSQL's real grammar —
+`gram.y`, 19,513 lines and 492 keywords, vendored from 17.4 at
+[`vendor/postgresql/`](vendor/postgresql/) with its licence intact. Not a subset,
+not a lookalike: the definition every other tool in the world was built against.
+If it is valid PostgreSQL and the evaluator can parse it, it runs.
+
+The right-hand side is what NEDB adds because it can — `AS OF SYSTEM TIME`,
+`VALID AS OF`, `SEARCH`, `TRACE`, `TRAVERSE`. These are clauses PostgreSQL has no
+spelling for, because a store that overwrites has nothing to point them at. They
+are additions **to** the vendored grammar, never deviations **from** it.
+
+So neSQL is not a dialect of SQL that you have to learn around. It is PostgreSQL
+plus the questions a database with permanent memory can be asked. Anything you
+already write keeps working; the new clauses are there when you need them.
+
+Which half a statement is read as is decided **structurally**, never guessed:
+NQL's own form begins `FROM`, PostgreSQL has no statement form that begins with
 `FROM`, so the leading keyword partitions the two vocabularies rather than hinting
 at them. A first word in neither is refused *naming both*.
 
@@ -67,7 +83,7 @@ published. The engine you actually install is `nedb-engine`. The
 [neSQL repository](https://github.com/Eth-Interchained/neSQL) holds the language —
 both halves of the grammar and the CLI's source, side by side.
 
-### `nesql` — the CLI, and it speaks neQL
+### `nesql` — the CLI, and it speaks neSQL
 
 Ships in this release, no flag. `nesql` opens a store directly — no daemon, no
 port — and answers both halves of the language through **one** `query` command:
@@ -348,11 +364,21 @@ Provenance is selectable like any other column:
 SELECT _id, _hash, _seq FROM audit ORDER BY _seq;
 ```
 
-**This is not "NEDB speaks SQL", and the endpoint is careful to say so.** It is
-a documented subset of `SELECT` **translated** to NQL — and that word is doing
-all the work in this sentence. Every refusal below traces to the same cause:
-NQL is the engine's native language, so SQL has to be rewritten into it, and a
-rewrite can only ever reach as far as the target language's shape.
+**NEDB speaks SQL. That sentence used to carry a caveat, and no longer does.**
+
+For most of this project's life it was true that the endpoint served a
+documented *subset* of `SELECT` **translated** into NQL — and every refusal in
+the table below traced to that one cause: a rewrite can only reach as far as the
+target language's shape, and NQL's shape is single-collection with no projection.
+
+That translator no longer answers `SELECT`. The evaluator does, for every
+statement it can parse, with nothing to enable. It is kept for writes and for
+anything outside the `SELECT` grammar, which is why a statement it cannot parse
+still gets an answer rather than an error.
+
+The table is preserved below as history, because the distinction between "the
+engine could never do this" and "the translator could not reach it" is the whole
+story of how neSQL happened — and only one of those was ever true.
 
 | Expressible in NQL | Not expressible there, and why | the evaluator |
 | --- | --- | --- |
@@ -372,7 +398,7 @@ NEDB is append-only *so that history cannot be discarded* — that is the produc
 not a gap — and DDL is refused because collections are created by the first write
 to them. Those answers do not change.
 
-### Every other row on that table was a translation artefact — and one flag removes them
+### Every other row on that table was a translation artefact — and they are gone
 
 > ### 🆕 [**neSQL**](https://github.com/Eth-Interchained/neSQL) — PostgreSQL's grammar, NEDB's memory
 >
@@ -1023,7 +1049,7 @@ curl -X POST :7070/v1/databases -d '{
     "links": [["users:u1","buys","orders:o1"]]
   }}'
 
-# Query — the endpoint speaks neQL: SQL *or* NQL, routed on the first keyword
+# Query — the endpoint speaks neSQL: SQL *or* NQL, routed on the first keyword
 curl -X POST :7070/v1/databases/shop/query \
   -d '{"nql":"SELECT name FROM users WHERE status = '"'"'active'"'"' ORDER BY name"}'
 # → {"rows":[{"name":"Alice"}],"count":1,"dialect":"sql", ...}
@@ -1034,7 +1060,7 @@ curl -X POST :7070/v1/databases/shop/query \
 
 
 **The field is still called `nql`, and its contents no longer have to be.** This
-endpoint accepts **neQL** — NQL *or* PostgreSQL SQL — and answers with the
+endpoint accepts **neSQL** — NQL *or* PostgreSQL SQL — and answers with the
 `dialect` it chose. The name is unchanged because every existing HTTP client
 sends it; renaming would break them to gain nothing. Old NQL clients are
 unaffected.
@@ -1046,7 +1072,7 @@ refused *naming both* — never handed to whichever parser seems likelier.
 
 ```bash
 curl -X POST :7070/v1/databases/shop/query -d '{"nql":"GRANT ALL ON users"}'
-# → 400  "GRANT" does not begin a statement in either half of neQL
+# → 400  "GRANT" does not begin a statement in either half of neSQL
 #          NQL statements begin with: FROM
 #          SQL statements begin with: SELECT, INSERT, UPDATE, ...
 ```

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 // NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
 
-//! **neQL** — the whole language: NQL *and* PostgreSQL SQL.
+//! **neSQL** — the whole language: NQL *and* PostgreSQL SQL.
 //!
-//! Not a third dialect. neQL is the name for the pair, and this module is the
+//! Not a third dialect. neSQL is the name for the pair, and this module is the
 //! one place that decides which half a statement is written in.
 //!
 //! # Why the router lives in the engine
@@ -34,7 +34,7 @@
 //! parser seems likelier, because "seems likelier" is the guess the rule
 //! forbids.
 
-/// Which half of neQL a statement is written in.
+/// Which half of neSQL a statement is written in — inherited PostgreSQL, or NQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     Nql,
@@ -78,9 +78,11 @@ pub fn route(q: &str) -> Result<Dialect, String> {
         return Ok(Dialect::Sql);
     }
     Err(format!(
-        "{:?} does not begin a statement in either half of neQL\n  \
-         NQL statements begin with: {}\n  \
-         SQL statements begin with: {}",
+        "{:?} does not begin a neSQL statement.\n\
+         neSQL is PostgreSQL's SQL plus NEDB's own clauses, so a statement starts\n\
+         in one of these two vocabularies:\n  \
+         NQL form begins with: {}\n  \
+         SQL form begins with: {}",
         head,
         NQL_HEADS.join(", "),
         SQL_HEADS.join(", "),
@@ -94,7 +96,7 @@ mod tests {
     #[test]
     fn the_two_vocabularies_do_not_overlap() {
         // The whole no-guessing argument rests on this. If a word ever appears
-        // in both lists, routing becomes a coin flip and neQL starts lying
+        // in both lists, routing becomes a coin flip and neSQL starts lying
         // about being total.
         for n in NQL_HEADS {
             assert!(

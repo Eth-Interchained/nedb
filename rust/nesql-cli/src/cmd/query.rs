@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 // NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
 
-//! `nesql query` — run **neQL**.
+//! `nesql query` — run **neSQL**.
 //!
-//! neQL is the whole language neSQL speaks: NQL and Postgres SQL, not one or
-//! the other. That is the point of the name. Since the Postgres merge the
-//! engine answers both, and a CLI that accepted only NQL would be describing a
-//! product that stopped existing.
+//! neSQL is PostgreSQL's SQL, inherited whole, PLUS what NEDB adds to it —
+//! the temporal, causal and full-text clauses a permanent store can answer and
+//! an overwriting one cannot. NQL's own FROM-first form is still accepted, so a
+//! CLI that took only one of the two would be describing a smaller product than
+//! the one that ships.
 //!
 //! # Routing is structural, so nothing is guessed
 //!
@@ -55,11 +56,11 @@ pub use crate::args::Dialect;
 /// Routing is the ENGINE's decision, not this crate's.
 ///
 /// `NQL_HEADS`, `SQL_HEADS` and `route` used to live here. They moved to
-/// `nedb_engine::neql` when the HTTP endpoint needed the same routing, so
+/// `nedb_engine::nesql` when the HTTP endpoint needed the same routing, so
 /// that a statement means the same thing whether it arrives through `nesql
 /// query` or through `POST /query`. Re-exported so this module's tests and
 /// callers are unchanged.
-pub use nedb_engine::neql::{route, NQL_HEADS, SQL_HEADS};
+pub use nedb_engine::nesql::{route, NQL_HEADS, SQL_HEADS};
 
 pub fn run(db: &Arc<Db>, q: &str) -> Report {
     run_with(db, q, None)

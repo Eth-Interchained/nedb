@@ -3961,7 +3961,7 @@ impl Executed {
 /// Every SQL→NEDB decision lives here, which is the point: the extended query
 /// protocol added below is then purely a matter of message framing, and cannot
 /// drift from the simple path's semantics.
-/// Run one neQL statement against a database, in process.
+/// Run one neSQL statement against a database, in process.
 ///
 /// # Why this exists
 ///

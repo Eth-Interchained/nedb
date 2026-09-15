@@ -81,8 +81,8 @@ pub enum BranchCmd {
     /// Write a document ON the branch. Invisible to the destination until
     /// merge.
     ///
-    /// A document-level verb rather than `branch query <NAME> <neQL>`, which
-    /// is where the reduced vocabulary would point. neQL writes run through
+    /// A document-level verb rather than `branch query <NAME> <neSQL>`, which
+    /// is where the reduced vocabulary would point. neSQL writes run through
     /// the engine's normal write path, and routing them into a branch overlay
     /// instead is not a CLI change — it arrives with the child store, when a
     /// branch has somewhere of its own to write to. Promising the nicer
@@ -122,14 +122,14 @@ pub enum NotWired {
     Merge,
 }
 
-/// Which half of neQL a statement is to be read as.
+/// Which half of neSQL a statement is to be read as — inherited PostgreSQL, or NQL.
 ///
 /// Re-exported from the ENGINE rather than defined here. It lived in this
 /// crate first, and then `POST /query` needed the same decision — at which
 /// point keeping a copy would have meant the daemon and the CLI could drift
 /// about what a statement MEANS, which is worse than drifting about a result
 /// because nothing looks broken when it happens.
-pub use nedb_engine::neql::Dialect;
+pub use nedb_engine::nesql::Dialect;
 
 impl NotWired {
     pub fn name(self) -> &'static str {
@@ -604,10 +604,10 @@ fn resolve(
                 (false, false) => None,
             };
             if words.is_empty() {
-                // neQL, not NQL: this command has accepted Postgres SQL since
+                // neSQL, not NQL: this command has accepted Postgres SQL since
                 // the pgwire merge, and an error naming only half the language
                 // sends the reader looking for the wrong syntax.
-                return refuse("query needs a neQL statement (NQL or Postgres SQL)");
+                return refuse("query needs a neSQL statement (NQL or Postgres SQL)");
             }
             // Multiple words are joined with single spaces, so both
             // `query "FROM users LIMIT 1"` and `query FROM users LIMIT 1`

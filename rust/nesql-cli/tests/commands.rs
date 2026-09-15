@@ -360,7 +360,7 @@ fn the_exit_code_table_is_exactly_what_is_documented() {
     assert_eq!(Exit::from_code(97), Exit::Failure);
 }
 
-// ── neQL: both halves of the language ─────────────────────────────────────
+// ── neSQL: both halves of the language ─────────────────────────────────────
 
 #[test]
 fn neql_runs_nql_and_sql_through_one_command() {

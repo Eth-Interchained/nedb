@@ -50,7 +50,7 @@ COMMANDS
   grammar                       this grammar surface and its digest
   constitution                  the engine's constitution + compatibility check
   version                       CLI version AND engine version
-  query <neQL> [--nql|--sql]    run neQL: NQL or Postgres SQL
+  query <neSQL> [--nql|--sql]   run neSQL: PostgreSQL SQL + NEDB's own
                                 the dialect is chosen by the leading keyword
                                 (NQL statements begin FROM; SQL begins SELECT,
                                 INSERT, UPDATE, DELETE, EXPLAIN, WITH, SHOW,
@@ -331,7 +331,7 @@ mod tests {
         }
     }
 
-    /// The spec must name neQL, not NQL alone. `query` has answered Postgres
+    /// The spec must name neSQL, not NQL alone. `query` has answered Postgres
     /// SQL since the pgwire merge; describing it as an NQL-only command sends
     /// the reader to the wrong syntax.
     #[test]
@@ -341,7 +341,7 @@ mod tests {
             .find(|l| l.trim_start().starts_with("query "))
             .expect("the spec documents query");
         assert!(
-            q.contains("neQL"),
+            q.contains("neSQL"),
             "the query line still describes only one half of the language: {:?}",
             q.trim()
         );

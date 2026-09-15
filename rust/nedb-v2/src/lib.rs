@@ -23,7 +23,7 @@ pub mod segment;
 pub mod index;
 pub mod graph;
 pub mod namespace;
-pub mod neql;
+pub mod nesql;
 pub mod relation;
 pub mod root;
 pub mod diff;
