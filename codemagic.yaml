@@ -174,6 +174,22 @@ workflows:
           # reported SUCCESS. It also explains the 3.3s step duration exactly:
           # cargo never ran at all.
           source "$HOME/.cargo/env"
+          # The Intel legs CROSS-compile from an arm64 runner, and the linker
+          # env that makes that work is exported in the "Build nedbd-v2 binary
+          # (cross-compile x86_64)" step -- a DIFFERENT shell, so it is gone
+          # here for exactly the same reason cargo's PATH was.
+          #
+          # Read from the v9.0.2 logs rather than found by another tag: BOTH
+          # arches died at `cargo: command not found`, so the x86_64
+          # cross-link had never been REACHED. Fixing only the PATH would have
+          # moved the Intel failure one line down to a missing linker and cost
+          # another release to discover. Set on the x86_64 leg only -- the
+          # arm64 leg builds natively and needs none of it.
+          if [ "$RUST_TARGET" = "x86_64-apple-darwin" ]; then
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+            export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           # Codemagic's API exposes no build log for this account -- `logUrl`
           # is null on every action, and the artefacts zip carries only the
           # addon -- so a diagnosis has to survive as an ARTEFACT or it does
@@ -393,6 +409,22 @@ workflows:
           # reported SUCCESS. It also explains the 3.3s step duration exactly:
           # cargo never ran at all.
           source "$HOME/.cargo/env"
+          # The Intel legs CROSS-compile from an arm64 runner, and the linker
+          # env that makes that work is exported in the "Build nedbd-v2 binary
+          # (cross-compile x86_64)" step -- a DIFFERENT shell, so it is gone
+          # here for exactly the same reason cargo's PATH was.
+          #
+          # Read from the v9.0.2 logs rather than found by another tag: BOTH
+          # arches died at `cargo: command not found`, so the x86_64
+          # cross-link had never been REACHED. Fixing only the PATH would have
+          # moved the Intel failure one line down to a missing linker and cost
+          # another release to discover. Set on the x86_64 leg only -- the
+          # arm64 leg builds natively and needs none of it.
+          if [ "$RUST_TARGET" = "x86_64-apple-darwin" ]; then
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+            export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           # Codemagic's API exposes no build log for this account -- `logUrl`
           # is null on every action, and the artefacts zip carries only the
           # addon -- so a diagnosis has to survive as an ARTEFACT or it does
@@ -611,6 +643,22 @@ workflows:
           # reported SUCCESS. It also explains the 3.3s step duration exactly:
           # cargo never ran at all.
           source "$HOME/.cargo/env"
+          # The Intel legs CROSS-compile from an arm64 runner, and the linker
+          # env that makes that work is exported in the "Build nedbd-v2 binary
+          # (cross-compile x86_64)" step -- a DIFFERENT shell, so it is gone
+          # here for exactly the same reason cargo's PATH was.
+          #
+          # Read from the v9.0.2 logs rather than found by another tag: BOTH
+          # arches died at `cargo: command not found`, so the x86_64
+          # cross-link had never been REACHED. Fixing only the PATH would have
+          # moved the Intel failure one line down to a missing linker and cost
+          # another release to discover. Set on the x86_64 leg only -- the
+          # arm64 leg builds natively and needs none of it.
+          if [ "$RUST_TARGET" = "x86_64-apple-darwin" ]; then
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+            export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           # Codemagic's API exposes no build log for this account -- `logUrl`
           # is null on every action, and the artefacts zip carries only the
           # addon -- so a diagnosis has to survive as an ARTEFACT or it does
@@ -833,6 +881,22 @@ workflows:
           # reported SUCCESS. It also explains the 3.3s step duration exactly:
           # cargo never ran at all.
           source "$HOME/.cargo/env"
+          # The Intel legs CROSS-compile from an arm64 runner, and the linker
+          # env that makes that work is exported in the "Build nedbd-v2 binary
+          # (cross-compile x86_64)" step -- a DIFFERENT shell, so it is gone
+          # here for exactly the same reason cargo's PATH was.
+          #
+          # Read from the v9.0.2 logs rather than found by another tag: BOTH
+          # arches died at `cargo: command not found`, so the x86_64
+          # cross-link had never been REACHED. Fixing only the PATH would have
+          # moved the Intel failure one line down to a missing linker and cost
+          # another release to discover. Set on the x86_64 leg only -- the
+          # arm64 leg builds natively and needs none of it.
+          if [ "$RUST_TARGET" = "x86_64-apple-darwin" ]; then
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+            export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           # Codemagic's API exposes no build log for this account -- `logUrl`
           # is null on every action, and the artefacts zip carries only the
           # addon -- so a diagnosis has to survive as an ARTEFACT or it does
@@ -1051,6 +1115,22 @@ workflows:
           # reported SUCCESS. It also explains the 3.3s step duration exactly:
           # cargo never ran at all.
           source "$HOME/.cargo/env"
+          # The Intel legs CROSS-compile from an arm64 runner, and the linker
+          # env that makes that work is exported in the "Build nedbd-v2 binary
+          # (cross-compile x86_64)" step -- a DIFFERENT shell, so it is gone
+          # here for exactly the same reason cargo's PATH was.
+          #
+          # Read from the v9.0.2 logs rather than found by another tag: BOTH
+          # arches died at `cargo: command not found`, so the x86_64
+          # cross-link had never been REACHED. Fixing only the PATH would have
+          # moved the Intel failure one line down to a missing linker and cost
+          # another release to discover. Set on the x86_64 leg only -- the
+          # arm64 leg builds natively and needs none of it.
+          if [ "$RUST_TARGET" = "x86_64-apple-darwin" ]; then
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+            export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           # Codemagic's API exposes no build log for this account -- `logUrl`
           # is null on every action, and the artefacts zip carries only the
           # addon -- so a diagnosis has to survive as an ARTEFACT or it does
@@ -1273,6 +1353,22 @@ workflows:
           # reported SUCCESS. It also explains the 3.3s step duration exactly:
           # cargo never ran at all.
           source "$HOME/.cargo/env"
+          # The Intel legs CROSS-compile from an arm64 runner, and the linker
+          # env that makes that work is exported in the "Build nedbd-v2 binary
+          # (cross-compile x86_64)" step -- a DIFFERENT shell, so it is gone
+          # here for exactly the same reason cargo's PATH was.
+          #
+          # Read from the v9.0.2 logs rather than found by another tag: BOTH
+          # arches died at `cargo: command not found`, so the x86_64
+          # cross-link had never been REACHED. Fixing only the PATH would have
+          # moved the Intel failure one line down to a missing linker and cost
+          # another release to discover. Set on the x86_64 leg only -- the
+          # arm64 leg builds natively and needs none of it.
+          if [ "$RUST_TARGET" = "x86_64-apple-darwin" ]; then
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+            export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
           # Codemagic's API exposes no build log for this account -- `logUrl`
           # is null on every action, and the artefacts zip carries only the
           # addon -- so a diagnosis has to survive as an ARTEFACT or it does
