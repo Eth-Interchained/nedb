@@ -54,6 +54,11 @@ ol.track{list-style:none;counter-reset:step;padding:56px 0 0}
 .terminal .o{color:#5b667d;font-style:italic}
 .terminal .g{color:var(--emerald)}
 .terminal .y{color:var(--amber2)}
+/* Lost / failed output. `.r` already exists but is scoped to `.bar` as the
+   traffic-light dot, so a bare `.r` inside a <pre> silently rendered
+   unstyled -- the `null` in case A below is the single most important
+   character on this page and it has to READ as a loss. */
+.terminal .lost{color:var(--rose);font-weight:600}
 .note{background:rgba(52,211,153,.06);border:1px solid rgba(52,211,153,.25);border-radius:11px;padding:12px 16px;font-size:13.5px;color:var(--dim);margin:12px 0}
 .note b{color:var(--emerald)}
 .warn{background:rgba(249,115,22,.06);border:1px solid rgba(249,115,22,.3);border-radius:11px;padding:12px 16px;font-size:13.5px;color:var(--dim);margin:12px 0}
@@ -235,18 +240,59 @@ db.flush();
   <p class="why">Four things worth noticing. <b>Links</b> are real edges — <code>neighbors</code> walks forward, <code>inbound</code> walks backward, both have <code>*AsOf</code> variants for graph queries at a past sequence. <b><code>tip()</code></b> returns the literal latest write — note the link itself is a stored document in the DAG, not a foreign key. <b><code>since()</code></b> is the changefeed: pass a <b>BigInt</b> cursor (a plain <code>0</code> throws — this bites everyone once) and it pages every node after it, with <code>has_more</code> telling you whether to keep draining. <b><code>scanStatus()</code></b> reports replication readiness: gate followers on <code>seq_index_ready</code>, not <code>scan_complete</code> — on a warm boot the seq index is deliberately empty, and a follower that trusted <code>scan_complete</code> would believe it is caught up while holding nothing.</p>
 
   <div class="terminal"><div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>step 5 — durability: prove the flush discipline yourself</span></div>
-  <pre><span class="p">$</span> node -e <span class="s">"
+  <pre><span class="c"># A — put, then kill -9 immediately. THE WRITE IS LOST.</span>
+<span class="p">$</span> rm -rf dur-a &amp;&amp; node -e <span class="s">"
 const { NedbCore } = require('nedb-engine');
-const db = NedbCore.open('./dur-store');
+const db = NedbCore.open('./dur-a');
 db.put('k','1', JSON.stringify({v:'survives'}));
-process.kill(process.pid, 'SIGKILL');      // the harshest possible exit
+process.kill(process.pid, 'SIGKILL');      // no flush, no time to tick
 "</span>
-<span class="p">$</span> node -e <span class="s">"
+<span class="p">$</span> node -e <span class="s">"const { NedbCore } = require('nedb-engine');
+console.log(NedbCore.open('./dur-a').get('k','1'));"</span>
+<span class="lost">null</span>
+
+<span class="c"># B — put, flush(), then kill -9. THE WRITE SURVIVES.</span>
+<span class="p">$</span> rm -rf dur-b &amp;&amp; node -e <span class="s">"
 const { NedbCore } = require('nedb-engine');
-const db = NedbCore.open('./dur-store');
-console.log(db.get('k','1'));              // SIGKILL survival?
-"</span></pre></div>
-  <p class="why">Run the first block, then the second. The write survives <code>SIGKILL</code> — the wrapper's exit-flush armed on open, and the engine's id-index WAL carries the staged write. What you lose on a hard kill is at most the last <b>1-second ticker tick</b> of acknowledged writes (<code>NEDB_FLUSH_MS</code> tunes it). This durability contract — what a power cut actually costs — is specified precisely in <code>docs/DURABILITY.md</code>, with the failure modes that motivated it.</p>
+const db = NedbCore.open('./dur-b');
+db.put('k','1', JSON.stringify({v:'survives'}));
+db.flush();                                // &lt;-- the whole lesson
+process.kill(process.pid, 'SIGKILL');
+"</span>
+<span class="p">$</span> node -e <span class="s">"const { NedbCore } = require('nedb-engine');
+console.log(NedbCore.open('./dur-b').get('k','1'));"</span>
+<span class="g">{"v":"survives","_id":"1","_hash":"…","_seq":1,"_coll":"k"}</span>
+
+<span class="c"># C — put, wait past one 1000ms tick, then kill -9. ALSO SURVIVES.</span>
+<span class="p">$</span> rm -rf dur-c &amp;&amp; node -e <span class="s">"
+const { NedbCore } = require('nedb-engine');
+const db = NedbCore.open('./dur-c');
+db.put('k','1', JSON.stringify({v:'survives'}));
+setTimeout(() =&gt; process.kill(process.pid, 'SIGKILL'), 1500);
+"</span>
+<span class="p">$</span> node -e <span class="s">"const { NedbCore } = require('nedb-engine');
+console.log(NedbCore.open('./dur-c').get('k','1'));"</span>
+<span class="g">{"v":"survives","_id":"1","_hash":"…","_seq":1,"_coll":"k"}</span></pre></div>
+  <p class="why"><b>Run A first, and expect to lose the write.</b> That is not a bug and it is the most useful thing on this page: <code>put()</code> returns <em>before</em> its index entry is durable. A acknowledges, then dies inside the same millisecond — no <code>flush()</code> called, and the 1-second manifest ticker never got a chance to fire — so there is nothing on disk to find. B and C are the two ways to close that window: ask for durability explicitly, or let the ticker arrive. (Your <code>_hash</code> will not match a value printed here and is not meant to — it is elided above for that reason; what you are checking is <code>null</code> versus a document.)</p>
+
+  <p class="why">The contract, stated plainly: <b>an acknowledged write is on disk within one tick, or at exit — whichever comes first.</b> So what you can lose to a hard kill or a power cut is bounded at <b>the last 1000 ms of acknowledged writes</b> (<code>NEDB_FLUSH_MS</code> tunes it; min 50, <code>0</code> disables the ticker when your host owns its own cadence).</p>
+
+  <div class="note"><b>The flush discipline — what to actually do in your app.</b> Do not call <code>flush()</code> after every <code>put()</code> unless you mean it: it is an fsync, and the benchmark cost is real (≈7.9K/s durable vs ≈78K/s buffered). Pick per write class:
+  <ul>
+    <li><b>Money, orders, auth, anything you would refund or apologise for</b> — <code>flush()</code> before you acknowledge to your own caller. Treat the write as unacknowledged until it returns.</li>
+    <li><b>Batches and imports</b> — one <code>flush()</code> at the end of the batch, not per row. You get one fsync instead of N and the same guarantee for the batch as a whole.</li>
+    <li><b>Telemetry, caches, feeds, anything you would re-derive</b> — no explicit flush. The ticker is exactly the right tool and a bounded 1-second loss is the correct trade.</li>
+    <li><b>Short-lived processes</b> — a script that writes and exits within a tick is <em>case A</em>. A CLI, a lambda, a cron job or a test that does not flush before returning can lose everything it wrote. This is the sharpest edge in the whole API, because on a graceful exit the exit hook hides it and you only find out the first time something kills you.</li>
+  </ul></div>
+
+  <div class="note"><b>Which mechanism saves you, and when.</b> Three separate things, and they are not interchangeable:
+  <ul>
+    <li><code>flush()</code> — synchronous, immediate, works under <em>any</em> death including <code>SIGKILL</code>, because the bytes are already down before the call returns.</li>
+    <li><b>the 1000 ms manifest ticker</b> — armed by a durable <code>open()</code> in both bindings. This is what saves case C, and the only thing that bounds your loss on <code>kill -9</code>, an OOM-kill, or a power cut.</li>
+    <li><b>the exit hook</b> — covers the last partial tick on a <em>graceful</em> exit: a normal return, <code>SIGINT</code>, <code>SIGTERM</code>. It cannot help with <code>SIGKILL</code>, which POSIX makes impossible to catch, block or ignore. An earlier version of this page credited the exit hook for surviving <code>SIGKILL</code>; that was wrong in the one way worth being loud about, because it named a mechanism that is guaranteed not to run and so taught the opposite of the discipline above.</li>
+  </ul></div>
+
+  <p class="why">The full contract — every failure mode that motivated it, and the production incident that found it — is in <code>docs/DURABILITY.md</code>.</p>
 
   <div class="note"><b>Full API surface in the binding:</b> <code>put, putEx, delete, deleteEx, get, getAsOf, query, nesql, nesqlDialect, createIndex, link, unlink, neighbors, neighborsAsOf, inbound, inboundAsOf, tip, tipCollection, since, scanStatus, verify, head, seq, flush</code> — check <code>Object.getOwnPropertyNames(Object.getPrototypeOf(db))</code> yourself. The <code>*Ex</code> variants carry client/nonce/idempotency-key fields for the CAS transaction paths.</div>
 </li>
