@@ -524,6 +524,62 @@ jobs:
           cp "$SRC" "$DEST"
           chmod +x "$DEST" || true
           echo "Staged nedbd-v2 binary: $(ls -lh $DEST)"
+      # ── nesql (the neSQL CLI) — built HERE, not in `wheels` ─────────────────
+      #
+      # It WAS built in `wheels`, which arch-named it for npm and then ended.
+      # Nothing in that job uploads an artifact or a release asset, so the file
+      # evaporated with the runner: `nesql-*` reached npm on no platform for
+      # every release from v8.0.0 through v9.0.0, while `nesql.js` shipped
+      # promising four of them. `pip` users were fine the whole time, because
+      # the wheel copy lands inside the wheel that job builds -- which is
+      # exactly why nobody noticed.
+      #
+      # This job is the right home: the two steps below already glob `nesql-*`
+      # into the release assets and into the `node-<target>` artifact that
+      # `publish-npm` consumes, so building it here makes both work with no
+      # further change. The `wheels` copy stays where it is -- it feeds PyPI
+      # and is not redundant with this one.
+      #
+      # Naming mirrors nedbd-v2 exactly, including the musl legs. A binary is
+      # built for every target this job has rather than only the ones the shim
+      # currently resolves, because an asset that exists can be resolved later
+      # while one that was never built cannot.
+      - name: Build nesql (neSQL CLI binary)
+        shell: bash
+        run: |
+          set -e
+          cd rust
+          cargo build --release --bin nesql --package nesql --target ${{ matrix.target }}
+          cd ..
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              SRC="rust/target/${{ matrix.target }}/release/nesql"; DEST="nesql-linux-x64" ;;
+            aarch64-unknown-linux-gnu)
+              SRC="rust/target/${{ matrix.target }}/release/nesql"; DEST="nesql-linux-arm64" ;;
+            x86_64-unknown-linux-musl)
+              SRC="rust/target/${{ matrix.target }}/release/nesql"; DEST="nesql-linux-x64-musl" ;;
+            aarch64-unknown-linux-musl)
+              SRC="rust/target/${{ matrix.target }}/release/nesql"; DEST="nesql-linux-arm64-musl" ;;
+            x86_64-pc-windows-msvc)
+              SRC="rust/target/${{ matrix.target }}/release/nesql.exe"; DEST="nesql-win-x64.exe" ;;
+            *)
+              echo "::error::unknown target ${{ matrix.target }} — nesql has no npm name for it"; exit 1 ;;
+          esac
+          cp "$SRC" "$DEST"
+          chmod +x "$DEST" || true
+          echo "Staged nesql binary: $(ls -lh $DEST)"
+          # Prove it runs before it is packaged. `cargo test` never executes
+          # main, so a binary that builds and panics on startup looks identical
+          # to a good one in a build log. Only on natively-runnable legs: a
+          # cross-built musl or windows binary cannot execute on this runner,
+          # and that is the cross-build working, not a defect.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              ./"$DEST" version
+              ./"$DEST" grammar --json | head -c 80; echo ;;
+            *)
+              echo "  (startup check skipped — $DEST cannot execute on this runner)" ;;
+          esac
       - name: Upload .node + nedbd-v2 binaries to GitHub release
         shell: bash
         env:
@@ -640,6 +696,7 @@ jobs:
           done
           echo "Final .node files:     $(ls *.node 2>/dev/null || echo 'none')"
           echo "Final nedbd-v2 files:  $(ls nedbd-v2-* 2>/dev/null || echo 'none')"
+          echo "Final nesql files:     $(ls nesql-* 2>/dev/null || echo 'none')"
       - name: Make nedbd-v2 binaries executable
         shell: bash
         run: |
@@ -647,6 +704,34 @@ jobs:
             [ -f "$f" ] && chmod +x "$f"
           done
           ls -lh nedbd-v2-* 2>/dev/null || true
+      # The gate that was missing. `nesql-*` was downloaded with `|| true` and
+      # never printed, so a tarball with no CLI binary at all published green
+      # for four consecutive releases. `nesql.js` ships unconditionally and
+      # tells the user a binary should be here, so shipping without one emits a
+      # broken command to every npm user -- fail instead.
+      #
+      # Deliberately NOT gated on a specific platform: the Mac halves come from
+      # Codemagic and can legitimately be late, which is a partial package and
+      # a warning. Zero binaries is never legitimate, because this workflow's
+      # own node-binaries job builds five of them.
+      - name: Gate — the npm tarball must carry at least one nesql binary
+        shell: bash
+        run: |
+          set -e
+          FOUND=$(ls nesql-* 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$FOUND" = "0" ]; then
+            echo "::error::no nesql-* binary staged — nesql.js would ship promising a CLI this package does not contain (this is the v8.0.0-v9.0.0 defect). Expected the node-binaries job to upload nesql-linux-x64 and friends as release assets."
+            echo "release assets actually present:"
+            gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' 2>/dev/null | sed 's/^/  /' || echo "  (could not read release)"
+            exit 1
+          fi
+          echo "nesql binaries staged for npm ($FOUND):"
+          ls -lh nesql-* | sed 's/^/  /'
+          for want in nesql-darwin-arm64 nesql-darwin-x64; do
+            [ -f "$want" ] || echo "::warning::$want absent — Mac users of this npm release will get exit 5 from nesql.js (Codemagic upload late or failed)"
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Publish to npm (all available platform binaries)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

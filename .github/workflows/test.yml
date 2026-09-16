@@ -260,6 +260,15 @@ jobs:
         with:
           node-version: "20"
       - run: pip install httpx
+      # Pure static parity -- no daemon, no network, so it is cheap and runs
+      # before anything heavier. Placed here rather than in a packaging-only
+      # job on purpose: the defect it guards (nesql.js promising binaries no
+      # pipeline built) survived four green releases precisely because no
+      # ordinary test run touched packaging.
+      - name: npm binary parity — every shim promise is built by some pipeline
+        run: python3 tests/test_npm_binary_parity.py
+      - name: neSQL router parity — Rust and Python agree on the vocabulary
+        run: python3 tests/test_nesql_parity.py
       - name: PyPI client — nedb_client against a live nedbd
         run: python3 tests/test_client_package.py
       - name: npm client — build the artifact that actually ships
