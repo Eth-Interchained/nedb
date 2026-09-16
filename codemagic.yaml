@@ -129,70 +129,6 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
-          # ── nesql CLI binary ───────────────────────────────────────────────
-          #
-          # THREE defects lived in the four lines this replaces, and together
-          # they shipped npm a CLI-less package from v8.0.0 to v9.0.0 while
-          # every build reported success:
-          #
-          # 1. The build was BARE -- the only cargo invocation in this file
-          #    without `--target $RUST_TARGET`. On the Intel legs that builds
-          #    for the arm64 HOST and names the result `nesql-darwin-x64`, so
-          #    a success would have shipped the wrong architecture to Intel
-          #    Macs. On every leg it also targets a different target-dir than
-          #    the nedbd build just populated, so nothing was cached and the
-          #    compile could not finish inside the 3.3s the step actually took.
-          # 2. `cp rust/target/release/nesql` therefore read a path that does
-          #    not exist, and this script has no `set -e`, so the failure
-          #    continued into `chmod`, the smoke, and the upload -- all of
-          #    which failed too.
-          # 3. The step's exit status came from the trailing `|| true` loops
-          #    below, so it reported SUCCESS with no asset uploaded. A silent
-          #    failure is indistinguishable from a broken dependency, and this
-          #    one cost four releases.
-          #
-          # Fixed by matching what nedbd does five lines above -- explicit
-          # target, explicit path -- and by checking each step so a failure
-          # says which one. Scoped deliberately: `set -e` is NOT applied to
-          # the whole script, because that would convert every other latent
-          # failure in it into a hard release stop in the same change.
-          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
-          if ! ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ); then
-            echo "ERROR: nesql failed to build for $RUST_TARGET" >&2
-            exit 1
-          fi
-          if [ ! -f "$NESQL_SRC" ]; then
-            echo "ERROR: nesql built but $NESQL_SRC is absent. Contents of rust/target/$RUST_TARGET/release:" >&2
-            ls -la "rust/target/$RUST_TARGET/release" 2>&1 | head -30 >&2
-            exit 1
-          fi
-          cp "$NESQL_SRC" nesql-darwin-arm64
-          chmod +x nesql-darwin-arm64
-          # Assert the ARCHITECTURE, not just that a file exists. The bare
-          # build would have produced a running arm64 binary here and the
-          # version smoke below would have passed it -- on the Intel leg that
-          # is precisely the wrong answer arriving green.
-          file nesql-darwin-arm64
-          case "$RUST_TARGET" in
-            x86_64-apple-darwin)
-              file nesql-darwin-arm64 | grep -q "x86_64" \
-                || { echo "ERROR: nesql-darwin-arm64 is not x86_64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-            aarch64-apple-darwin)
-              file nesql-darwin-arm64 | grep -q "arm64" \
-                || { echo "ERROR: nesql-darwin-arm64 is not arm64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-          esac
-          # A binary that builds can still panic on startup, and `cargo test`
-          # never executes main. Only runnable natively.
-          if [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
-            ./nesql-darwin-arm64 version
-          else
-            echo "  (startup check skipped -- x86_64 binary cross-built on an arm64 runner)"
-          fi
-          if ! gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber; then
-            echo "ERROR: failed to upload nesql-darwin-arm64 to release $TAG" >&2
-            exit 1
-          fi
-          echo "nesql-darwin-arm64 uploaded to $TAG"
           # _native extension (so pypi fat-wheel includes it for Mac users)
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -204,9 +140,91 @@ workflows:
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
 
+           # ── nesql CLI binary — LAST on purpose ─────────────────────────────
+          #
+          # This block used to sit directly after the nedbd upload, and its
+          # hard `exit 1` then aborted the script before the `_native` and
+          # `.node` uploads below. v9.0.1 shipped with NO darwin `.node`
+          # assets at all for exactly that reason -- a missing CLI cost Mac
+          # npm users their ADDON, which is strictly worse than the bug being
+          # fixed. Failing loudly was right; failing loudly in the middle of a
+          # sequence of INDEPENDENT uploads was not.
+          #
+          # So it runs last and records the failure instead of
+          # short-circuiting: everything independently uploadable ships first,
+          # and the step still exits non-zero at the very end.
+          NESQL_FAILED=""
+          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
+          # Codemagic's API exposes no build log for this account -- `logUrl`
+          # is null on every action, and the artefacts zip carries only the
+          # addon -- so a diagnosis has to survive as an ARTEFACT or it does
+          # not survive at all. Hence the tee'd log, uploaded to the release
+          # below whether this succeeds or fails.
+          {
+            echo "=== nesql staging for $RUST_TARGET ==="
+            ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ) 2>&1
+            echo "cargo exit: $?"
+            echo "--- expected: $NESQL_SRC ---"
+            ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
+          } > nesql-build-arm64.log 2>&1 || true
+          if [ ! -f "$NESQL_SRC" ]; then
+            echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
+            tail -40 nesql-build-arm64.log >&2
+            NESQL_FAILED="build"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            cp "$NESQL_SRC" nesql-darwin-arm64
+            chmod +x nesql-darwin-arm64
+            # Assert the ARCHITECTURE, not merely that a file exists: the old
+            # bare build produced a RUNNING arm64 binary that the version
+            # smoke passed happily while being the wrong answer on Intel.
+            #
+            # `file -b` is load-bearing. Plain `file X` prints "X: <desc>",
+            # so `file nesql-darwin-arm64 | grep -q arm64` matches the
+            # FILENAME and the assertion is vacuous -- it passes for any
+            # architecture whatsoever. The Intel leg only escaped because the
+            # file is named `-x64` while the check greps `x86_64`. Caught by
+            # simulating a wrong-arch binary, which exited 0. `-b` drops the
+            # filename so the match is against the description alone.
+            WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
+            file -b nesql-darwin-arm64 | tee -a nesql-build-arm64.log
+            if ! file -b nesql-darwin-arm64 | grep -q "$WANT"; then
+              echo "ERROR: nesql-darwin-arm64 is not $WANT -- refusing to ship the wrong arch" >&2
+              NESQL_FAILED="arch"
+            fi
+          fi
+          if [ -z "$NESQL_FAILED" ] && [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
+            ./nesql-darwin-arm64 version || NESQL_FAILED="startup"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            if gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber; then
+              echo "nesql-darwin-arm64 uploaded to $TAG"
+            else
+              NESQL_FAILED="upload"
+            fi
+          fi
+          gh release upload "$TAG" nesql-build-arm64.log --repo Eth-Interchained/nedb --clobber || true
+          if [ -n "$NESQL_FAILED" ]; then
+            echo "ERROR: nesql-darwin-arm64 did not ship (stage: $NESQL_FAILED)." >&2
+            echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
+            echo "       Full build output: nesql-build-arm64.log, attached to release $TAG." >&2
+            exit 1
+          fi
     artifacts:
       - dist/*.whl
       - "*.node"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account -- every action's `logUrl` is null -- so this is the only way
+      # a failed nesql stage can be read after the fact. It is an artefact
+      # here AS WELL AS a release asset because the release upload can itself
+      # be the thing that failed.
+      - "nesql-build-*.log"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account (every action's `logUrl` is null), so this is the ONLY way a
+      # failed nesql stage can be read after the fact -- and the upload
+      # branch below can itself be the thing that failed, which is why the
+      # log is an artefact here as well as a release asset.
+      - "nesql-build-*.log"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
   macos-intel-wheel:
@@ -311,70 +329,6 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
-          # ── nesql CLI binary ───────────────────────────────────────────────
-          #
-          # THREE defects lived in the four lines this replaces, and together
-          # they shipped npm a CLI-less package from v8.0.0 to v9.0.0 while
-          # every build reported success:
-          #
-          # 1. The build was BARE -- the only cargo invocation in this file
-          #    without `--target $RUST_TARGET`. On the Intel legs that builds
-          #    for the arm64 HOST and names the result `nesql-darwin-x64`, so
-          #    a success would have shipped the wrong architecture to Intel
-          #    Macs. On every leg it also targets a different target-dir than
-          #    the nedbd build just populated, so nothing was cached and the
-          #    compile could not finish inside the 3.3s the step actually took.
-          # 2. `cp rust/target/release/nesql` therefore read a path that does
-          #    not exist, and this script has no `set -e`, so the failure
-          #    continued into `chmod`, the smoke, and the upload -- all of
-          #    which failed too.
-          # 3. The step's exit status came from the trailing `|| true` loops
-          #    below, so it reported SUCCESS with no asset uploaded. A silent
-          #    failure is indistinguishable from a broken dependency, and this
-          #    one cost four releases.
-          #
-          # Fixed by matching what nedbd does five lines above -- explicit
-          # target, explicit path -- and by checking each step so a failure
-          # says which one. Scoped deliberately: `set -e` is NOT applied to
-          # the whole script, because that would convert every other latent
-          # failure in it into a hard release stop in the same change.
-          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
-          if ! ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ); then
-            echo "ERROR: nesql failed to build for $RUST_TARGET" >&2
-            exit 1
-          fi
-          if [ ! -f "$NESQL_SRC" ]; then
-            echo "ERROR: nesql built but $NESQL_SRC is absent. Contents of rust/target/$RUST_TARGET/release:" >&2
-            ls -la "rust/target/$RUST_TARGET/release" 2>&1 | head -30 >&2
-            exit 1
-          fi
-          cp "$NESQL_SRC" nesql-darwin-x64
-          chmod +x nesql-darwin-x64
-          # Assert the ARCHITECTURE, not just that a file exists. The bare
-          # build would have produced a running arm64 binary here and the
-          # version smoke below would have passed it -- on the Intel leg that
-          # is precisely the wrong answer arriving green.
-          file nesql-darwin-x64
-          case "$RUST_TARGET" in
-            x86_64-apple-darwin)
-              file nesql-darwin-x64 | grep -q "x86_64" \
-                || { echo "ERROR: nesql-darwin-x64 is not x86_64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-            aarch64-apple-darwin)
-              file nesql-darwin-x64 | grep -q "arm64" \
-                || { echo "ERROR: nesql-darwin-x64 is not arm64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-          esac
-          # A binary that builds can still panic on startup, and `cargo test`
-          # never executes main. Only runnable natively.
-          if [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
-            ./nesql-darwin-x64 version
-          else
-            echo "  (startup check skipped -- x86_64 binary cross-built on an arm64 runner)"
-          fi
-          if ! gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber; then
-            echo "ERROR: failed to upload nesql-darwin-x64 to release $TAG" >&2
-            exit 1
-          fi
-          echo "nesql-darwin-x64 uploaded to $TAG"
           # _native extension
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -386,9 +340,91 @@ workflows:
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
 
+           # ── nesql CLI binary — LAST on purpose ─────────────────────────────
+          #
+          # This block used to sit directly after the nedbd upload, and its
+          # hard `exit 1` then aborted the script before the `_native` and
+          # `.node` uploads below. v9.0.1 shipped with NO darwin `.node`
+          # assets at all for exactly that reason -- a missing CLI cost Mac
+          # npm users their ADDON, which is strictly worse than the bug being
+          # fixed. Failing loudly was right; failing loudly in the middle of a
+          # sequence of INDEPENDENT uploads was not.
+          #
+          # So it runs last and records the failure instead of
+          # short-circuiting: everything independently uploadable ships first,
+          # and the step still exits non-zero at the very end.
+          NESQL_FAILED=""
+          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
+          # Codemagic's API exposes no build log for this account -- `logUrl`
+          # is null on every action, and the artefacts zip carries only the
+          # addon -- so a diagnosis has to survive as an ARTEFACT or it does
+          # not survive at all. Hence the tee'd log, uploaded to the release
+          # below whether this succeeds or fails.
+          {
+            echo "=== nesql staging for $RUST_TARGET ==="
+            ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ) 2>&1
+            echo "cargo exit: $?"
+            echo "--- expected: $NESQL_SRC ---"
+            ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
+          } > nesql-build-x64.log 2>&1 || true
+          if [ ! -f "$NESQL_SRC" ]; then
+            echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
+            tail -40 nesql-build-x64.log >&2
+            NESQL_FAILED="build"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            cp "$NESQL_SRC" nesql-darwin-x64
+            chmod +x nesql-darwin-x64
+            # Assert the ARCHITECTURE, not merely that a file exists: the old
+            # bare build produced a RUNNING arm64 binary that the version
+            # smoke passed happily while being the wrong answer on Intel.
+            #
+            # `file -b` is load-bearing. Plain `file X` prints "X: <desc>",
+            # so `file nesql-darwin-arm64 | grep -q arm64` matches the
+            # FILENAME and the assertion is vacuous -- it passes for any
+            # architecture whatsoever. The Intel leg only escaped because the
+            # file is named `-x64` while the check greps `x86_64`. Caught by
+            # simulating a wrong-arch binary, which exited 0. `-b` drops the
+            # filename so the match is against the description alone.
+            WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
+            file -b nesql-darwin-x64 | tee -a nesql-build-x64.log
+            if ! file -b nesql-darwin-x64 | grep -q "$WANT"; then
+              echo "ERROR: nesql-darwin-x64 is not $WANT -- refusing to ship the wrong arch" >&2
+              NESQL_FAILED="arch"
+            fi
+          fi
+          if [ -z "$NESQL_FAILED" ] && [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
+            ./nesql-darwin-x64 version || NESQL_FAILED="startup"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            if gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber; then
+              echo "nesql-darwin-x64 uploaded to $TAG"
+            else
+              NESQL_FAILED="upload"
+            fi
+          fi
+          gh release upload "$TAG" nesql-build-x64.log --repo Eth-Interchained/nedb --clobber || true
+          if [ -n "$NESQL_FAILED" ]; then
+            echo "ERROR: nesql-darwin-x64 did not ship (stage: $NESQL_FAILED)." >&2
+            echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
+            echo "       Full build output: nesql-build-x64.log, attached to release $TAG." >&2
+            exit 1
+          fi
     artifacts:
       - dist/*.whl
       - "*.node"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account -- every action's `logUrl` is null -- so this is the only way
+      # a failed nesql stage can be read after the fact. It is an artefact
+      # here AS WELL AS a release asset because the release upload can itself
+      # be the thing that failed.
+      - "nesql-build-*.log"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account (every action's `logUrl` is null), so this is the ONLY way a
+      # failed nesql stage can be read after the fact -- and the upload
+      # branch below can itself be the thing that failed, which is why the
+      # log is an artefact here as well as a release asset.
+      - "nesql-build-*.log"
 
   cryptodb-macos-arm64-wheel:
     name: "cryptoDB wheel — macOS arm64"
@@ -492,70 +528,6 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
-          # ── nesql CLI binary ───────────────────────────────────────────────
-          #
-          # THREE defects lived in the four lines this replaces, and together
-          # they shipped npm a CLI-less package from v8.0.0 to v9.0.0 while
-          # every build reported success:
-          #
-          # 1. The build was BARE -- the only cargo invocation in this file
-          #    without `--target $RUST_TARGET`. On the Intel legs that builds
-          #    for the arm64 HOST and names the result `nesql-darwin-x64`, so
-          #    a success would have shipped the wrong architecture to Intel
-          #    Macs. On every leg it also targets a different target-dir than
-          #    the nedbd build just populated, so nothing was cached and the
-          #    compile could not finish inside the 3.3s the step actually took.
-          # 2. `cp rust/target/release/nesql` therefore read a path that does
-          #    not exist, and this script has no `set -e`, so the failure
-          #    continued into `chmod`, the smoke, and the upload -- all of
-          #    which failed too.
-          # 3. The step's exit status came from the trailing `|| true` loops
-          #    below, so it reported SUCCESS with no asset uploaded. A silent
-          #    failure is indistinguishable from a broken dependency, and this
-          #    one cost four releases.
-          #
-          # Fixed by matching what nedbd does five lines above -- explicit
-          # target, explicit path -- and by checking each step so a failure
-          # says which one. Scoped deliberately: `set -e` is NOT applied to
-          # the whole script, because that would convert every other latent
-          # failure in it into a hard release stop in the same change.
-          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
-          if ! ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ); then
-            echo "ERROR: nesql failed to build for $RUST_TARGET" >&2
-            exit 1
-          fi
-          if [ ! -f "$NESQL_SRC" ]; then
-            echo "ERROR: nesql built but $NESQL_SRC is absent. Contents of rust/target/$RUST_TARGET/release:" >&2
-            ls -la "rust/target/$RUST_TARGET/release" 2>&1 | head -30 >&2
-            exit 1
-          fi
-          cp "$NESQL_SRC" nesql-darwin-arm64
-          chmod +x nesql-darwin-arm64
-          # Assert the ARCHITECTURE, not just that a file exists. The bare
-          # build would have produced a running arm64 binary here and the
-          # version smoke below would have passed it -- on the Intel leg that
-          # is precisely the wrong answer arriving green.
-          file nesql-darwin-arm64
-          case "$RUST_TARGET" in
-            x86_64-apple-darwin)
-              file nesql-darwin-arm64 | grep -q "x86_64" \
-                || { echo "ERROR: nesql-darwin-arm64 is not x86_64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-            aarch64-apple-darwin)
-              file nesql-darwin-arm64 | grep -q "arm64" \
-                || { echo "ERROR: nesql-darwin-arm64 is not arm64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-          esac
-          # A binary that builds can still panic on startup, and `cargo test`
-          # never executes main. Only runnable natively.
-          if [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
-            ./nesql-darwin-arm64 version
-          else
-            echo "  (startup check skipped -- x86_64 binary cross-built on an arm64 runner)"
-          fi
-          if ! gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber; then
-            echo "ERROR: failed to upload nesql-darwin-arm64 to release $TAG" >&2
-            exit 1
-          fi
-          echo "nesql-darwin-arm64 uploaded to $TAG"
           # _native extension (so pypi fat-wheel includes it for Mac users)
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -567,9 +539,91 @@ workflows:
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
 
+           # ── nesql CLI binary — LAST on purpose ─────────────────────────────
+          #
+          # This block used to sit directly after the nedbd upload, and its
+          # hard `exit 1` then aborted the script before the `_native` and
+          # `.node` uploads below. v9.0.1 shipped with NO darwin `.node`
+          # assets at all for exactly that reason -- a missing CLI cost Mac
+          # npm users their ADDON, which is strictly worse than the bug being
+          # fixed. Failing loudly was right; failing loudly in the middle of a
+          # sequence of INDEPENDENT uploads was not.
+          #
+          # So it runs last and records the failure instead of
+          # short-circuiting: everything independently uploadable ships first,
+          # and the step still exits non-zero at the very end.
+          NESQL_FAILED=""
+          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
+          # Codemagic's API exposes no build log for this account -- `logUrl`
+          # is null on every action, and the artefacts zip carries only the
+          # addon -- so a diagnosis has to survive as an ARTEFACT or it does
+          # not survive at all. Hence the tee'd log, uploaded to the release
+          # below whether this succeeds or fails.
+          {
+            echo "=== nesql staging for $RUST_TARGET ==="
+            ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ) 2>&1
+            echo "cargo exit: $?"
+            echo "--- expected: $NESQL_SRC ---"
+            ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
+          } > nesql-build-arm64.log 2>&1 || true
+          if [ ! -f "$NESQL_SRC" ]; then
+            echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
+            tail -40 nesql-build-arm64.log >&2
+            NESQL_FAILED="build"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            cp "$NESQL_SRC" nesql-darwin-arm64
+            chmod +x nesql-darwin-arm64
+            # Assert the ARCHITECTURE, not merely that a file exists: the old
+            # bare build produced a RUNNING arm64 binary that the version
+            # smoke passed happily while being the wrong answer on Intel.
+            #
+            # `file -b` is load-bearing. Plain `file X` prints "X: <desc>",
+            # so `file nesql-darwin-arm64 | grep -q arm64` matches the
+            # FILENAME and the assertion is vacuous -- it passes for any
+            # architecture whatsoever. The Intel leg only escaped because the
+            # file is named `-x64` while the check greps `x86_64`. Caught by
+            # simulating a wrong-arch binary, which exited 0. `-b` drops the
+            # filename so the match is against the description alone.
+            WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
+            file -b nesql-darwin-arm64 | tee -a nesql-build-arm64.log
+            if ! file -b nesql-darwin-arm64 | grep -q "$WANT"; then
+              echo "ERROR: nesql-darwin-arm64 is not $WANT -- refusing to ship the wrong arch" >&2
+              NESQL_FAILED="arch"
+            fi
+          fi
+          if [ -z "$NESQL_FAILED" ] && [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
+            ./nesql-darwin-arm64 version || NESQL_FAILED="startup"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            if gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber; then
+              echo "nesql-darwin-arm64 uploaded to $TAG"
+            else
+              NESQL_FAILED="upload"
+            fi
+          fi
+          gh release upload "$TAG" nesql-build-arm64.log --repo Eth-Interchained/nedb --clobber || true
+          if [ -n "$NESQL_FAILED" ]; then
+            echo "ERROR: nesql-darwin-arm64 did not ship (stage: $NESQL_FAILED)." >&2
+            echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
+            echo "       Full build output: nesql-build-arm64.log, attached to release $TAG." >&2
+            exit 1
+          fi
     artifacts:
       - dist/*.whl
       - "*.node"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account -- every action's `logUrl` is null -- so this is the only way
+      # a failed nesql stage can be read after the fact. It is an artefact
+      # here AS WELL AS a release asset because the release upload can itself
+      # be the thing that failed.
+      - "nesql-build-*.log"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account (every action's `logUrl` is null), so this is the ONLY way a
+      # failed nesql stage can be read after the fact -- and the upload
+      # branch below can itself be the thing that failed, which is why the
+      # log is an artefact here as well as a release asset.
+      - "nesql-build-*.log"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
 
@@ -677,70 +731,6 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
-          # ── nesql CLI binary ───────────────────────────────────────────────
-          #
-          # THREE defects lived in the four lines this replaces, and together
-          # they shipped npm a CLI-less package from v8.0.0 to v9.0.0 while
-          # every build reported success:
-          #
-          # 1. The build was BARE -- the only cargo invocation in this file
-          #    without `--target $RUST_TARGET`. On the Intel legs that builds
-          #    for the arm64 HOST and names the result `nesql-darwin-x64`, so
-          #    a success would have shipped the wrong architecture to Intel
-          #    Macs. On every leg it also targets a different target-dir than
-          #    the nedbd build just populated, so nothing was cached and the
-          #    compile could not finish inside the 3.3s the step actually took.
-          # 2. `cp rust/target/release/nesql` therefore read a path that does
-          #    not exist, and this script has no `set -e`, so the failure
-          #    continued into `chmod`, the smoke, and the upload -- all of
-          #    which failed too.
-          # 3. The step's exit status came from the trailing `|| true` loops
-          #    below, so it reported SUCCESS with no asset uploaded. A silent
-          #    failure is indistinguishable from a broken dependency, and this
-          #    one cost four releases.
-          #
-          # Fixed by matching what nedbd does five lines above -- explicit
-          # target, explicit path -- and by checking each step so a failure
-          # says which one. Scoped deliberately: `set -e` is NOT applied to
-          # the whole script, because that would convert every other latent
-          # failure in it into a hard release stop in the same change.
-          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
-          if ! ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ); then
-            echo "ERROR: nesql failed to build for $RUST_TARGET" >&2
-            exit 1
-          fi
-          if [ ! -f "$NESQL_SRC" ]; then
-            echo "ERROR: nesql built but $NESQL_SRC is absent. Contents of rust/target/$RUST_TARGET/release:" >&2
-            ls -la "rust/target/$RUST_TARGET/release" 2>&1 | head -30 >&2
-            exit 1
-          fi
-          cp "$NESQL_SRC" nesql-darwin-x64
-          chmod +x nesql-darwin-x64
-          # Assert the ARCHITECTURE, not just that a file exists. The bare
-          # build would have produced a running arm64 binary here and the
-          # version smoke below would have passed it -- on the Intel leg that
-          # is precisely the wrong answer arriving green.
-          file nesql-darwin-x64
-          case "$RUST_TARGET" in
-            x86_64-apple-darwin)
-              file nesql-darwin-x64 | grep -q "x86_64" \
-                || { echo "ERROR: nesql-darwin-x64 is not x86_64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-            aarch64-apple-darwin)
-              file nesql-darwin-x64 | grep -q "arm64" \
-                || { echo "ERROR: nesql-darwin-x64 is not arm64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-          esac
-          # A binary that builds can still panic on startup, and `cargo test`
-          # never executes main. Only runnable natively.
-          if [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
-            ./nesql-darwin-x64 version
-          else
-            echo "  (startup check skipped -- x86_64 binary cross-built on an arm64 runner)"
-          fi
-          if ! gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber; then
-            echo "ERROR: failed to upload nesql-darwin-x64 to release $TAG" >&2
-            exit 1
-          fi
-          echo "nesql-darwin-x64 uploaded to $TAG"
           # _native extension
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -752,9 +742,91 @@ workflows:
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
 
+           # ── nesql CLI binary — LAST on purpose ─────────────────────────────
+          #
+          # This block used to sit directly after the nedbd upload, and its
+          # hard `exit 1` then aborted the script before the `_native` and
+          # `.node` uploads below. v9.0.1 shipped with NO darwin `.node`
+          # assets at all for exactly that reason -- a missing CLI cost Mac
+          # npm users their ADDON, which is strictly worse than the bug being
+          # fixed. Failing loudly was right; failing loudly in the middle of a
+          # sequence of INDEPENDENT uploads was not.
+          #
+          # So it runs last and records the failure instead of
+          # short-circuiting: everything independently uploadable ships first,
+          # and the step still exits non-zero at the very end.
+          NESQL_FAILED=""
+          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
+          # Codemagic's API exposes no build log for this account -- `logUrl`
+          # is null on every action, and the artefacts zip carries only the
+          # addon -- so a diagnosis has to survive as an ARTEFACT or it does
+          # not survive at all. Hence the tee'd log, uploaded to the release
+          # below whether this succeeds or fails.
+          {
+            echo "=== nesql staging for $RUST_TARGET ==="
+            ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ) 2>&1
+            echo "cargo exit: $?"
+            echo "--- expected: $NESQL_SRC ---"
+            ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
+          } > nesql-build-x64.log 2>&1 || true
+          if [ ! -f "$NESQL_SRC" ]; then
+            echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
+            tail -40 nesql-build-x64.log >&2
+            NESQL_FAILED="build"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            cp "$NESQL_SRC" nesql-darwin-x64
+            chmod +x nesql-darwin-x64
+            # Assert the ARCHITECTURE, not merely that a file exists: the old
+            # bare build produced a RUNNING arm64 binary that the version
+            # smoke passed happily while being the wrong answer on Intel.
+            #
+            # `file -b` is load-bearing. Plain `file X` prints "X: <desc>",
+            # so `file nesql-darwin-arm64 | grep -q arm64` matches the
+            # FILENAME and the assertion is vacuous -- it passes for any
+            # architecture whatsoever. The Intel leg only escaped because the
+            # file is named `-x64` while the check greps `x86_64`. Caught by
+            # simulating a wrong-arch binary, which exited 0. `-b` drops the
+            # filename so the match is against the description alone.
+            WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
+            file -b nesql-darwin-x64 | tee -a nesql-build-x64.log
+            if ! file -b nesql-darwin-x64 | grep -q "$WANT"; then
+              echo "ERROR: nesql-darwin-x64 is not $WANT -- refusing to ship the wrong arch" >&2
+              NESQL_FAILED="arch"
+            fi
+          fi
+          if [ -z "$NESQL_FAILED" ] && [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
+            ./nesql-darwin-x64 version || NESQL_FAILED="startup"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            if gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber; then
+              echo "nesql-darwin-x64 uploaded to $TAG"
+            else
+              NESQL_FAILED="upload"
+            fi
+          fi
+          gh release upload "$TAG" nesql-build-x64.log --repo Eth-Interchained/nedb --clobber || true
+          if [ -n "$NESQL_FAILED" ]; then
+            echo "ERROR: nesql-darwin-x64 did not ship (stage: $NESQL_FAILED)." >&2
+            echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
+            echo "       Full build output: nesql-build-x64.log, attached to release $TAG." >&2
+            exit 1
+          fi
     artifacts:
       - dist/*.whl
       - "*.node"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account -- every action's `logUrl` is null -- so this is the only way
+      # a failed nesql stage can be read after the fact. It is an artefact
+      # here AS WELL AS a release asset because the release upload can itself
+      # be the thing that failed.
+      - "nesql-build-*.log"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account (every action's `logUrl` is null), so this is the ONLY way a
+      # failed nesql stage can be read after the fact -- and the upload
+      # branch below can itself be the thing that failed, which is why the
+      # log is an artefact here as well as a release asset.
+      - "nesql-build-*.log"
 
   nitrodb-macos-arm64-wheel:
     name: "nitroDB wheel — macOS arm64"
@@ -858,70 +930,6 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
-          # ── nesql CLI binary ───────────────────────────────────────────────
-          #
-          # THREE defects lived in the four lines this replaces, and together
-          # they shipped npm a CLI-less package from v8.0.0 to v9.0.0 while
-          # every build reported success:
-          #
-          # 1. The build was BARE -- the only cargo invocation in this file
-          #    without `--target $RUST_TARGET`. On the Intel legs that builds
-          #    for the arm64 HOST and names the result `nesql-darwin-x64`, so
-          #    a success would have shipped the wrong architecture to Intel
-          #    Macs. On every leg it also targets a different target-dir than
-          #    the nedbd build just populated, so nothing was cached and the
-          #    compile could not finish inside the 3.3s the step actually took.
-          # 2. `cp rust/target/release/nesql` therefore read a path that does
-          #    not exist, and this script has no `set -e`, so the failure
-          #    continued into `chmod`, the smoke, and the upload -- all of
-          #    which failed too.
-          # 3. The step's exit status came from the trailing `|| true` loops
-          #    below, so it reported SUCCESS with no asset uploaded. A silent
-          #    failure is indistinguishable from a broken dependency, and this
-          #    one cost four releases.
-          #
-          # Fixed by matching what nedbd does five lines above -- explicit
-          # target, explicit path -- and by checking each step so a failure
-          # says which one. Scoped deliberately: `set -e` is NOT applied to
-          # the whole script, because that would convert every other latent
-          # failure in it into a hard release stop in the same change.
-          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
-          if ! ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ); then
-            echo "ERROR: nesql failed to build for $RUST_TARGET" >&2
-            exit 1
-          fi
-          if [ ! -f "$NESQL_SRC" ]; then
-            echo "ERROR: nesql built but $NESQL_SRC is absent. Contents of rust/target/$RUST_TARGET/release:" >&2
-            ls -la "rust/target/$RUST_TARGET/release" 2>&1 | head -30 >&2
-            exit 1
-          fi
-          cp "$NESQL_SRC" nesql-darwin-arm64
-          chmod +x nesql-darwin-arm64
-          # Assert the ARCHITECTURE, not just that a file exists. The bare
-          # build would have produced a running arm64 binary here and the
-          # version smoke below would have passed it -- on the Intel leg that
-          # is precisely the wrong answer arriving green.
-          file nesql-darwin-arm64
-          case "$RUST_TARGET" in
-            x86_64-apple-darwin)
-              file nesql-darwin-arm64 | grep -q "x86_64" \
-                || { echo "ERROR: nesql-darwin-arm64 is not x86_64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-            aarch64-apple-darwin)
-              file nesql-darwin-arm64 | grep -q "arm64" \
-                || { echo "ERROR: nesql-darwin-arm64 is not arm64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-          esac
-          # A binary that builds can still panic on startup, and `cargo test`
-          # never executes main. Only runnable natively.
-          if [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
-            ./nesql-darwin-arm64 version
-          else
-            echo "  (startup check skipped -- x86_64 binary cross-built on an arm64 runner)"
-          fi
-          if ! gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber; then
-            echo "ERROR: failed to upload nesql-darwin-arm64 to release $TAG" >&2
-            exit 1
-          fi
-          echo "nesql-darwin-arm64 uploaded to $TAG"
           # _native extension (so pypi fat-wheel includes it for Mac users)
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -933,9 +941,91 @@ workflows:
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
 
+           # ── nesql CLI binary — LAST on purpose ─────────────────────────────
+          #
+          # This block used to sit directly after the nedbd upload, and its
+          # hard `exit 1` then aborted the script before the `_native` and
+          # `.node` uploads below. v9.0.1 shipped with NO darwin `.node`
+          # assets at all for exactly that reason -- a missing CLI cost Mac
+          # npm users their ADDON, which is strictly worse than the bug being
+          # fixed. Failing loudly was right; failing loudly in the middle of a
+          # sequence of INDEPENDENT uploads was not.
+          #
+          # So it runs last and records the failure instead of
+          # short-circuiting: everything independently uploadable ships first,
+          # and the step still exits non-zero at the very end.
+          NESQL_FAILED=""
+          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
+          # Codemagic's API exposes no build log for this account -- `logUrl`
+          # is null on every action, and the artefacts zip carries only the
+          # addon -- so a diagnosis has to survive as an ARTEFACT or it does
+          # not survive at all. Hence the tee'd log, uploaded to the release
+          # below whether this succeeds or fails.
+          {
+            echo "=== nesql staging for $RUST_TARGET ==="
+            ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ) 2>&1
+            echo "cargo exit: $?"
+            echo "--- expected: $NESQL_SRC ---"
+            ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
+          } > nesql-build-arm64.log 2>&1 || true
+          if [ ! -f "$NESQL_SRC" ]; then
+            echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
+            tail -40 nesql-build-arm64.log >&2
+            NESQL_FAILED="build"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            cp "$NESQL_SRC" nesql-darwin-arm64
+            chmod +x nesql-darwin-arm64
+            # Assert the ARCHITECTURE, not merely that a file exists: the old
+            # bare build produced a RUNNING arm64 binary that the version
+            # smoke passed happily while being the wrong answer on Intel.
+            #
+            # `file -b` is load-bearing. Plain `file X` prints "X: <desc>",
+            # so `file nesql-darwin-arm64 | grep -q arm64` matches the
+            # FILENAME and the assertion is vacuous -- it passes for any
+            # architecture whatsoever. The Intel leg only escaped because the
+            # file is named `-x64` while the check greps `x86_64`. Caught by
+            # simulating a wrong-arch binary, which exited 0. `-b` drops the
+            # filename so the match is against the description alone.
+            WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
+            file -b nesql-darwin-arm64 | tee -a nesql-build-arm64.log
+            if ! file -b nesql-darwin-arm64 | grep -q "$WANT"; then
+              echo "ERROR: nesql-darwin-arm64 is not $WANT -- refusing to ship the wrong arch" >&2
+              NESQL_FAILED="arch"
+            fi
+          fi
+          if [ -z "$NESQL_FAILED" ] && [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
+            ./nesql-darwin-arm64 version || NESQL_FAILED="startup"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            if gh release upload "$TAG" nesql-darwin-arm64 --repo Eth-Interchained/nedb --clobber; then
+              echo "nesql-darwin-arm64 uploaded to $TAG"
+            else
+              NESQL_FAILED="upload"
+            fi
+          fi
+          gh release upload "$TAG" nesql-build-arm64.log --repo Eth-Interchained/nedb --clobber || true
+          if [ -n "$NESQL_FAILED" ]; then
+            echo "ERROR: nesql-darwin-arm64 did not ship (stage: $NESQL_FAILED)." >&2
+            echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
+            echo "       Full build output: nesql-build-arm64.log, attached to release $TAG." >&2
+            exit 1
+          fi
     artifacts:
       - dist/*.whl
       - "*.node"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account -- every action's `logUrl` is null -- so this is the only way
+      # a failed nesql stage can be read after the fact. It is an artefact
+      # here AS WELL AS a release asset because the release upload can itself
+      # be the thing that failed.
+      - "nesql-build-*.log"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account (every action's `logUrl` is null), so this is the ONLY way a
+      # failed nesql stage can be read after the fact -- and the upload
+      # branch below can itself be the thing that failed, which is why the
+      # log is an artefact here as well as a release asset.
+      - "nesql-build-*.log"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
 
@@ -1043,70 +1133,6 @@ workflows:
           # nedbd-v2 server binary
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
-          # ── nesql CLI binary ───────────────────────────────────────────────
-          #
-          # THREE defects lived in the four lines this replaces, and together
-          # they shipped npm a CLI-less package from v8.0.0 to v9.0.0 while
-          # every build reported success:
-          #
-          # 1. The build was BARE -- the only cargo invocation in this file
-          #    without `--target $RUST_TARGET`. On the Intel legs that builds
-          #    for the arm64 HOST and names the result `nesql-darwin-x64`, so
-          #    a success would have shipped the wrong architecture to Intel
-          #    Macs. On every leg it also targets a different target-dir than
-          #    the nedbd build just populated, so nothing was cached and the
-          #    compile could not finish inside the 3.3s the step actually took.
-          # 2. `cp rust/target/release/nesql` therefore read a path that does
-          #    not exist, and this script has no `set -e`, so the failure
-          #    continued into `chmod`, the smoke, and the upload -- all of
-          #    which failed too.
-          # 3. The step's exit status came from the trailing `|| true` loops
-          #    below, so it reported SUCCESS with no asset uploaded. A silent
-          #    failure is indistinguishable from a broken dependency, and this
-          #    one cost four releases.
-          #
-          # Fixed by matching what nedbd does five lines above -- explicit
-          # target, explicit path -- and by checking each step so a failure
-          # says which one. Scoped deliberately: `set -e` is NOT applied to
-          # the whole script, because that would convert every other latent
-          # failure in it into a hard release stop in the same change.
-          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
-          if ! ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ); then
-            echo "ERROR: nesql failed to build for $RUST_TARGET" >&2
-            exit 1
-          fi
-          if [ ! -f "$NESQL_SRC" ]; then
-            echo "ERROR: nesql built but $NESQL_SRC is absent. Contents of rust/target/$RUST_TARGET/release:" >&2
-            ls -la "rust/target/$RUST_TARGET/release" 2>&1 | head -30 >&2
-            exit 1
-          fi
-          cp "$NESQL_SRC" nesql-darwin-x64
-          chmod +x nesql-darwin-x64
-          # Assert the ARCHITECTURE, not just that a file exists. The bare
-          # build would have produced a running arm64 binary here and the
-          # version smoke below would have passed it -- on the Intel leg that
-          # is precisely the wrong answer arriving green.
-          file nesql-darwin-x64
-          case "$RUST_TARGET" in
-            x86_64-apple-darwin)
-              file nesql-darwin-x64 | grep -q "x86_64" \
-                || { echo "ERROR: nesql-darwin-x64 is not x86_64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-            aarch64-apple-darwin)
-              file nesql-darwin-x64 | grep -q "arm64" \
-                || { echo "ERROR: nesql-darwin-x64 is not arm64 -- refusing to ship the wrong arch" >&2; exit 1; } ;;
-          esac
-          # A binary that builds can still panic on startup, and `cargo test`
-          # never executes main. Only runnable natively.
-          if [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
-            ./nesql-darwin-x64 version
-          else
-            echo "  (startup check skipped -- x86_64 binary cross-built on an arm64 runner)"
-          fi
-          if ! gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber; then
-            echo "ERROR: failed to upload nesql-darwin-x64 to release $TAG" >&2
-            exit 1
-          fi
-          echo "nesql-darwin-x64 uploaded to $TAG"
           # _native extension
           python3 scripts/extract_native.py "dist/*.whl" native-ext
           cp native-ext/nedb/_native* . 2>/dev/null || true
@@ -1118,9 +1144,91 @@ workflows:
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
 
+           # ── nesql CLI binary — LAST on purpose ─────────────────────────────
+          #
+          # This block used to sit directly after the nedbd upload, and its
+          # hard `exit 1` then aborted the script before the `_native` and
+          # `.node` uploads below. v9.0.1 shipped with NO darwin `.node`
+          # assets at all for exactly that reason -- a missing CLI cost Mac
+          # npm users their ADDON, which is strictly worse than the bug being
+          # fixed. Failing loudly was right; failing loudly in the middle of a
+          # sequence of INDEPENDENT uploads was not.
+          #
+          # So it runs last and records the failure instead of
+          # short-circuiting: everything independently uploadable ships first,
+          # and the step still exits non-zero at the very end.
+          NESQL_FAILED=""
+          NESQL_SRC="rust/target/$RUST_TARGET/release/nesql"
+          # Codemagic's API exposes no build log for this account -- `logUrl`
+          # is null on every action, and the artefacts zip carries only the
+          # addon -- so a diagnosis has to survive as an ARTEFACT or it does
+          # not survive at all. Hence the tee'd log, uploaded to the release
+          # below whether this succeeds or fails.
+          {
+            echo "=== nesql staging for $RUST_TARGET ==="
+            ( cd rust && cargo build --release --bin nesql --package nesql --target "$RUST_TARGET" ) 2>&1
+            echo "cargo exit: $?"
+            echo "--- expected: $NESQL_SRC ---"
+            ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
+          } > nesql-build-x64.log 2>&1 || true
+          if [ ! -f "$NESQL_SRC" ]; then
+            echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
+            tail -40 nesql-build-x64.log >&2
+            NESQL_FAILED="build"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            cp "$NESQL_SRC" nesql-darwin-x64
+            chmod +x nesql-darwin-x64
+            # Assert the ARCHITECTURE, not merely that a file exists: the old
+            # bare build produced a RUNNING arm64 binary that the version
+            # smoke passed happily while being the wrong answer on Intel.
+            #
+            # `file -b` is load-bearing. Plain `file X` prints "X: <desc>",
+            # so `file nesql-darwin-arm64 | grep -q arm64` matches the
+            # FILENAME and the assertion is vacuous -- it passes for any
+            # architecture whatsoever. The Intel leg only escaped because the
+            # file is named `-x64` while the check greps `x86_64`. Caught by
+            # simulating a wrong-arch binary, which exited 0. `-b` drops the
+            # filename so the match is against the description alone.
+            WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
+            file -b nesql-darwin-x64 | tee -a nesql-build-x64.log
+            if ! file -b nesql-darwin-x64 | grep -q "$WANT"; then
+              echo "ERROR: nesql-darwin-x64 is not $WANT -- refusing to ship the wrong arch" >&2
+              NESQL_FAILED="arch"
+            fi
+          fi
+          if [ -z "$NESQL_FAILED" ] && [ "$RUST_TARGET" = "aarch64-apple-darwin" ]; then
+            ./nesql-darwin-x64 version || NESQL_FAILED="startup"
+          fi
+          if [ -z "$NESQL_FAILED" ]; then
+            if gh release upload "$TAG" nesql-darwin-x64 --repo Eth-Interchained/nedb --clobber; then
+              echo "nesql-darwin-x64 uploaded to $TAG"
+            else
+              NESQL_FAILED="upload"
+            fi
+          fi
+          gh release upload "$TAG" nesql-build-x64.log --repo Eth-Interchained/nedb --clobber || true
+          if [ -n "$NESQL_FAILED" ]; then
+            echo "ERROR: nesql-darwin-x64 did not ship (stage: $NESQL_FAILED)." >&2
+            echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
+            echo "       Full build output: nesql-build-x64.log, attached to release $TAG." >&2
+            exit 1
+          fi
     artifacts:
       - dist/*.whl
       - "*.node"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account -- every action's `logUrl` is null -- so this is the only way
+      # a failed nesql stage can be read after the fact. It is an artefact
+      # here AS WELL AS a release asset because the release upload can itself
+      # be the thing that failed.
+      - "nesql-build-*.log"
+      # The nesql staging log. Codemagic exposes no build log for this
+      # account (every action's `logUrl` is null), so this is the ONLY way a
+      # failed nesql stage can be read after the fact -- and the upload
+      # branch below can itself be the thing that failed, which is why the
+      # log is an artefact here as well as a release asset.
+      - "nesql-build-*.log"
 
   # ── neSQL CLI on Apple hardware ───────────────────────────────────────
   #
