@@ -115,6 +115,45 @@ def main() -> int:
               "every binary beside it" % files)
     check("nesql.js itself is packed", "nesql.js" in files)
 
+    print("\n── the npm wait must gate on the nesql binaries, not the addons ──")
+    # npm 10.30.90 shipped nesql-darwin-arm64 and NO nesql-darwin-x64. The
+    # wait loop gated on any `darwin-x64` asset, which `nedb.darwin-x64.node`
+    # satisfies -- and once the nesql stage moved to the END of Codemagic's
+    # script, the addon started landing FIRST. The gate passed at 00:16:19,
+    # npm published at 00:16:25, and nesql-darwin-x64 arrived at 00:16:41.
+    #
+    # A 16-second race is not something a human re-reads the workflow and
+    # spots, so it is asserted: the wait must name the nesql assets exactly.
+    wait_ok = ('"nesql-darwin-arm64"' in rel) and ('"nesql-darwin-x64"' in rel)
+    check("the Mac wait names both nesql binaries exactly", wait_ok,
+          why="the wait loop must grep for '\"nesql-darwin-arm64\"' and "
+              "'\"nesql-darwin-x64\"'. Gating on a looser darwin pattern "
+              "matches the .node addons, which now upload BEFORE nesql -- "
+              "that is the v10.30.90 race that shipped npm without the "
+              "Intel Mac CLI")
+
+    print("\n── no build log may ship inside the npm package ──")
+    # The diagnostic log added for the Mac failures was named
+    # `nesql-build-<arch>.log`, which `files: ["nesql-*"]` happily packed --
+    # so npm 10.30.90 carried 1.3KB of CI build output. Harmless but sloppy,
+    # and the fix (rename outside the glob) is the kind of thing that silently
+    # regresses the next time someone names a log.
+    cm = read("codemagic.yaml")
+    # Only files the pipeline actually WRITES or uploads -- anchored on the
+    # redirection and on `gh release upload`. A bare `\S+\.log` also matched
+    # `console.log` from unrelated JS, which passed but made the output lie
+    # about what it was checking.
+    logs = set(re.findall(r'>\s*([A-Za-z0-9_.-]+\.log)', cm))
+    logs |= set(re.findall(r'gh release upload "\$TAG" ([A-Za-z0-9_.-]+\.log)', cm))
+    for lg in sorted(logs):
+        packed = any(
+            lg.startswith(f[:-1]) if f.endswith("*") else lg == f
+            for f in files
+        )
+        check("%s stays out of the npm tarball" % lg, not packed,
+              why="it matches an entry in package.json files[] (%s), so npm "
+                  "packs CI build output into a public package" % files)
+
     print("\n── the shim must not promise a reinstall as the remedy ──")
     # `npm install --force` cannot conjure a binary no version ever shipped,
     # and suggesting it sent the first reporter down a dead end.

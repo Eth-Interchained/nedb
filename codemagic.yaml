@@ -163,7 +163,7 @@ workflows:
           # cargo build was put here.
           #
           # THIS IS THE ORIGINAL v8.0.0-v9.0.0 DEFECT, finally read from a
-          # log rather than inferred. v9.0.2's nesql-build-arm64.log says:
+          # log rather than inferred. v9.0.2's codemagic-nesql-arm64.log says:
           #
           #     line 51: cargo: command not found
           #     cargo exit: 127
@@ -201,10 +201,10 @@ workflows:
             echo "cargo exit: $?"
             echo "--- expected: $NESQL_SRC ---"
             ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
-          } > nesql-build-arm64.log 2>&1 || true
+          } > codemagic-nesql-arm64.log 2>&1 || true
           if [ ! -f "$NESQL_SRC" ]; then
             echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
-            tail -40 nesql-build-arm64.log >&2
+            tail -40 codemagic-nesql-arm64.log >&2
             NESQL_FAILED="build"
           fi
           if [ -z "$NESQL_FAILED" ]; then
@@ -222,7 +222,7 @@ workflows:
             # simulating a wrong-arch binary, which exited 0. `-b` drops the
             # filename so the match is against the description alone.
             WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
-            file -b nesql-darwin-arm64 | tee -a nesql-build-arm64.log
+            file -b nesql-darwin-arm64 | tee -a codemagic-nesql-arm64.log
             if ! file -b nesql-darwin-arm64 | grep -q "$WANT"; then
               echo "ERROR: nesql-darwin-arm64 is not $WANT -- refusing to ship the wrong arch" >&2
               NESQL_FAILED="arch"
@@ -238,11 +238,11 @@ workflows:
               NESQL_FAILED="upload"
             fi
           fi
-          gh release upload "$TAG" nesql-build-arm64.log --repo Eth-Interchained/nedb --clobber || true
+          gh release upload "$TAG" codemagic-nesql-arm64.log --repo Eth-Interchained/nedb --clobber || true
           if [ -n "$NESQL_FAILED" ]; then
             echo "ERROR: nesql-darwin-arm64 did not ship (stage: $NESQL_FAILED)." >&2
             echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
-            echo "       Full build output: nesql-build-arm64.log, attached to release $TAG." >&2
+            echo "       Full build output: codemagic-nesql-arm64.log, attached to release $TAG." >&2
             exit 1
           fi
     artifacts:
@@ -253,13 +253,13 @@ workflows:
       # a failed nesql stage can be read after the fact. It is an artefact
       # here AS WELL AS a release asset because the release upload can itself
       # be the thing that failed.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
       # The nesql staging log. Codemagic exposes no build log for this
       # account (every action's `logUrl` is null), so this is the ONLY way a
       # failed nesql stage can be read after the fact -- and the upload
       # branch below can itself be the thing that failed, which is why the
       # log is an artefact here as well as a release asset.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
   macos-intel-wheel:
@@ -398,7 +398,7 @@ workflows:
           # cargo build was put here.
           #
           # THIS IS THE ORIGINAL v8.0.0-v9.0.0 DEFECT, finally read from a
-          # log rather than inferred. v9.0.2's nesql-build-arm64.log says:
+          # log rather than inferred. v9.0.2's codemagic-nesql-arm64.log says:
           #
           #     line 51: cargo: command not found
           #     cargo exit: 127
@@ -436,10 +436,10 @@ workflows:
             echo "cargo exit: $?"
             echo "--- expected: $NESQL_SRC ---"
             ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
-          } > nesql-build-x64.log 2>&1 || true
+          } > codemagic-nesql-x64.log 2>&1 || true
           if [ ! -f "$NESQL_SRC" ]; then
             echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
-            tail -40 nesql-build-x64.log >&2
+            tail -40 codemagic-nesql-x64.log >&2
             NESQL_FAILED="build"
           fi
           if [ -z "$NESQL_FAILED" ]; then
@@ -457,7 +457,7 @@ workflows:
             # simulating a wrong-arch binary, which exited 0. `-b` drops the
             # filename so the match is against the description alone.
             WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
-            file -b nesql-darwin-x64 | tee -a nesql-build-x64.log
+            file -b nesql-darwin-x64 | tee -a codemagic-nesql-x64.log
             if ! file -b nesql-darwin-x64 | grep -q "$WANT"; then
               echo "ERROR: nesql-darwin-x64 is not $WANT -- refusing to ship the wrong arch" >&2
               NESQL_FAILED="arch"
@@ -473,11 +473,11 @@ workflows:
               NESQL_FAILED="upload"
             fi
           fi
-          gh release upload "$TAG" nesql-build-x64.log --repo Eth-Interchained/nedb --clobber || true
+          gh release upload "$TAG" codemagic-nesql-x64.log --repo Eth-Interchained/nedb --clobber || true
           if [ -n "$NESQL_FAILED" ]; then
             echo "ERROR: nesql-darwin-x64 did not ship (stage: $NESQL_FAILED)." >&2
             echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
-            echo "       Full build output: nesql-build-x64.log, attached to release $TAG." >&2
+            echo "       Full build output: codemagic-nesql-x64.log, attached to release $TAG." >&2
             exit 1
           fi
     artifacts:
@@ -488,13 +488,13 @@ workflows:
       # a failed nesql stage can be read after the fact. It is an artefact
       # here AS WELL AS a release asset because the release upload can itself
       # be the thing that failed.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
       # The nesql staging log. Codemagic exposes no build log for this
       # account (every action's `logUrl` is null), so this is the ONLY way a
       # failed nesql stage can be read after the fact -- and the upload
       # branch below can itself be the thing that failed, which is why the
       # log is an artefact here as well as a release asset.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
 
   cryptodb-macos-arm64-wheel:
     name: "cryptoDB wheel — macOS arm64"
@@ -632,7 +632,7 @@ workflows:
           # cargo build was put here.
           #
           # THIS IS THE ORIGINAL v8.0.0-v9.0.0 DEFECT, finally read from a
-          # log rather than inferred. v9.0.2's nesql-build-arm64.log says:
+          # log rather than inferred. v9.0.2's codemagic-nesql-arm64.log says:
           #
           #     line 51: cargo: command not found
           #     cargo exit: 127
@@ -670,10 +670,10 @@ workflows:
             echo "cargo exit: $?"
             echo "--- expected: $NESQL_SRC ---"
             ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
-          } > nesql-build-arm64.log 2>&1 || true
+          } > codemagic-nesql-arm64.log 2>&1 || true
           if [ ! -f "$NESQL_SRC" ]; then
             echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
-            tail -40 nesql-build-arm64.log >&2
+            tail -40 codemagic-nesql-arm64.log >&2
             NESQL_FAILED="build"
           fi
           if [ -z "$NESQL_FAILED" ]; then
@@ -691,7 +691,7 @@ workflows:
             # simulating a wrong-arch binary, which exited 0. `-b` drops the
             # filename so the match is against the description alone.
             WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
-            file -b nesql-darwin-arm64 | tee -a nesql-build-arm64.log
+            file -b nesql-darwin-arm64 | tee -a codemagic-nesql-arm64.log
             if ! file -b nesql-darwin-arm64 | grep -q "$WANT"; then
               echo "ERROR: nesql-darwin-arm64 is not $WANT -- refusing to ship the wrong arch" >&2
               NESQL_FAILED="arch"
@@ -707,11 +707,11 @@ workflows:
               NESQL_FAILED="upload"
             fi
           fi
-          gh release upload "$TAG" nesql-build-arm64.log --repo Eth-Interchained/nedb --clobber || true
+          gh release upload "$TAG" codemagic-nesql-arm64.log --repo Eth-Interchained/nedb --clobber || true
           if [ -n "$NESQL_FAILED" ]; then
             echo "ERROR: nesql-darwin-arm64 did not ship (stage: $NESQL_FAILED)." >&2
             echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
-            echo "       Full build output: nesql-build-arm64.log, attached to release $TAG." >&2
+            echo "       Full build output: codemagic-nesql-arm64.log, attached to release $TAG." >&2
             exit 1
           fi
     artifacts:
@@ -722,13 +722,13 @@ workflows:
       # a failed nesql stage can be read after the fact. It is an artefact
       # here AS WELL AS a release asset because the release upload can itself
       # be the thing that failed.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
       # The nesql staging log. Codemagic exposes no build log for this
       # account (every action's `logUrl` is null), so this is the ONLY way a
       # failed nesql stage can be read after the fact -- and the upload
       # branch below can itself be the thing that failed, which is why the
       # log is an artefact here as well as a release asset.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
 
@@ -870,7 +870,7 @@ workflows:
           # cargo build was put here.
           #
           # THIS IS THE ORIGINAL v8.0.0-v9.0.0 DEFECT, finally read from a
-          # log rather than inferred. v9.0.2's nesql-build-arm64.log says:
+          # log rather than inferred. v9.0.2's codemagic-nesql-arm64.log says:
           #
           #     line 51: cargo: command not found
           #     cargo exit: 127
@@ -908,10 +908,10 @@ workflows:
             echo "cargo exit: $?"
             echo "--- expected: $NESQL_SRC ---"
             ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
-          } > nesql-build-x64.log 2>&1 || true
+          } > codemagic-nesql-x64.log 2>&1 || true
           if [ ! -f "$NESQL_SRC" ]; then
             echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
-            tail -40 nesql-build-x64.log >&2
+            tail -40 codemagic-nesql-x64.log >&2
             NESQL_FAILED="build"
           fi
           if [ -z "$NESQL_FAILED" ]; then
@@ -929,7 +929,7 @@ workflows:
             # simulating a wrong-arch binary, which exited 0. `-b` drops the
             # filename so the match is against the description alone.
             WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
-            file -b nesql-darwin-x64 | tee -a nesql-build-x64.log
+            file -b nesql-darwin-x64 | tee -a codemagic-nesql-x64.log
             if ! file -b nesql-darwin-x64 | grep -q "$WANT"; then
               echo "ERROR: nesql-darwin-x64 is not $WANT -- refusing to ship the wrong arch" >&2
               NESQL_FAILED="arch"
@@ -945,11 +945,11 @@ workflows:
               NESQL_FAILED="upload"
             fi
           fi
-          gh release upload "$TAG" nesql-build-x64.log --repo Eth-Interchained/nedb --clobber || true
+          gh release upload "$TAG" codemagic-nesql-x64.log --repo Eth-Interchained/nedb --clobber || true
           if [ -n "$NESQL_FAILED" ]; then
             echo "ERROR: nesql-darwin-x64 did not ship (stage: $NESQL_FAILED)." >&2
             echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
-            echo "       Full build output: nesql-build-x64.log, attached to release $TAG." >&2
+            echo "       Full build output: codemagic-nesql-x64.log, attached to release $TAG." >&2
             exit 1
           fi
     artifacts:
@@ -960,13 +960,13 @@ workflows:
       # a failed nesql stage can be read after the fact. It is an artefact
       # here AS WELL AS a release asset because the release upload can itself
       # be the thing that failed.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
       # The nesql staging log. Codemagic exposes no build log for this
       # account (every action's `logUrl` is null), so this is the ONLY way a
       # failed nesql stage can be read after the fact -- and the upload
       # branch below can itself be the thing that failed, which is why the
       # log is an artefact here as well as a release asset.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
 
   nitrodb-macos-arm64-wheel:
     name: "nitroDB wheel — macOS arm64"
@@ -1104,7 +1104,7 @@ workflows:
           # cargo build was put here.
           #
           # THIS IS THE ORIGINAL v8.0.0-v9.0.0 DEFECT, finally read from a
-          # log rather than inferred. v9.0.2's nesql-build-arm64.log says:
+          # log rather than inferred. v9.0.2's codemagic-nesql-arm64.log says:
           #
           #     line 51: cargo: command not found
           #     cargo exit: 127
@@ -1142,10 +1142,10 @@ workflows:
             echo "cargo exit: $?"
             echo "--- expected: $NESQL_SRC ---"
             ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
-          } > nesql-build-arm64.log 2>&1 || true
+          } > codemagic-nesql-arm64.log 2>&1 || true
           if [ ! -f "$NESQL_SRC" ]; then
             echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
-            tail -40 nesql-build-arm64.log >&2
+            tail -40 codemagic-nesql-arm64.log >&2
             NESQL_FAILED="build"
           fi
           if [ -z "$NESQL_FAILED" ]; then
@@ -1163,7 +1163,7 @@ workflows:
             # simulating a wrong-arch binary, which exited 0. `-b` drops the
             # filename so the match is against the description alone.
             WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
-            file -b nesql-darwin-arm64 | tee -a nesql-build-arm64.log
+            file -b nesql-darwin-arm64 | tee -a codemagic-nesql-arm64.log
             if ! file -b nesql-darwin-arm64 | grep -q "$WANT"; then
               echo "ERROR: nesql-darwin-arm64 is not $WANT -- refusing to ship the wrong arch" >&2
               NESQL_FAILED="arch"
@@ -1179,11 +1179,11 @@ workflows:
               NESQL_FAILED="upload"
             fi
           fi
-          gh release upload "$TAG" nesql-build-arm64.log --repo Eth-Interchained/nedb --clobber || true
+          gh release upload "$TAG" codemagic-nesql-arm64.log --repo Eth-Interchained/nedb --clobber || true
           if [ -n "$NESQL_FAILED" ]; then
             echo "ERROR: nesql-darwin-arm64 did not ship (stage: $NESQL_FAILED)." >&2
             echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
-            echo "       Full build output: nesql-build-arm64.log, attached to release $TAG." >&2
+            echo "       Full build output: codemagic-nesql-arm64.log, attached to release $TAG." >&2
             exit 1
           fi
     artifacts:
@@ -1194,13 +1194,13 @@ workflows:
       # a failed nesql stage can be read after the fact. It is an artefact
       # here AS WELL AS a release asset because the release upload can itself
       # be the thing that failed.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
       # The nesql staging log. Codemagic exposes no build log for this
       # account (every action's `logUrl` is null), so this is the ONLY way a
       # failed nesql stage can be read after the fact -- and the upload
       # branch below can itself be the thing that failed, which is why the
       # log is an artefact here as well as a release asset.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
 
@@ -1342,7 +1342,7 @@ workflows:
           # cargo build was put here.
           #
           # THIS IS THE ORIGINAL v8.0.0-v9.0.0 DEFECT, finally read from a
-          # log rather than inferred. v9.0.2's nesql-build-arm64.log says:
+          # log rather than inferred. v9.0.2's codemagic-nesql-arm64.log says:
           #
           #     line 51: cargo: command not found
           #     cargo exit: 127
@@ -1380,10 +1380,10 @@ workflows:
             echo "cargo exit: $?"
             echo "--- expected: $NESQL_SRC ---"
             ls -la "rust/target/$RUST_TARGET/release/" 2>&1 | head -40
-          } > nesql-build-x64.log 2>&1 || true
+          } > codemagic-nesql-x64.log 2>&1 || true
           if [ ! -f "$NESQL_SRC" ]; then
             echo "ERROR: nesql absent at $NESQL_SRC after build" >&2
-            tail -40 nesql-build-x64.log >&2
+            tail -40 codemagic-nesql-x64.log >&2
             NESQL_FAILED="build"
           fi
           if [ -z "$NESQL_FAILED" ]; then
@@ -1401,7 +1401,7 @@ workflows:
             # simulating a wrong-arch binary, which exited 0. `-b` drops the
             # filename so the match is against the description alone.
             WANT="arm64"; [ "$RUST_TARGET" = "x86_64-apple-darwin" ] && WANT="x86_64"
-            file -b nesql-darwin-x64 | tee -a nesql-build-x64.log
+            file -b nesql-darwin-x64 | tee -a codemagic-nesql-x64.log
             if ! file -b nesql-darwin-x64 | grep -q "$WANT"; then
               echo "ERROR: nesql-darwin-x64 is not $WANT -- refusing to ship the wrong arch" >&2
               NESQL_FAILED="arch"
@@ -1417,11 +1417,11 @@ workflows:
               NESQL_FAILED="upload"
             fi
           fi
-          gh release upload "$TAG" nesql-build-x64.log --repo Eth-Interchained/nedb --clobber || true
+          gh release upload "$TAG" codemagic-nesql-x64.log --repo Eth-Interchained/nedb --clobber || true
           if [ -n "$NESQL_FAILED" ]; then
             echo "ERROR: nesql-darwin-x64 did not ship (stage: $NESQL_FAILED)." >&2
             echo "       Every OTHER artifact in this step was uploaded; only nesql is missing." >&2
-            echo "       Full build output: nesql-build-x64.log, attached to release $TAG." >&2
+            echo "       Full build output: codemagic-nesql-x64.log, attached to release $TAG." >&2
             exit 1
           fi
     artifacts:
@@ -1432,13 +1432,13 @@ workflows:
       # a failed nesql stage can be read after the fact. It is an artefact
       # here AS WELL AS a release asset because the release upload can itself
       # be the thing that failed.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
       # The nesql staging log. Codemagic exposes no build log for this
       # account (every action's `logUrl` is null), so this is the ONLY way a
       # failed nesql stage can be read after the fact -- and the upload
       # branch below can itself be the thing that failed, which is why the
       # log is an artefact here as well as a release asset.
-      - "nesql-build-*.log"
+      - "codemagic-nesql-*.log"
 
   # ── neSQL CLI on Apple hardware ───────────────────────────────────────
   #

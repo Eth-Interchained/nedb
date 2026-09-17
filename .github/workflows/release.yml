@@ -668,12 +668,40 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ github.ref_name }}"
-          echo "Polling GitHub release for Mac .node binaries..."
+          # ── what this waits FOR, and why it changed ─────────────────────────
+          #
+          # This used to gate on any asset matching `darwin-arm64` /
+          # `darwin-x64`, which the `.node` addons satisfy. That was correct
+          # only while Codemagic uploaded nesql BEFORE the addons: the addon
+          # landing implied nesql had already landed.
+          #
+          # #177 moved the nesql stage to the END of Codemagic's upload script
+          # (so a nesql failure could not abort the addon uploads). Correct in
+          # itself, and it inverted the order this gate depends on. On
+          # v10.30.90 the consequence was exact:
+          #
+          #   00:16:00  nedb.darwin-x64.node uploaded
+          #   00:16:19  this gate passed
+          #   00:16:25  npm published
+          #   00:16:41  nesql-darwin-x64 uploaded   <-- 16s too late
+          #
+          # So npm 10.30.90 shipped nesql-darwin-arm64 and NO
+          # nesql-darwin-x64, and an Intel Mac still got exit 5 -- the exact
+          # bug this whole chain set out to fix.
+          #
+          # Gate on the nesql binaries by EXACT name instead. They are now the
+          # last things Codemagic uploads, so waiting for them implies every
+          # earlier asset has landed. Naming them exactly also means a rename
+          # on either side fails the wait instead of silently publishing an
+          # incomplete package.
+          echo "Polling GitHub release for the Mac nesql binaries (last assets Codemagic uploads)..."
           for i in $(seq 1 35); do
             ASSETS=$(gh release view "$VERSION" --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
-            ARM=$(echo "$ASSETS" | grep -c "darwin-arm64" || true)
-            X86=$(echo "$ASSETS" | grep -c "darwin-x64" || true)
-            echo "  Attempt $i/35 — arm64=$ARM x86_64=$X86"
+            ARM=$(echo "$ASSETS" | grep -c '"nesql-darwin-arm64"' || true)
+            X86=$(echo "$ASSETS" | grep -c '"nesql-darwin-x64"' || true)
+            NARM=$(echo "$ASSETS" | grep -c "darwin-arm64" || true)
+            NX86=$(echo "$ASSETS" | grep -c "darwin-x64" || true)
+            echo "  Attempt $i/35 — nesql arm64=$ARM x86_64=$X86  (any darwin asset: $NARM/$NX86)"
             if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
               echo "Mac binaries found — downloading .node + nedbd-v2"
               gh release download "$VERSION" --pattern "*.node" --dir . --clobber
