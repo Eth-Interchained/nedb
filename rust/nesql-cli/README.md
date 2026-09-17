@@ -50,6 +50,7 @@ rejection.
 
 ```sql
 SELECT who FROM orders AS OF SYSTEM TIME 412      -- the exact state at a sequence
+SELECT who FROM orders AS OF 412                  -- shorthand, same SQL projection
 SELECT who FROM orders VALID AS OF '2026-01-01'   -- what was BELIEVED TRUE then
 SELECT who FROM orders SEARCH 'acme'              -- full text over the document
 SELECT who FROM orders TRACE caused_by            -- the causal chain that produced it
@@ -65,7 +66,14 @@ SELECT o.who FROM orders SEARCH 'acme' o JOIN orders n ON o._id = n._id
 ## Built for scripts as much as for people
 
 `--json` emits exactly one JSON object on stdout. Engine diagnostics go to
-stderr, so a pipe stays clean. The exit code carries the verdict:
+stderr, so a pipe stays clean.
+
+Argument errors also use this envelope (`command: "parse"`, `status: "usage"`,
+exit `2`) before any database is opened. Without `--json`, errors remain text
+on stderr. Conflicting `--json --human` flags are reported as text; `--json`
+after `--` or supplied as a flag's value is an operand, not a format request.
+
+The exit code carries the verdict:
 
 | code | meaning |
 | --- | --- |

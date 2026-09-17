@@ -4,11 +4,8 @@
 
 //! `nesql` — argv in, exit code out.
 //!
-//! Everything interesting happens in the library, which is why this file is
-//! short and why the integration tests never spawn the binary: they call the
-//! same functions with the same arguments and assert on the same `Report`.
-//! What is left here is the part a test cannot reach — process arguments,
-//! stdout, stderr, and the exit code.
+//! Command tests exercise the library's reports; process tests cover argument
+//! failures, stdout, stderr, and exit codes at this boundary.
 
 use std::process::ExitCode;
 
@@ -25,12 +22,14 @@ fn main() -> ExitCode {
     let inv = match args::parse(&argv) {
         Ok(i) => i,
         Err(e) => {
-            // The format flag lives inside the thing that failed to parse, so
-            // there is no honest way to know whether the caller wanted JSON.
-            // Usage errors therefore go to stderr as text — a machine reading
-            // stdout gets nothing rather than something it might parse as a
-            // result.
-            eprintln!("{}", Report::usage(e.0).human);
+            let report = Report::usage(e.0);
+            if args::usage_is_json(&argv) {
+                // No command was resolved. Use a stable parse-stage name,
+                // and the same envelope as errors after command dispatch.
+                println!("{}", report.render("parse", Format::Json));
+            } else {
+                eprintln!("{}", report.human);
+            }
             return ExitCode::from(Exit::Usage.code() as u8);
         }
     };

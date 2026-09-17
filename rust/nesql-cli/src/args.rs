@@ -237,6 +237,30 @@ fn takes_value(flag: &str) -> bool {
     matches!(flag, "--db" | "--limit" | "--since" | "--at" | "--message")
 }
 
+/// Recover an unambiguous output preference even when parsing fails. Follow
+/// the lexer's value boundaries and `--` terminator: a path or operand named
+/// `--json` is not an output flag. Conflicting formats retain human errors.
+pub fn usage_is_json(argv: &[String]) -> bool {
+    let mut json = false;
+    let mut human = false;
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        match arg.as_str() {
+            "--json" => json = true,
+            "--human" => human = true,
+            _ => {
+                if takes_value(arg) {
+                    args.next();
+                }
+            }
+        }
+    }
+    json && !human
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
     Flag { name: String, value: Option<String> },

@@ -577,3 +577,28 @@ fn diff_reports_change_and_refuses_a_pruned_range() {
     assert_eq!(pruned.exit.code(), 3,
                "a pruned range is could-not-determine, not an empty diff");
 }
+
+#[test]
+fn historical_sql_shorthand_preserves_projection_and_expressions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed(dir.path());
+    let at = cmd::status::head_seq(&db);
+    db.put("orders", "1", serde_json::json!({"total": 999, "who": "changed"}), vec![], None, None).unwrap();
+
+    for spelling in ["AS OF", "AS OF SYSTEM TIME"] {
+        let projected = cmd::query::run(&db, &format!(
+            "SELECT who FROM orders {spelling} {at} ORDER BY total DESC"
+        ));
+        assert_eq!(projected.exit, Exit::Ok, "{}", projected.human);
+        assert_eq!(projected.body["rows"], serde_json::json!([
+            {"who": "globex"}, {"who": "acme"}
+        ]));
+        let calculated = cmd::query::run(&db, &format!(
+            "SELECT o.who AS customer, o.total + 1 AS next_total FROM orders {spelling} {at} o WHERE o.total < 200"
+        ));
+        assert_eq!(calculated.exit, Exit::Ok, "{}", calculated.human);
+        assert_eq!(calculated.body["rows"], serde_json::json!([
+            {"customer": "acme", "next_total": 101}
+        ]));
+    }
+}

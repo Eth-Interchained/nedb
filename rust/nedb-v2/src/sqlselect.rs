@@ -1368,8 +1368,11 @@ impl Parser {
         let as_of = if self.peek().is_kw("AS") && self.peek_at(1).is_kw("OF") {
             self.next();
             self.next();
-            self.expect_kw("SYSTEM")?;
-            self.expect_kw("TIME")?;
+            // The legacy `AS OF <target>` spelling must use this evaluator
+            // too: translator fallback loses SELECT projection/expressions.
+            if self.eat_kw("SYSTEM") {
+                self.expect_kw("TIME")?;
+            }
             match self.next() {
                 Tok::Num(n) if n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
                 Tok::Str(s) => Some(WallClock::parse(&s)?.as_marker()),
