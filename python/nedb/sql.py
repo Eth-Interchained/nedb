@@ -229,6 +229,11 @@ def _conditions_to_nql(conditions: List[Tuple[str, str, Any]]) -> Tuple[str, Opt
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def sql_to_nql(sql: str) -> str:
+    """The NQL translation alone. See :func:`sql_to_nql_projected`."""
+    return sql_to_nql_projected(sql)[0]
+
+
+def sql_to_nql_projected(sql: str) -> Tuple[str, Optional[List[str]]]:
     """
     Translate a SQL SELECT statement to an NQL query string.
     Raises ``SQLError`` / ``SQLUnsupportedError`` for unsupported constructs.
@@ -242,28 +247,84 @@ def sql_to_nql(sql: str) -> str:
     p = _Parser(tokens)
     p.eat_kw("SELECT")
 
-    # columns (we don't project yet — * and explicit columns both return full docs)
+    # The select list, CAPTURED rather than discarded.
+    #
+    # It used to be consumed and thrown away -- the old comment said "we don't
+    # project yet — * and explicit columns both return full docs" -- so
+    # `SELECT who FROM orders` answered with every field and the metadata too.
+    # The Rust SQL evaluator projects, so this was one dialect giving two
+    # different answers to the same query depending on which engine you asked.
+    #
+    # NQL has no projection clause, which is exactly why this belongs here:
+    # the SQL layer projects, the NQL layer reads. Same division as Rust, where
+    # the evaluator projects and `nql::query` does not.
+    projection: Optional[List[str]] = None
     if p.peek() and p.peek()[0] == "STAR":
         p.eat()
     else:
-        # consume column list until FROM
+        cols: List[str] = []
         while not p.kw("FROM"):
-            if p.peek() and p.peek()[0] == "COMMA":  # type: ignore[index]
+            if p.peek() is None:
+                raise SQLError("expected FROM after the select list")
+            if p.peek()[0] == "COMMA":  # type: ignore[index]
                 p.eat()
-            else:
-                p.eat_ident()
+                continue
+            cols.append(p.eat_ident())
+            # An alias or an expression is NOT silently projected as if it were
+            # a bare column. Returning full documents for
+            # `SELECT a + 1 AS b` would be a wrong answer wearing the shape of
+            # a right one; the Rust evaluator handles these and this translator
+            # does not, so it says so.
+            nxt = p.peek_upper()
+            if nxt == "AS" or (p.peek() and p.peek()[0] not in ("COMMA", "KW")):
+                raise SQLUnsupportedError(
+                    "the reference engine's SQL translator projects bare column "
+                    "names only; aliases and expressions need the Rust evaluator "
+                    "(nedbd, the native wheel, or the napi addon)")
+        projection = cols
 
     p.eat_kw("FROM")
     table = p.eat_ident()
 
     parts = [f"FROM {table}"]
 
-    # AS OF (NEDB extension — also accepted in SQL via the AS OF syntax)
+    # AS OF — the same shape the Rust engine accepts, so one dialect means one
+    # dialect. Three things were missing here and each of them worked in Rust:
+    #
+    #   AS OF SYSTEM TIME <n>          the SQL spelling (SYSTEM TIME is optional)
+    #   AS OF '<datetime>'             a wall-clock moment
+    #   AS OF SYSTEM TIME '<datetime>' both together
+    #
+    # Only `AS OF <n>` parsed, so a query that ran against nedbd failed against
+    # the reference engine -- and a user could not tell which half was wrong.
+    #
+    # The datetime needs no resolution machinery here: this is a TRANSLATOR to
+    # NQL, and the NQL half has always resolved a quoted datetime. Passing it
+    # through is the whole fix. (Rust needed the marker plumbing because its
+    # SQL evaluator does not route through NQL.)
     if p.kw("AS") and p.peek_upper(1) == "OF":
         p.eat_kw("AS")
         p.eat_kw("OF")
-        seq_tok = p.eat("INT")
-        parts.append(f"AS OF {seq_tok[1]}")
+        # SYSTEM TIME is optional on both engines. Accepting it only in one
+        # spelling is how `AS OF SYSTEM TIME 412` came to work on nedbd and
+        # raise here.
+        if p.peek_upper() == "SYSTEM":
+            p.eat()
+            if p.peek_upper() != "TIME":
+                raise SQLError("AS OF SYSTEM expects TIME")
+            p.eat()
+        tok = p.peek()
+        if tok is None:
+            raise SQLError("AS OF expects a sequence number or a quoted datetime")
+        if tok[0] == "INT":
+            parts.append(f"AS OF {p.eat('INT')[1]}")
+        elif tok[0] == "STRING":
+            # Re-quoted for NQL, which spells strings with double quotes. The
+            # lexer has already stripped the SQL quoting.
+            parts.append('AS OF "%s"' % str(p.eat("STRING")[1]).strip('"\''))
+        else:
+            raise SQLError(
+                "AS OF expects a sequence number or a quoted datetime, got %r" % (tok[1],))
 
     # WHERE
     search: Optional[str] = None
@@ -295,7 +356,7 @@ def sql_to_nql(sql: str) -> str:
         n = p.eat("INT")
         parts.append(f"LIMIT {n[1]}")
 
-    return " ".join(parts)
+    return " ".join(parts), projection
 
 
 def sql_exec(db: Any, sql: str) -> Any:
@@ -324,8 +385,19 @@ def sql_exec(db: Any, sql: str) -> Any:
     kw = tokens[0][1].upper()
 
     if kw == "SELECT":
-        nql = sql_to_nql(sql)
-        return db.query(nql)
+        nql, projection = sql_to_nql_projected(sql)
+        rows = db.query(nql)
+        if projection is None:
+            return rows  # SELECT * — the whole document, metadata included
+        # Narrow to the named columns, in the order they were written. A column
+        # a document does not carry is simply absent from that row rather than
+        # present-and-null: NEDB is schemaless, so "this document has no such
+        # field" and "this field is null" are different facts and the reference
+        # engine must not collapse them.
+        return [
+            {c: r[c] for c in projection if c in r}
+            for r in rows
+        ]
 
     if kw == "INSERT":
         return _exec_insert(db, _Parser(tokens))

@@ -269,6 +269,11 @@ jobs:
         run: python3 tests/test_npm_binary_parity.py
       - name: neSQL router parity — Rust and Python agree on the vocabulary
         run: python3 tests/test_nesql_parity.py
+      # Measures BOTH engines in one run (it drives cargo itself), so it needs
+      # the Rust toolchain that this job already has. It exits non-zero rather
+      # than reporting success if it can only reach one engine.
+      - name: AS OF parity — all four surfaces agree, form for form
+        run: python3 tests/test_asof_parity.py
       - name: PyPI client — nedb_client against a live nedbd
         run: python3 tests/test_client_package.py
       - name: npm client — build the artifact that actually ships

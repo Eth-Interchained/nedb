@@ -3555,40 +3555,20 @@ fn try_catalog_select(
         // OF <seq>" honestly rather than leaking a tagged marker into the
         // executor. Resolution is `Db::seq_at`: the last seq whose write-time
         // is at or before the moment, over the ts index the cold scan fills.
+        // One implementation, in `relation::resolve_as_of`. It lived here as a
+        // closure while NQL had no resolution at all -- which is why a quoted
+        // datetime worked in SQL and errored in NQL for the same store.
         let resolve_marker = |m: u64| -> Result<u64, Vec<u8>> {
-            if (m & crate::wallclock::WALL_CLOCK_FLAG) == 0 {
-                return Ok(m); // bare integer — a seq, untouched, backcompat
-            }
-            let moment = crate::wallclock::WallClock::from_marker(m)
-                .ok_or_else(|| err_msg("0A000", "invalid wall-clock marker"))?;
-            let db = db.ok_or_else(|| err_msg("0A000",
-                "AS OF SYSTEM TIME by datetime names a database; connect with one"))?;
-            if !db.ts_index_ready() {
-                return Err(err_msg("0A000",
-                    "the write-time index is not ready on this boot (warm start defers it). \
-                     Run `nedb-cli repair` or a cold scan, or AS OF a bare sequence number"));
-            }
-            match db.seq_at(moment.epoch_secs()) {
-                Some(seq) => Ok(seq),
-                None => {
-                    let floor = db.history_floor();
-                    // Distinguish "before anything" from "pruned" — the two
-                    // read differently to an operator (one is routine, the
-                    // other is the compaction tradeoff answering).
-                    if floor > 0 {
-                        Err(err_msg("0A000", &format!(
-                            "history at or before that moment is no longer available — \
-                             the store was compacted past it (history floor {}). \
-                             AS OF a bare sequence at or after the floor instead", floor)))
-                    } else {
-                        Err(err_msg("0A000", &format!(
-                            "no writes at or before that moment in this database — \
-                             nothing existed yet (the first write is at seq {}). \
-                             A timestamp answers about the past; there is no past here yet", 
-                            db.seq.load(std::sync::atomic::Ordering::SeqCst))))
-                    }
-                }
-            }
+            let db = match db {
+                Some(db) => db,
+                // Only a wall-clock marker needs a database to resolve; a bare
+                // sequence is answerable without one, so the check is ordered
+                // to keep `AS OF 5` working on a connection without a db.
+                None if (m & crate::wallclock::WALL_CLOCK_FLAG) == 0 => return Ok(m),
+                None => return Err(err_msg("0A000",
+                    "AS OF SYSTEM TIME by datetime names a database; connect with one")),
+            };
+            crate::relation::resolve_as_of(db, m).map_err(|e| err_msg("0A000", &e))
         };
         // Gather every sequence each name is read at first, INCLUDING the
         // absent one, then judge. Deciding as we walk got this wrong: the

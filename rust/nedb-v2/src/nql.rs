@@ -541,7 +541,20 @@ impl Parser {
                     self.expect_kw("OF")?;
                     match self.advance() {
                         Tok::Num(n) => q.as_of = Some(n as u64),
-                        other => bail!("AS OF expects sequence number, got {:?}", other),
+                        // A quoted datetime, accepted here because the Python
+                        // reference engine has always accepted it and the two
+                        // are one dialect. It rides the same u64 slot with
+                        // `WALL_CLOCK_FLAG` set and is resolved to a real
+                        // sequence before execution -- see `resolve_as_of_in`.
+                        Tok::Str(sx) => {
+                            let moment = crate::wallclock::WallClock::parse(&sx)
+                                .map_err(|e| anyhow::anyhow!(
+                                    "AS OF could not read {:?} as a datetime: {}", sx, e))?;
+                            q.as_of = Some(moment.as_marker());
+                        }
+                        other => bail!(
+                            "AS OF expects a sequence number or a quoted datetime, got {:?}",
+                            other),
                     }
                 }
 
@@ -1584,7 +1597,13 @@ pub fn parse(nql: &str) -> Result<Query> {
 pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
     // One parse path, shared with the public `parse()` above — so validation and
     // execution can never disagree about what is well-formed.
-    let q = parse(nql)?;
+    let mut q = parse(nql)?;
+
+    // A wall-clock AS OF becomes a real sequence HERE, before any candidate
+    // generation reads it. Placed at the top of execution rather than inside
+    // the AS OF branch so no future fast path can pick up `q.as_of` while it
+    // still holds a tagged marker.
+    resolve_as_of_in(db, &mut q)?;
 
     // ── Candidate generation ──────────────────────────────────────────────────
 
@@ -1809,6 +1828,24 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
 }
 
 /// Parse and execute NQL, returning (rows, count).
+/// Turn a parsed `AS OF` marker into a real sequence, in place.
+///
+/// Called on every parsed query before execution. The NQL executor reads
+/// `q.as_of` as a literal sequence and hands it to `Db::get_as_of`, so a
+/// wall-clock marker that reached it unresolved would be read as a sequence
+/// near 2^63 -- answering a question about the past from a point in history
+/// that does not exist, silently and with full confidence. That is strictly
+/// worse than the parse error this replaced, which is why the parser change
+/// and this one are inseparable.
+fn resolve_as_of_in(db: &Db, q: &mut Query) -> Result<()> {
+    if let Some(marker) = q.as_of {
+        q.as_of = Some(
+            crate::relation::resolve_as_of(db, marker).map_err(|e| anyhow::anyhow!("{}", e))?,
+        );
+    }
+    Ok(())
+}
+
 pub fn query(db: &Db, nql: &str) -> Result<(Vec<Value>, usize)> {
     let rows = execute(db, nql)?;
     let count = rows.len();

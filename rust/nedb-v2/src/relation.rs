@@ -184,6 +184,69 @@ pub fn read_json(db: &Db, scan: &Scan) -> Vec<Value> {
     read(db, scan).iter().map(crate::nql::node_to_json).collect()
 }
 
+/// Resolve an `AS OF` marker to a real sequence number.
+///
+/// A bare integer passes through bit-for-bit; that is the backcompat
+/// contract. A wall-clock moment arrives with `WALL_CLOCK_FLAG` set and is
+/// resolved through [`Db::seq_at`] — the last sequence whose write-time is at
+/// or before the moment.
+///
+/// # Why this is a function and not a closure in one executor
+///
+/// It WAS a closure inside the SQL executor, and NQL had no resolution at all.
+/// That split is why `FROM orders AS OF "2026-01-01"` errored in Rust while
+/// the Python reference engine accepted it: one dialect, two implementations,
+/// and only one of them taught to read a timestamp.
+///
+/// Worse than the error was the fix that looked obvious — teaching the NQL
+/// PARSER to accept a datetime without also teaching its executor to resolve
+/// the flag. The marker would then reach `get_as_of` as a literal sequence
+/// near 2^63 and the query would answer confidently from the wrong point in
+/// history. An error is recoverable; a silently wrong answer about the past is
+/// the failure this codebase exists to prevent.
+///
+/// Returns the message TEXT rather than a typed error because the two callers
+/// surface it differently (a wire `ErrorResponse` and an `anyhow` bail), and
+/// both would convert a shared enum straight back to a string.
+pub fn resolve_as_of(db: &Db, marker: u64) -> Result<u64, String> {
+    if (marker & crate::wallclock::WALL_CLOCK_FLAG) == 0 {
+        return Ok(marker); // bare integer — a seq, untouched
+    }
+    let moment = crate::wallclock::WallClock::from_marker(marker)
+        .ok_or_else(|| "invalid wall-clock marker".to_string())?;
+    if !db.ts_index_ready() {
+        return Err(
+            "the write-time index is not ready on this boot (warm start defers it). \
+             Run `nedb-cli repair` or a cold scan, or AS OF a bare sequence number"
+                .to_string(),
+        );
+    }
+    match db.seq_at(moment.epoch_secs()) {
+        Some(seq) => Ok(seq),
+        None => {
+            let floor = db.history_floor();
+            // "Before anything existed" and "pruned away" read completely
+            // differently to an operator: one is routine, the other is the
+            // compaction tradeoff answering back.
+            if floor > 0 {
+                Err(format!(
+                    "history at or before that moment is no longer available — \
+                     the store was compacted past it (history floor {}). \
+                     AS OF a bare sequence at or after the floor instead",
+                    floor
+                ))
+            } else {
+                Err(format!(
+                    "no writes at or before that moment in this database — \
+                     nothing existed yet (the first write is at seq {}). \
+                     A timestamp answers about the past; there is no past here yet",
+                    db.seq.load(std::sync::atomic::Ordering::SeqCst)
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
