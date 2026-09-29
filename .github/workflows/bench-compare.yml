@@ -1,0 +1,161 @@
+# Benchmark (head-to-head) — NEDB vs SQLite · PostgreSQL · Redis · MongoDB
+#
+# ON DEMAND ONLY. No push, no pull_request, no tag trigger: this can never
+# gate or slow a release. Dispatch it from Actions → "Benchmark (head-to-head)".
+#
+# One workload, every engine, one runner, run one after another:
+#   bench/compare.py        the workload, five adapters, the answer oracle
+#   bench/compare_report.py renders docs/BENCHMARKS.md from the JSON
+#
+# NEDB is built from THIS checkout (native wheel + nedbd-v2), exactly as the
+# python-native / python-daemon tiers of test.yml build it, so the numbers
+# describe the commit that was dispatched — not whatever is on PyPI.
+#
+# Every engine is REQUIRED: a server that fails to come up fails the run
+# rather than silently dropping out of the comparison.
+#
+# With `publish` on, the rendered page is proposed as a PR that touches only
+# docs/BENCHMARKS.md. Master is never pushed to directly.
+
+name: Benchmark (head-to-head)
+
+on:
+  workflow_dispatch:
+    inputs:
+      orders:
+        description: "Orders in the dataset (customers = orders/10, 3 items per order)"
+        default: "5000"
+        required: true
+      ops:
+        description: "Keys per point-style phase"
+        default: "400"
+        required: true
+      publish:
+        description: "Open a PR updating docs/BENCHMARKS.md with the results"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bench-compare
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_DSN: postgresql://postgres:bench@127.0.0.1:5432/postgres
+  REDIS_URL: redis://127.0.0.1:6379/0
+  MONGO_URL: mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true
+
+jobs:
+  bench:
+    name: head-to-head (${{ inputs.orders }} orders)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── the rival engines ──────────────────────────────────────────────────
+      # Started first so they boot while the Rust build runs. Plain `docker run`
+      # rather than service containers: Mongo needs --replSet (multi-document
+      # transactions are part of the workload) and Redis needs CONFIG SET.
+      - name: Start PostgreSQL, Redis, MongoDB
+        run: |
+          docker run -d --name pg    -p 5432:5432  -e POSTGRES_PASSWORD=bench postgres:17
+          docker run -d --name redis -p 6379:6379  redis:7
+          docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # ── NEDB from this checkout ────────────────────────────────────────────
+      - name: Stage Python source + README into the maturin layout
+        run: bash scripts/stage_maturin.sh
+      - name: Build + install the native wheel
+        run: |
+          pip install --upgrade maturin
+          maturin build --release --manifest-path rust/crates/nedb-py/Cargo.toml --out dist
+          pip install --force-reinstall dist/*.whl
+      - name: Build nedbd-v2
+        run: |
+          cargo build --release --bin nedbd --package nedb-engine --manifest-path rust/Cargo.toml
+          echo "NEDBD_BIN=$GITHUB_WORKSPACE/rust/target/release/nedbd" >> "$GITHUB_ENV"
+      - name: Install clients
+        run: pip install psycopg2-binary redis pymongo requests
+
+      - name: Confirm every engine is up (and NEDB is native)
+        run: |
+          python - <<'EOF'
+          import nedb, sys
+          print("nedb", nedb.__version__, "native:", nedb.__has_native__)
+          if not nedb.__has_native__:
+              sys.exit("nedb._native did not load — the embedded leg would measure pure Python")
+          EOF
+          "$NEDBD_BIN" --version
+          timeout 90 bash -c 'until docker exec pg pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done'
+          timeout 90 bash -c 'until docker exec mongo mongosh --quiet --eval "db.adminCommand({ping:1}).ok" | grep -q 1; do sleep 2; done'
+          docker exec mongo mongosh --quiet --eval \
+            'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+          timeout 90 bash -c 'until docker exec mongo mongosh --quiet --eval "db.hello().isWritablePrimary" | grep -q true; do sleep 2; done'
+          echo "all engines up"
+
+      # ── the run ────────────────────────────────────────────────────────────
+      - name: Run the head-to-head
+        run: |
+          python bench/compare.py \
+            --orders "${{ inputs.orders }}" --ops "${{ inputs.ops }}" \
+            --require nedb,nedbd,sqlite,postgres,redis,mongo \
+            --json bench-results.json --markdown docs/BENCHMARKS.md
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f docs/BENCHMARKS.md ]; then cat docs/BENCHMARKS.md >> "$GITHUB_STEP_SUMMARY";
+          else echo "No results were rendered — see the 'Run the head-to-head' step log." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: |
+            bench-results.json
+            docs/BENCHMARKS.md
+          if-no-files-found: warn
+
+      # ── publish: a PR touching docs/BENCHMARKS.md only ─────────────────────
+      - name: Open a PR with docs/BENCHMARKS.md
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="bench/results-${{ github.run_id }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add docs/BENCHMARKS.md
+          if git diff --cached --quiet; then
+            echo "docs/BENCHMARKS.md unchanged — nothing to publish"; exit 0
+          fi
+          git commit -m "docs(bench): head-to-head results, run ${{ github.run_id }}"
+          git push origin "$branch"
+          gh pr create --base master --head "$branch" \
+            --title "docs(bench): head-to-head results — ${{ inputs.orders }} orders, run ${{ github.run_id }}" \
+            --body "Rendered by the on-demand **Benchmark (head-to-head)** workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. Touches docs/BENCHMARKS.md only." \
+          || {
+            # The results ARE published (the branch is pushed); only the PR
+            # wrapper was refused. This repo does not let Actions open PRs
+            # (Settings → Actions → General → "Allow GitHub Actions to create
+            # and approve pull requests" is off), so say so and hand over the link.
+            url="${{ github.server_url }}/${{ github.repository }}/compare/master...$branch"
+            echo "::warning::Results pushed to $branch, but GitHub refused to let this workflow open the PR (the message above says why — usually the 'Allow GitHub Actions to create and approve pull requests' setting). Open it from: $url"
+            echo "### Publish: branch pushed, PR not opened" >> "$GITHUB_STEP_SUMMARY"
+            echo "Results are on \`$branch\`. Open the PR: $url" >> "$GITHUB_STEP_SUMMARY"
+          }
