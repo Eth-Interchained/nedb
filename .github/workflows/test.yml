@@ -449,7 +449,12 @@ jobs:
           NEDB_REQUIRE_ALL: "1"
           NEDBD_BIN: rust/target/release/nedbd
         run: |
-          pip install 'psycopg[binary]' asyncpg sqlalchemy psycopg2-binary
+          # SQLAlchemy is pinned below 2.1: 2.1.1 (2026-09-25) added
+          # `SHOW default_table_access_method` to its dialect init, which the
+          # nedbd pgwire endpoint does not answer yet. Unpinned, this suite
+          # went red on master without a single repo change. Lift the pin
+          # when pgwire answers that setting (Postgres answers 'heap').
+          pip install 'psycopg[binary]' asyncpg 'sqlalchemy<2.1' psycopg2-binary
           # --no-save leaves package.json and the lockfile untouched;
           # --ignore-scripts stops a plain install from trying to build this
           # repo's own native addon as a side effect of adding a test client.
