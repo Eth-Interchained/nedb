@@ -52,7 +52,9 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as dt
+import gc
 import json
 import math
 import os
@@ -67,6 +69,18 @@ from typing import Any, Dict, Iterable, List, Optional
 
 SEED = 19901030
 STATUSES = ("paid", "pending", "shipped", "cancelled")
+
+# The benchmark owns persistence explicitly: each write batch ends in
+# checkpoint()/flush(). Disable the 1 s background ticker so random tick timing
+# cannot add disk I/O to one sample but not its A/B partner.
+os.environ["NEDB_FLUSH_MS"] = "off"
+
+
+def dag_tempdir(prefix: str) -> str:
+    """Create a DAG temp dir whose cleanup runs after NEDB's atexit flush."""
+    path = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(shutil.rmtree, path, ignore_errors=True)
+    return path
 
 
 class BenchFailure(RuntimeError):
@@ -232,8 +246,17 @@ class Protocol:
         }
 
     def teardown(self) -> None:
-        if self.shadow_dir:
-            shutil.rmtree(self.shadow_dir, ignore_errors=True)
+        # Drop Python owners of the native DAG before shutdown. The directory
+        # itself is removed by dag_tempdir() only after NEDB's atexit flush.
+        if self.shadow and self.surface is not None:
+            try:
+                self.surface.checkpoint()
+            except Exception:
+                pass
+            self.surface = None
+            if hasattr(self, "db"):
+                self.db = None
+            gc.collect()
 
 
 class SQLiteProtocol(Protocol):
@@ -256,7 +279,7 @@ class SQLiteProtocol(Protocol):
         if self.shadow:
             from nedb import wrap_sqlite
 
-            self.shadow_dir = tempfile.mkdtemp(prefix="nedb-shadow-sqlite-")
+            self.shadow_dir = dag_tempdir("nedb-shadow-sqlite-")
             wrapped = wrap_sqlite(
                 raw,
                 db_name="bench_sqlite",
@@ -335,7 +358,7 @@ class PostgresProtocol(Protocol):
         if self.shadow:
             from nedb import wrap_postgresql
 
-            self.shadow_dir = tempfile.mkdtemp(prefix="nedb-shadow-postgres-")
+            self.shadow_dir = dag_tempdir("nedb-shadow-postgres-")
             wrapped = wrap_postgresql(
                 raw,
                 db_name="bench_postgres",
@@ -435,7 +458,7 @@ class RedisProtocol(Protocol):
         if self.shadow:
             from nedb import wrap_redis
 
-            self.shadow_dir = tempfile.mkdtemp(prefix="nedb-shadow-redis-")
+            self.shadow_dir = dag_tempdir("nedb-shadow-redis-")
             wrapped = wrap_redis(
                 raw,
                 db_name="bench_redis",
@@ -494,13 +517,13 @@ class MongoProtocol(Protocol):
     def setup(self):
         from pymongo import MongoClient
 
-        raw = MongoClient(self.url, w=1, j=True)
+        raw = MongoClient(self.url, w=1, journal=True)
         raw.drop_database(self.db_name)
         self.raw = raw
         if self.shadow:
             from nedb import wrap_mongo
 
-            self.shadow_dir = tempfile.mkdtemp(prefix="nedb-shadow-mongo-")
+            self.shadow_dir = dag_tempdir("nedb-shadow-mongo-")
             wrapped = wrap_mongo(
                 raw,
                 db_name="bench_mongo",
@@ -549,7 +572,7 @@ class MongoProtocol(Protocol):
         return int(self.db.bench.count_documents({}))
 
     def commit(self):
-        # j=True makes each acknowledged Mongo write journaled. The NEDB side
+        # journal=True makes each acknowledged Mongo write journaled. The NEDB side
         # still checkpoints at the common workload batch boundary.
         super().commit()
 
@@ -575,7 +598,7 @@ class NativeNEDB:
 
         if not nedb.__has_native__:
             raise RuntimeError("native NEDB extension is required")
-        self.dir = tempfile.mkdtemp(prefix="nedb-native-bench-")
+        self.dir = dag_tempdir("nedb-native-bench-")
         self.db = _native.NedbCore.open(self.dir)
 
     def insert(self, row):
@@ -628,7 +651,11 @@ class NativeNEDB:
         }
 
     def teardown(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
+        try:
+            self.db.flush()
+        finally:
+            self.db = None
+            gc.collect()
 
 
 def run_case(a, rows, read_ids, update_ids, batch) -> Dict[str, Any]:
