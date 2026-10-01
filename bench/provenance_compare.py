@@ -52,7 +52,9 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as dt
+import gc
 import json
 import math
 import os
@@ -67,6 +69,18 @@ from typing import Any, Dict, Iterable, List, Optional
 
 SEED = 19901030
 STATUSES = ("paid", "pending", "shipped", "cancelled")
+
+# The benchmark owns persistence explicitly: each write batch ends in
+# checkpoint()/flush(). Disable the 1 s background ticker so random tick timing
+# cannot add disk I/O to one sample but not its A/B partner.
+os.environ["NEDB_FLUSH_MS"] = "off"
+
+
+def dag_tempdir(prefix: str) -> str:
+    """Create a DAG temp dir whose cleanup runs after NEDB's atexit flush."""
+    path = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(shutil.rmtree, path, ignore_errors=True)
+    return path
 
 
 class BenchFailure(RuntimeError):
