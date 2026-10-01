@@ -494,7 +494,7 @@ class MongoProtocol(Protocol):
     def setup(self):
         from pymongo import MongoClient
 
-        raw = MongoClient(self.url, w=1, j=True)
+        raw = MongoClient(self.url, w=1, journal=True)
         raw.drop_database(self.db_name)
         self.raw = raw
         if self.shadow:
@@ -549,7 +549,7 @@ class MongoProtocol(Protocol):
         return int(self.db.bench.count_documents({}))
 
     def commit(self):
-        # j=True makes each acknowledged Mongo write journaled. The NEDB side
+        # journal=True makes each acknowledged Mongo write journaled. The NEDB side
         # still checkpoints at the common workload batch boundary.
         super().commit()
 
