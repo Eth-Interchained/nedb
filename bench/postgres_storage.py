@@ -75,7 +75,15 @@ def snapshot(raw, root):
 def worker(args):
     import psycopg2
     root = Path(args.work_dir)
-    raw = psycopg2.connect(args.dsn)
+    deadline = time.monotonic() + 90
+    while True:
+        try:
+            raw = psycopg2.connect(args.dsn, connect_timeout=3)
+            break
+        except psycopg2.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
     if args.verify:
         from nedb.backends.dag import DagBackend
         dag = DagBackend(str(root / 'nedb')) if args.shadow else None
@@ -296,6 +304,9 @@ def main():
                     if time.monotonic() > deadline:
                         raise RuntimeError('PostgreSQL restart timed out')
                     time.sleep(1)
+                # Docker can assign a different ephemeral host port on restart.
+                port = docker('port', name, '5432/tcp', capture_output=True).stdout.strip().rsplit(':', 1)[1]
+                cmd[cmd.index('--dsn') + 1] = f'postgresql://postgres:bench@127.0.0.1:{port}/postgres'
                 subprocess.run(cmd + ['--verify'], check=True)
                 result = json.loads((leg / 'result.json').read_text())
                 result['verification'] = json.loads((leg / 'verification.json').read_text())
