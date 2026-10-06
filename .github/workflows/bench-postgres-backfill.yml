@@ -1,0 +1,89 @@
+name: Benchmark (Postgres backfill storage exposure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Logical source payload size
+        type: choice
+        options:
+          - Both
+          - 100 MB
+          - 1 GB
+        default: Both
+        required: true
+      record_bytes:
+        description: Payload bytes per record
+        default: '16384'
+        required: true
+      batch:
+        description: Raw commit batch and backfill fetch batch
+        default: '100'
+        required: true
+  pull_request:
+    paths:
+      - bench/postgres_backfill.py
+      - bench/postgres_storage.py
+      - bench/tests/test_postgres_backfill.py
+      - .github/workflows/bench-postgres-backfill.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-backfill-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    name: Backfill ${{ matrix.target_bytes }} logical bytes
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target_bytes: ${{ fromJSON(github.event_name == 'pull_request' && '[10000000]' || inputs.dataset == '100 MB' && '[100000000]' || inputs.dataset == '1 GB' && '[1000000000]' || '[100000000,1000000000]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build native NEDB from this checkout
+        run: |
+          bash scripts/stage_maturin.sh
+          pip install maturin psycopg2-binary
+          maturin build --release --manifest-path rust/crates/nedb-py/Cargo.toml --out backfill-dist
+          pip install --force-reinstall backfill-dist/*.whl
+      - name: Check report measurements
+        run: python -m unittest discover -s bench/tests -p 'test_postgres_backfill.py'
+      - name: Load raw Postgres then backfill NEDB
+        env:
+          TARGET_BYTES: ${{ matrix.target_bytes }}
+          RECORD_BYTES: ${{ inputs.record_bytes || '16384' }}
+          BATCH_SIZE: ${{ inputs.batch || '100' }}
+        run: |
+          # Root can measure the container-owned PGDATA without changing its permissions.
+          sudo --preserve-env=GITHUB_SHA "$(command -v python)" bench/postgres_backfill.py \
+            --target-bytes "$TARGET_BYTES" --record-bytes "$RECORD_BYTES" \
+            --batch "$BATCH_SIZE" --work-dir "$RUNNER_TEMP/backfill-exposure"
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/backfill-exposure/backfill-results.md" ]; then
+            cat "$RUNNER_TEMP/backfill-exposure/backfill-results.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Backfill incomplete; inspect JSON artifacts and logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-backfill-${{ matrix.target_bytes }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/backfill-exposure/*.json
+            ${{ runner.temp }}/backfill-exposure/*.md
+          if-no-files-found: warn
