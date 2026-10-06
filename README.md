@@ -395,6 +395,12 @@ identical answers.
 
 ## Postgres wire protocol — run your SQL, get history for free
 
+> **New in this release:** the pgwire endpoint now speaks better Postgres.
+> `WITH` (CTE) queries inline as derived tables, and bare `id` reads from
+> NEDB's `_id` — so `SELECT id`, `WHERE id = …`, `count(id)`, and `SUM(id)`
+> all behave the way a Postgres client expects. The engine stays schemaless;
+> the translation layer just got more fluent.
+
 `nedbd --pg-port 5433` opens a **PostgreSQL wire-protocol endpoint** — reads
 *and* writes. `psql`, DBeaver, Metabase, Grafana, psycopg — anything that
 speaks pgwire can use a tamper-evident NEDB store with ordinary SQL, with no
