@@ -1,6 +1,6 @@
 [package]
 name        = "nedb-engine"
-version     = "10.30.93"
+version     = "11.12.14"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server (nedbd binary)"
 license     = "BUSL-1.1"
