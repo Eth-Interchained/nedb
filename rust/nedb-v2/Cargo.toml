@@ -45,6 +45,7 @@ blake2       = "0.10"
 aes-gcm      = "0.10"
 sha2         = "0.10"
 hex          = "0.4"
+chrono       = { version = "0.4", default-features = false, features = ["std"] }
 
 # Concurrency
 rayon        = "1"

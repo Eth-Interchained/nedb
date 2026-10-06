@@ -1158,6 +1158,22 @@ impl Parser {
             return Ok(Expr::Cast { expr: Box::new(inner), ty });
         }
 
+        // EXTRACT uses FROM between its arguments, rather than a comma.
+        // Lower it to a scalar call so predicates, grouping and projection
+        // all use the same evaluator instead of falling back to NQL.
+        if self.peek().is_kw("EXTRACT") && matches!(self.peek_at(1), Tok::Punct('(')) {
+            self.pos += 2;
+            let field = match self.next() {
+                Tok::Word { raw, .. } | Tok::Str(raw) => raw.to_ascii_lowercase(),
+                other => bail!("expected a date field in EXTRACT, got {:?}", other),
+            };
+            self.expect_kw("FROM")?;
+            let source = self.parse_expr()?;
+            self.expect_punct(')')?;
+            return Ok(Expr::Func { name: "extract".into(), args: vec![
+                Expr::Literal(Value::String(field)), source] });
+        }
+
         // CASE
         if self.peek().is_kw("CASE") {
             return self.parse_case();
@@ -1758,7 +1774,18 @@ impl Parser {
                 {
                     bail!("GROUP BY ROLLUP / CUBE / GROUPING SETS is not supported");
                 }
-                group_by.push(self.parse_expr()?);
+                let mut key = self.parse_expr()?;
+                if let Expr::Literal(Value::Number(n)) = &key {
+                    let ordinal = n.as_u64().filter(|n| *n > 0)
+                        .ok_or_else(|| anyhow::anyhow!("GROUP BY position must be a positive integer"))?;
+                    let item = items.get((ordinal - 1) as usize)
+                        .ok_or_else(|| anyhow::anyhow!("GROUP BY position {} is not in select list", ordinal))?;
+                    if has_aggregate(&item.expr) || matches!(item.expr, Expr::Star | Expr::QualifiedStar(_)) {
+                        bail!("GROUP BY position {} must reference a non-aggregate expression", ordinal);
+                    }
+                    key = item.expr.clone();
+                }
+                group_by.push(key);
                 if self.eat_punct(',') {
                     continue;
                 }
@@ -2474,6 +2501,42 @@ fn eval_func(name: &str, args: &[Expr], row: &Bound) -> Result<Value> {
     };
 
     Ok(match name {
+        "extract" => {
+            use chrono::{Datelike, Timelike};
+            let field = as_text(&arg(0)?).to_ascii_lowercase();
+            let value = arg(1)?;
+            if value.is_null() {
+                Value::Null
+            } else {
+                let text = as_text(&value);
+                // Naive timestamps preserve their calendar fields. Offset
+                // timestamps use UTC, matching this endpoint's session zone.
+                let dt = chrono::DateTime::parse_from_rfc3339(&text)
+                    .map(|t| t.naive_utc())
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f"))
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.f"))
+                    .or_else(|_| chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap()))
+                    .map_err(|_| anyhow::anyhow!("EXTRACT requires a valid ISO date or timestamp, got {:?}", text))?;
+                let number = match field.as_str() {
+                    "year" => dt.year() as f64,
+                    "month" => dt.month() as f64,
+                    "day" => dt.day() as f64,
+                    "hour" => dt.hour() as f64,
+                    "minute" => dt.minute() as f64,
+                    "second" => dt.second() as f64 + dt.nanosecond() as f64 / 1e9,
+                    "quarter" => ((dt.month() - 1) / 3 + 1) as f64,
+                    "dow" => dt.weekday().num_days_from_sunday() as f64,
+                    "isodow" => dt.weekday().number_from_monday() as f64,
+                    "doy" => dt.ordinal() as f64,
+                    "week" => dt.iso_week().week() as f64,
+                    "isoyear" => dt.iso_week().year() as f64,
+                    "epoch" => dt.and_utc().timestamp() as f64 + dt.nanosecond() as f64 / 1e9,
+                    _ => bail!("EXTRACT field {:?} is not supported", field),
+                };
+                from_f64(number)
+            }
+        }
         // ── identity / session ──────────────────────────────────────────────
         // NEDB presents a single role and a single schema; reporting them
         // consistently is what lets a client's "who am I" probe succeed.
@@ -6119,6 +6182,40 @@ mod subquery_exec_tests {
                 json!({"oid": 12, "cid": 2, "total": 9}),
             ]),
         ])
+    }
+
+    #[test]
+    fn group_ordinals_resolve_to_select_expressions() {
+        let t = tables(vec![("hosts", vec![json!({"region":"east"}),
+            json!({"region":"east"}), json!({"region":null})])]);
+        let (_, rows) = go("SELECT region, count(*) AS n FROM hosts GROUP BY 1 ORDER BY region NULLS LAST", &t);
+        assert_eq!(rows, vec![json!({"region":"east","n":2}), json!({"region":null,"n":1})]);
+        let (_, named) = go("SELECT region, count(*) AS n FROM hosts GROUP BY region ORDER BY region NULLS LAST", &t);
+        assert_eq!(rows, named);
+        for sql in ["SELECT region FROM hosts GROUP BY 0",
+                    "SELECT region FROM hosts GROUP BY 2",
+                    "SELECT count(*) FROM hosts GROUP BY 1"] {
+            assert!(parse(sql).is_err(), "{}", sql);
+        }
+    }
+
+    #[test]
+    fn extract_filters_dates_and_preserves_nulls() {
+        let t = tables(vec![("samples", vec![
+            json!({"id":1,"taken_at":"2025-12-31 23:59:59"}),
+            json!({"id":2,"taken_at":"2026-03-01 12:34:56.25"}),
+            json!({"id":3,"taken_at":"2026-04-01"}),
+            json!({"id":4,"taken_at":null})])]);
+        let (_, rows) = go("SELECT id FROM samples WHERE EXTRACT(YEAR FROM taken_at)=2026 AND EXTRACT(MONTH FROM taken_at)=3", &t);
+        assert_eq!(col(&rows, "id"), vec![json!(2)]);
+        let (_, rows) = go("SELECT EXTRACT(SECOND FROM taken_at) AS s FROM samples WHERE id=2", &t);
+        assert_eq!(col(&rows, "s"), vec![json!(56.25)]);
+        let (_, rows) = go("SELECT EXTRACT(YEAR FROM taken_at) AS y FROM samples WHERE id=4", &t);
+        assert_eq!(col(&rows, "y"), vec![Value::Null]);
+        assert!(run("SELECT EXTRACT(YEAR FROM '2026-02-30')", &t).is_err());
+        assert!(run("SELECT EXTRACT(nonsense FROM '2026-01-01')", &t).is_err());
+        let (_, rows) = go("SELECT EXTRACT(YEAR FROM '2026-01-01T00:30:00+01:00') AS y", &t);
+        assert_eq!(col(&rows, "y"), vec![json!(2025)]);
     }
 
     #[test]
