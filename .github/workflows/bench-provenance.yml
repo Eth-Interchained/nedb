@@ -1,0 +1,135 @@
+# Benchmark — protocol A/B + cost of NEDB provenance
+#
+# ON DEMAND ONLY. This never gates releases.
+#
+# One deterministic workload is run:
+#   raw protocol
+#   same protocol through NEDB wrap_* with shadow_writes=True
+#
+# Then every provenance-enabled leg is shown head-to-head with native NEDB.
+# The benchmark FAILS if any required engine is unavailable, any answer is
+# wrong, any shadow chain is empty/incomplete, or NEDB verify() fails.
+
+name: Benchmark (provenance cost)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Rows in the deterministic dataset"
+        default: "2000"
+        required: true
+      ops:
+        description: "Point reads and updates"
+        default: "400"
+        required: true
+      batch:
+        description: "Write batch / NEDB checkpoint boundary"
+        default: "100"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-provenance-cost
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_DSN: postgresql://postgres:bench@127.0.0.1:5432/postgres
+  REDIS_URL: redis://127.0.0.1:6379/0
+  MONGO_URL: mongodb://127.0.0.1:27017/
+
+jobs:
+  benchmark:
+    name: protocol A/B + provenance head-to-head
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start the host engines before the Rust build so they boot in parallel.
+      # Redis uses AOF + appendfsync=always: the raw Redis leg is not allowed to
+      # win by acknowledging volatile writes while the provenance leg persists.
+      - name: Start PostgreSQL, Redis, MongoDB
+        run: |
+          docker run -d --name pg -p 5432:5432 \
+            -e POSTGRES_PASSWORD=bench postgres:17
+          docker run -d --name redis -p 6379:6379 redis:7 \
+            redis-server --appendonly yes --appendfsync always
+          docker run -d --name mongo -p 27017:27017 mongo:7 --bind_ip_all
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Build NEDB from THIS checkout. Never compare against a stale PyPI wheel.
+      - name: Build and install NEDB native wheel
+        run: |
+          bash scripts/stage_maturin.sh
+          pip install --upgrade maturin
+          maturin build --release \
+            --manifest-path rust/crates/nedb-py/Cargo.toml \
+            --out dist
+          pip install --force-reinstall dist/*.whl
+
+      - name: Install protocol clients
+        run: pip install psycopg2-binary redis pymongo
+
+      - name: Confirm every engine and durability setting
+        run: |
+          python - <<'PY'
+          import nedb, sys
+          print("nedb", nedb.__version__, "native:", nedb.__has_native__)
+          if not nedb.__has_native__:
+              sys.exit("native NEDB extension did not load")
+          PY
+
+          timeout 90 bash -c 'until docker exec pg pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done'
+          timeout 60 bash -c 'until docker exec redis redis-cli ping | grep -q PONG; do sleep 1; done'
+          timeout 90 bash -c 'until docker exec mongo mongosh --quiet --eval "db.adminCommand({ping:1}).ok" | grep -q 1; do sleep 2; done'
+
+          echo "Redis persistence:"
+          docker exec redis redis-cli CONFIG GET appendonly appendfsync
+
+          echo "PostgreSQL durability:"
+          docker exec pg psql -U postgres -Atc "show fsync; show synchronous_commit;"
+
+          echo "MongoDB journal settings:"
+          docker exec mongo mongosh --quiet --eval 'printjson(db.adminCommand({getCmdLineOpts:1}).parsed.storage || {})'
+
+      - name: Run protocol A/B and provenance head-to-head
+        run: |
+          python bench/provenance_compare.py \
+            --rows "${{ inputs.rows }}" \
+            --ops "${{ inputs.ops }}" \
+            --batch "${{ inputs.batch }}" \
+            --require-all \
+            --json provenance-results.json \
+            --markdown provenance-results.md
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f provenance-results.md ]; then
+            cat provenance-results.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No benchmark report was rendered. See the benchmark step." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: provenance-benchmark-${{ github.run_id }}
+          path: |
+            provenance-results.json
+            provenance-results.md
+          if-no-files-found: warn
