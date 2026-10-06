@@ -474,7 +474,16 @@ fn strip_column_qualifiers(
                 alias.map(|a| format!(" (aliased {:?})", a)).unwrap_or_default()
             ));
         }
-        out.push_str(&word);
+        // Bare `id` is NEDB's `_id` under its Postgres name: the engine stores
+        // the primary key as `_id`, and INSERT already accepts `id` as an alias
+        // for it, so the pgwire surface reads it back the same way. Without
+        // this, `SELECT id` / `count(id)` / `WHERE id = …` see a field that is
+        // never there.
+        if word.eq_ignore_ascii_case("id") {
+            out.push_str("_id");
+        } else {
+            out.push_str(&word);
+        }
     }
     Ok(out)
 }
@@ -1000,12 +1009,186 @@ fn translate_delete(sql: &str) -> Result<Stmt, String> {
     Ok(Stmt::Delete { coll, where_sql: where_raw, nql, returning })
 }
 
+/// Inline WITH (CTE) definitions as derived tables.
+///
+/// `WITH x AS (SELECT …), y AS (SELECT …) SELECT … FROM x JOIN y …`
+/// becomes
+/// `SELECT … FROM (SELECT …) AS x JOIN (SELECT …) AS y …`
+///
+/// Each CTE name is replaced where it appears as a FROM/JOIN target. CTEs
+/// that reference other CTEs are inlined inside-out (later definitions may
+/// use earlier ones). Recursive CTEs (`WITH RECURSIVE` or a CTE naming
+/// itself) are refused: the append-only store has no fixpoint operator.
+fn inline_ctes(sql: &str) -> Result<String, String> {
+    let upper = sql.to_uppercase();
+    if upper.starts_with("WITH RECURSIVE ") {
+        return Err("WITH RECURSIVE is not supported — NEDB is append-only and has no fixpoint operator".to_string());
+    }
+    // Skip "WITH ", then parse comma-separated `name [(cols)] AS (query)` defs.
+    let mut rest = sql[4..].trim();
+    let mut ctes: Vec<(String, String)> = Vec::new();
+    loop {
+        // CTE name: identifier, optionally followed by (col, …) alias list.
+        let name_end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '"'))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            return Err(format!("expected a CTE name in WITH clause, got {:?}", &rest[..rest.len().min(20)]));
+        }
+        let mut name = rest[..name_end].trim_matches('"').to_string();
+        rest = rest[name_end..].trim_start();
+        // Optional column alias list: `name (a, b) AS …` — skip it; the inner
+        // query's own output names are what the outer query sees.
+        if rest.starts_with('(') {
+            let mut depth = 0usize;
+            let mut idx = 0usize;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => { depth -= 1; if depth == 0 { idx = i + 1; break; } }
+                    '\'' => {
+                        // skip string literal
+                        let mut j = i + 1;
+                        while j < rest.len() {
+                            if rest.as_bytes()[j] == b'\'' {
+                                if rest.as_bytes().get(j + 1) == Some(&b'\'') { j += 1; }
+                                else { break; }
+                            }
+                            j += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if idx == 0 {
+                return Err("unbalanced parens in CTE column alias list".to_string());
+            }
+            rest = rest[idx..].trim_start();
+        }
+        if !rest.to_uppercase().starts_with("AS ") {
+            return Err(format!("expected AS after CTE name {:?}, got {:?}", name, &rest[..rest.len().min(20)]));
+        }
+        rest = rest[2..].trim_start();
+        if !rest.starts_with('(') {
+            return Err(format!("expected (query) after AS for CTE {:?}", name));
+        }
+        // Balanced parens for the CTE query, honouring string literals.
+        let mut depth = 0usize;
+        let mut end = 0usize;
+        let mut in_str = false;
+        let bytes = rest.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_str {
+                if c == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') { i += 1; }
+                    else { in_str = false; }
+                }
+            } else if c == b'\'' {
+                in_str = true;
+            } else if c == b'(' {
+                depth += 1;
+            } else if c == b')' {
+                depth -= 1;
+                if depth == 0 { end = i; break; }
+            }
+            i += 1;
+        }
+        if end == 0 {
+            return Err(format!("unbalanced parens in CTE {:?} definition", name));
+        }
+        let query = rest[1..end].trim().to_string();
+        // A CTE naming itself is recursive — refuse loudly.
+        if query.to_uppercase().contains(&format!(" {} ", name.to_uppercase()))
+            || query.to_uppercase().contains(&format!("({}", name.to_uppercase())) {
+            return Err(format!("recursive CTE {:?} is not supported", name));
+        }
+        ctes.push((name, query));
+        rest = rest[end + 1..].trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+            continue;
+        }
+        break;
+    }
+    if ctes.is_empty() {
+        return Err("WITH without any CTE definitions".to_string());
+    }
+    // `rest` is now the main query. Inline each CTE where its name appears
+    // as a FROM/JOIN target. Process in reverse definition order so later
+    // CTEs (which may reference earlier ones) are inlined first.
+    let mut main = rest.to_string();
+    for (name, query) in ctes.iter().rev() {
+        // Inline any earlier CTEs referenced inside this CTE's query first.
+        let mut q = query.clone();
+        for (inner_name, inner_query) in ctes.iter() {
+            if inner_name == name { continue; }
+            q = replace_table_ref(&q, inner_name, inner_query);
+        }
+        main = replace_table_ref(&main, name, &q);
+    }
+    Ok(main)
+}
+
+/// Replace `FROM <name>` / `JOIN <name>` (with optional alias) by
+/// `FROM (<query>) AS <name>` / `JOIN (<query>) AS <name>`.
+fn replace_table_ref(sql: &str, name: &str, query: &str) -> String {
+    let replacement = format!("({}) AS {}", query, name);
+    // Match FROM/JOIN followed by the CTE name as a whole word, keeping any
+    // trailing alias intact.
+    let mut out = String::with_capacity(sql.len() + query.len());
+    let bytes = sql.as_bytes();
+    let nl = name.len();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Look for FROM or JOIN keyword boundary.
+        let is_from = sql[i..].to_uppercase().starts_with("FROM ")
+            || sql[i..].to_uppercase().starts_with("FROM(");
+        let is_join = sql[i..].to_uppercase().starts_with("JOIN ")
+            || sql[i..].to_uppercase().starts_with("JOIN(");
+        if is_from || is_join {
+            let kw_len = if is_from { 4 } else { 4 };
+            let after_kw = sql[i + kw_len..].trim_start();
+            // Check the next word is exactly our CTE name.
+            if after_kw.len() >= nl
+                && after_kw[..nl].eq_ignore_ascii_case(name)
+                && after_kw[nl..].chars().next().map_or(true, |c| !c.is_alphanumeric() && c != '_')
+            {
+                // Preserve any alias after the name.
+                let after_name = after_kw[nl..].trim_start();
+                // If it's already a parenthesised subquery, don't touch it.
+                if !after_name.starts_with('(') {
+                    out.push_str(&sql[..i]);
+                    out.push_str(if is_from { "FROM " } else { "JOIN " });
+                    out.push_str(&replacement);
+                    // Skip past "FROM name" / "JOIN name" in the input.
+                    let skip = sql[i..].len() - after_kw[nl..].len();
+                    let remaining = &sql[i + skip..];
+                    out.push_str(remaining);
+                    return out;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Translate one SQL statement into something executable, or explain why not.
 pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     let sql = normalise(sql_raw);
     let sql = sql.trim().trim_end_matches(';').trim();
     if sql.is_empty() {
         return Ok(Stmt::Ok(""));
+    }
+    // WITH (CTE) support: inline each CTE as a derived table, then translate
+    // the rewritten SELECT. `WITH x AS (SELECT …) SELECT * FROM x` becomes
+    // `SELECT * FROM (SELECT …) AS x`. Recursive CTEs are refused — NEDB's
+    // append-only model has no fixpoint operator.
+    if sql.to_uppercase().starts_with("WITH ") {
+        let rewritten = inline_ctes(sql)?;
+        return translate(&rewritten);
     }
     let upper = sql.to_uppercase();
 
@@ -1207,6 +1390,8 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
                     return Err(format!("{}() needs a column", agg));
                 }
                 let inner = inner.rsplit('.').next().unwrap_or(inner).trim_matches('"');
+                // `id` inside an aggregate is `_id` underneath.
+                let inner = if inner.eq_ignore_ascii_case("id") { "_id" } else { inner };
                 let named = format!("{} {}", agg, inner);
                 if !agg_clause.is_empty() && agg_clause.trim() != "COUNT" && agg_clause.trim() != named {
                     return Err(format!(
@@ -1242,7 +1427,9 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
                     p));
             }
             let name = bare;
-            project.push(Col::renamed(name, alias.unwrap_or(name)));
+            // `id` reads from NEDB's `_id` but keeps its Postgres name on the wire.
+            let src = if name.eq_ignore_ascii_case("id") { "_id" } else { name };
+            project.push(Col::renamed(src, alias.unwrap_or(name)));
         }
     }
 
@@ -5157,7 +5344,7 @@ mod tests {
         match translate("UPDATE t SET note = 'where returning from' WHERE id = 'k'") {
             Ok(Stmt::Update { set, nql, .. }) => {
                 assert_eq!(set[0].1, json!("where returning from"));
-                assert_eq!(nql, r#"FROM t WHERE id = "k""#);
+                assert_eq!(nql, r#"FROM t WHERE _id = "k""#);
             }
             other => panic!("expected UPDATE, got {:?}", other),
         }
@@ -5644,6 +5831,45 @@ mod tests {
         assert_eq!(fmt_float(f64::NAN), "'NaN'");
         assert_eq!(fmt_float(3.0), "3", "a whole float should not gain a .0 tail");
         assert_eq!(fmt_float(3.5), "3.5");
+    }
+
+    #[test]
+    fn bare_id_reads_from_underscore_id() {
+        // Postgres clients say `id`; NEDB stores it as `_id`. The pgwire
+        // surface translates, so `count(id)` and `count(*)` agree.
+        // NQL has no projection clause — the column mapping rides in Stmt.
+        match translate("SELECT id FROM orders") {
+            Ok(Stmt::Query { project, .. }) => {
+                assert_eq!(project.len(), 1);
+                // Col::renamed(src, out): reads _id, presents as id.
+                let dbg = format!("{:?}", project[0]);
+                assert!(dbg.contains("_id"), "should read _id: {}", dbg);
+            }
+            other => panic!("expected query, got {:?}", other),
+        }
+        assert!(q("SELECT count(id) FROM orders").contains("COUNT"),
+                "count(id) should become a bare COUNT");
+        let where_nql = q("SELECT * FROM orders WHERE id = 1");
+        assert!(where_nql.contains("_id"),
+                "WHERE id should become _id: {}", where_nql);
+    }
+
+    #[test]
+    fn with_cte_inlines_as_derived_table() {
+        // The CTE name is replaced by its query as a derived table.
+        // (NQL has no projection clause, so we check the inlined SQL shape
+        // via a non-aggregate query that doesn't hit subquery flattening.)
+        let inlined = inline_ctes("WITH paid AS (SELECT * FROM orders WHERE status = 'paid') SELECT * FROM paid").unwrap();
+        assert!(inlined.contains("SELECT * FROM orders WHERE status = 'paid'"),
+                "CTE body should survive inlining: {}", inlined);
+        assert!(!inlined.to_uppercase().starts_with("WITH"),
+                "no WITH should remain after inlining: {}", inlined);
+    }
+
+    #[test]
+    fn with_recursive_is_refused() {
+        let err = translate("WITH RECURSIVE x AS (SELECT 1) SELECT * FROM x").unwrap_err();
+        assert!(err.contains("RECURSIVE"), "should name the refusal: {}", err);
     }
 }
 

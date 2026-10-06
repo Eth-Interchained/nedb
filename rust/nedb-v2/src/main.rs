@@ -16,7 +16,7 @@
 //!   NEDBD_HOST=127.0.0.1    Bind address (default 127.0.0.1 — loopback only)
 //!   NEDBD_PORT=7070         HTTP port (default 7070)
 //!   NEDBD_PG_PORT=5433      Also serve a Postgres wire-protocol READ endpoint
-//!                           (SELECT only). Unset = off.
+//!                           reads and writes; NEDBD_PG_READ_ONLY=1 for reads only. Unset = off.
 //!   NEDBD_TOKEN=<token>     Bearer token for auth (optional)
 //!   NEDBD_MEMORY=1          Pure in-memory mode — no disk I/O, data lost on exit
 //!   NEDB_DAG_V3=1           Use the v3 segment/pack object store (see --dag-v3)
@@ -41,7 +41,7 @@ OPTIONS:
     -H, --host <ADDR>     Bind address (default: 127.0.0.1 — loopback only)
     -p, --port <PORT>     HTTP port (default: 7070)
         --pg-port <PORT>  ALSO serve a PostgreSQL wire-protocol READ endpoint on
-                          this port (psql / DBeaver / psycopg; SELECT only).
+                          this port (psql / DBeaver / psycopg; reads and writes).
                           Off unless set. Cleartext — keep it on loopback or
                           behind a tunnel. Sets NEDBD_PG_PORT.
         --token <TOKEN>   Bearer token required on every request
