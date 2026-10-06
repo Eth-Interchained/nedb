@@ -360,6 +360,11 @@ jobs:
           pip install psycopg2-binary
           python3 tests/test_pgwire.py
 
+      - name: Imagine training gate — CTE and identity regressions
+        run: |
+          pip install 'psycopg[binary]'
+          python3 tests/test_imagine_engine_regression.py
+
       # pg_catalog / information_schema as REAL queryable tables. Driven over
       # the wire, because unit tests prove the rows exist and only a real
       # client proves they are reachable — and because the alternative
