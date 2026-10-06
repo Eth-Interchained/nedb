@@ -2631,6 +2631,10 @@ fn eval_func(name: &str, args: &[Expr], row: &Bound) -> Result<Value> {
                     Value::String("read committed".into())
                 }
                 "max_identifier_length" => Value::String("63".into()),
+                // PostgreSQL dialects use this default when reflecting table
+                // options. This is a wire-compatibility default, not a claim
+                // that NEDB's underlying storage is a PostgreSQL heap.
+                "default_table_access_method" => Value::String("heap".into()),
                 other => {
                     // `current_setting(name, true)` returns NULL for a
                     // missing setting instead of erroring.
@@ -5534,6 +5538,16 @@ mod eval_tests {
         // DDL — NEDB has no DDL to print.
         assert_eq!(v("pg_get_expr(o, o)", &r), Value::Null);
         assert_eq!(v("obj_description(o)", &r), Value::Null);
+    }
+
+    #[test]
+    fn reflection_default_access_method_and_unknown_settings() {
+        let r = json!({});
+        assert_eq!(v("pg_catalog.current_setting('default_table_access_method')", &r), json!("heap"));
+        assert_eq!(v("current_setting('default_table_access_method', true)", &r), json!("heap"));
+        assert_eq!(v("current_setting('nedb_unknown_setting', true)", &r), Value::Null);
+        let error = ev("current_setting('nedb_unknown_setting')", &r).unwrap_err().to_string();
+        assert!(error.contains("unrecognized configuration parameter"), "{}", error);
     }
 
     #[test]

@@ -1,0 +1,84 @@
+name: Benchmark (Postgres storage exposure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_bytes:
+        description: Logical payload bytes (1 GB default)
+        default: '1000000000'
+        required: true
+      record_bytes:
+        description: Payload bytes per record
+        default: '16384'
+        required: true
+      rounds:
+        description: Update rounds over the same 10% of records
+        default: '3'
+        required: true
+  pull_request:
+    paths:
+      - bench/postgres_storage.py
+      - bench/tests/test_postgres_storage.py
+      - .github/workflows/bench-postgres-storage.yml
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-storage-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build native NEDB from this checkout
+        run: |
+          bash scripts/stage_maturin.sh
+          pip install maturin psycopg2-binary
+          maturin build --release --manifest-path rust/crates/nedb-py/Cargo.toml --out storage-dist
+          pip install --force-reinstall storage-dist/*.whl
+      - name: Check measurement helpers
+        run: python -m unittest discover -s bench/tests -p 'test_postgres_storage.py'
+      - name: Compare fresh PostgreSQL clusters
+        env:
+          TARGET_BYTES: ${{ inputs.target_bytes || '1000000000' }}
+          RECORD_BYTES: ${{ inputs.record_bytes || '16384' }}
+          UPDATE_ROUNDS: ${{ inputs.rounds || '3' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            TARGET_BYTES=10000000
+          fi
+          # PGDATA is owned by the container UID with mode 0700. Root is needed
+          # to measure actual allocated blocks without changing its permissions.
+          sudo --preserve-env=GITHUB_SHA "$(command -v python)" bench/postgres_storage.py \
+            --target-bytes "$TARGET_BYTES" --record-bytes "$RECORD_BYTES" \
+            --rounds "$UPDATE_ROUNDS" --work-dir "$RUNNER_TEMP/storage-exposure"
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/storage-exposure/storage-results.md" ]; then
+            cat "$RUNNER_TEMP/storage-exposure/storage-results.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Benchmark incomplete; inspect JSON artifacts and step logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-storage-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/storage-exposure/storage-results.*
+            ${{ runner.temp }}/storage-exposure/*/*.json
+          if-no-files-found: warn

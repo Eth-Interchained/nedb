@@ -49,6 +49,9 @@ def run(fx, c):
     # that is where `select pg_catalog.version()` is sent.
     with eng.connect() as conn:
         c.ok("the dialect initialises (select pg_catalog.version())", True)
+        c.eq("reflection can resolve the default table access method",
+             conn.execute(sa.text("SELECT pg_catalog.current_setting('default_table_access_method')")).scalar(),
+             "heap")
         c.eq("a literal select answers",
              conn.execute(sa.text("SELECT 1")).scalar(), "1")
         c.eq("a bound parameter round-trips",
