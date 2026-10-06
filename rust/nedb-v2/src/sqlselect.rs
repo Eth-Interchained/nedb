@@ -1916,7 +1916,7 @@ impl<'a> Bound<'a> {
                 for (binding, row) in &self.parts {
                     if binding.eq_ignore_ascii_case(q) {
                         return row
-                            .and_then(|r| r.get(name))
+                            .and_then(|r| r.get(name).or_else(|| if name == "id" { r.get("_id") } else { None }))
                             .cloned()
                             .unwrap_or(Value::Null);
                     }
@@ -1928,7 +1928,7 @@ impl<'a> Bound<'a> {
             }
             None => {
                 for (_, row) in &self.parts {
-                    if let Some(v) = row.and_then(|r| r.get(name)) {
+                    if let Some(v) = row.and_then(|r| r.get(name).or_else(|| if name == "id" { r.get("_id") } else { None })) {
                         return v.clone();
                     }
                 }
