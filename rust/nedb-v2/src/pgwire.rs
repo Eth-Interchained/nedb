@@ -860,7 +860,7 @@ fn split_returning(tail: &str) -> (String, Vec<Col>) {
 
 /// Columns whose names are reserved: they carry provenance rather than data.
 fn take_reserved(doc: &mut serde_json::Map<String, Value>) -> (Option<String>, Vec<String>, Option<String>, Option<String>) {
-    let id = doc.remove("_id").or_else(|| doc.remove("id"))
+    let id = doc.remove("_id").or_else(|| doc.get("id").cloned())
         .and_then(|v| match v {
             Value::String(s) => Some(s),
             Value::Null => None,
@@ -1158,7 +1158,6 @@ fn replace_table_ref(sql: &str, name: &str, query: &str) -> String {
                 let after_name = after_kw[nl..].trim_start();
                 // If it's already a parenthesised subquery, don't touch it.
                 if !after_name.starts_with('(') {
-                    out.push_str(&sql[..i]);
                     out.push_str(if is_from { "FROM " } else { "JOIN " });
                     out.push_str(&replacement);
                     // Skip past "FROM name" / "JOIN name" in the input.
@@ -3581,6 +3580,10 @@ fn compose_prefiltered(cname: &str, scan: &crate::relation::Scan, pre: &str) -> 
 }
 
 fn sql_engine_owns(sql: &str) -> bool {
+    if sql.trim_start().to_uppercase().starts_with("WITH ") {
+        return inline_ctes(sql.trim().trim_end_matches(';'))
+            .map(|rewritten| sql_engine_owns(&rewritten)).unwrap_or(false);
+    }
     let Ok(sel) = crate::sqlselect::parse(sql) else { return false };
     let touched = sel.base_relations();
     if touched.is_empty() {
@@ -3679,6 +3682,11 @@ fn try_catalog_select(
     sql: &str,
     db: Option<&Arc<Db>>,
 ) -> Result<Option<(Executed, crate::sqlplan::Plan)>, Vec<u8>> {
+    if sql.trim_start().to_uppercase().starts_with("WITH ") {
+        let rewritten = inline_ctes(sql.trim().trim_end_matches(';'))
+            .map_err(|why| err_msg("0A000", &why))?;
+        return try_catalog_select(&rewritten, db);
+    }
     let sel = match crate::sqlselect::parse(sql) {
         Ok(sel) => sel,
         Err(why) => {
@@ -5871,5 +5879,33 @@ mod tests {
         let err = translate("WITH RECURSIVE x AS (SELECT 1) SELECT * FROM x").unwrap_err();
         assert!(err.contains("RECURSIVE"), "should name the refusal: {}", err);
     }
-}
 
+    #[test]
+    fn cte_count_executes_through_sql_evaluator() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path(), None).unwrap());
+        execute_sql(&db, "INSERT INTO orders (id, status) VALUES (1, 'paid'), (2, 'pending'), (3, 'paid')", false).unwrap();
+        let sql = "WITH paid AS (SELECT * FROM orders WHERE status='paid') SELECT count(*) AS n FROM paid";
+        assert!(sql_engine_owns(sql));
+        assert!(describe_shape(sql, Some(&db), 0).is_some());
+        let result = execute_sql(&db, sql, true).unwrap();
+        assert_eq!(result.rows[0]["n"].as_f64(), Some(2.0));
+        assert!(execute_sql(&db, &format!("EXPLAIN {}", sql), true).is_ok());
+        assert!(execute_sql(&db, "WITH RECURSIVE x AS (SELECT 1) SELECT * FROM x", true).is_err());
+    }
+
+    #[test]
+    fn count_id_counts_values_not_storage_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path(), None).unwrap());
+        execute_sql(&db, "INSERT INTO orders (id, status) VALUES (1, 'paid'), (2, 'paid')", false).unwrap();
+        let count = |sql: &str| execute_sql(&db, sql, true).unwrap().rows[0]["n"].as_f64().unwrap();
+        assert_eq!(count("SELECT count(*) AS n FROM orders"), 2.0);
+        assert_eq!(count("SELECT count(id) AS n FROM orders"), 2.0);
+        execute_sql(&db, "INSERT INTO orders (id, status) VALUES (NULL, 'paid')", false).unwrap();
+        execute_sql(&db, "INSERT INTO orders (status) VALUES ('paid')", false).unwrap();
+        assert_eq!(count("SELECT count(*) AS n FROM orders"), 4.0);
+        assert_eq!(count("SELECT count(id) AS n FROM orders"), 3.0);
+    }
+
+}
