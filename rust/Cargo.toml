@@ -33,7 +33,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "11.12.16"
+version = "12.13.14"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/Eth-Interchained/nedb"
