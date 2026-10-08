@@ -222,10 +222,41 @@ impl<'a> Lexer<'a> {
 /// can only ever express a conjunction of comparisons. A tree is required for
 /// OR, for NOT, and for parenthesised grouping — `WHERE (a = 1 OR b = 2) AND
 /// c != 3` has no encoding as a flat list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractPart {
+    Year,
+    Quarter,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl ExtractPart {
+    fn parse(s: &str) -> Option<ExtractPart> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "year" => ExtractPart::Year,
+            "quarter" => ExtractPart::Quarter,
+            "month" => ExtractPart::Month,
+            "day" => ExtractPart::Day,
+            "hour" => ExtractPart::Hour,
+            "minute" => ExtractPart::Minute,
+            "second" => ExtractPart::Second,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Pred {
     /// field <op> value, for op in = != > < >= <=
     Cmp { field: String, op: String, value: Value },
+    /// extract(<part> FROM <field>) <op> value — Postgres date-part
+    /// extraction over ISO-8601 timestamp strings. A null, absent, or
+    /// unparseable field makes the predicate false in either polarity,
+    /// mirroring SQL's three-valued logic.
+    Extract { field: String, part: ExtractPart, op: String, value: Value },
     /// field [NOT] IN (v1, v2, ...)
     In { field: String, values: Vec<Value>, negated: bool },
     /// field [NOT] BETWEEN low AND high — inclusive on both ends, as in SQL.
@@ -425,6 +456,12 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Pred> {
+        // extract(<part> FROM <field>) <op> <value> — Postgres date-part
+        // extraction. Intercepted before parse_field so the `(` after
+        // `extract` is not misread as a missing operator.
+        if self.peek_extract() {
+            return self.parse_extract();
+        }
         let field = self.parse_field("WHERE")?;
 
         // field IS [NOT] NULL
@@ -513,6 +550,48 @@ impl Parser {
 
         let value = self.parse_value()?;
         Ok(Pred::Cmp { field, op, value })
+    }
+
+    /// True when the upcoming tokens are `extract (` — the Postgres
+    /// date-part function. `extract` is not a reserved word, so it arrives
+    /// as an Ident; the `(` is what distinguishes the function call from a
+    /// document field that happens to be named `extract`.
+    fn peek_extract(&self) -> bool {
+        let is_extract = match self.peek() {
+            Tok::Ident(s) => s.eq_ignore_ascii_case("extract"),
+            _ => false,
+        };
+        is_extract && matches!(self.toks.get(self.pos + 1), Some(Tok::Punct('(')))
+    }
+
+    /// Parse `extract(<part> FROM <field>) <op> <value>`.
+    ///
+    /// Only the comparison operators are supported: extract() is a value
+    /// function, so `IN` / `BETWEEN` / `LIKE` over it are refused with a
+    /// clear error rather than silently miscompiled.
+    fn parse_extract(&mut self) -> Result<Pred> {
+        self.advance(); // `extract`
+        self.expect_punct('(')?;
+        let part_name = match self.advance() {
+            Tok::Ident(s) | Tok::Kw(s, _) => s,
+            other => bail!("WHERE: extract() expects a date part (year, quarter, month, day, hour, minute, second), got {:?}", other),
+        };
+        let part = match ExtractPart::parse(&part_name) {
+            Some(p) => p,
+            None => bail!(
+                "WHERE: extract() does not support the {:?} part — supported: year, quarter, month, day, hour, minute, second",
+                part_name
+            ),
+        };
+        self.expect_kw("FROM")?;
+        let field = self.parse_field("WHERE")?;
+        self.expect_punct(')')?;
+        let op = match self.advance() {
+            Tok::Op(s) if matches!(s.as_str(), "=" | "!=" | ">" | "<" | ">=" | "<=") => s,
+            other => bail!("WHERE: extract() supports the comparison operators = != > < >= <=, got {:?}", other),
+        };
+        let value = self.parse_value()?;
+        Ok(Pred::Extract { field, part, op, value })
     }
 
     fn parse(&mut self) -> Result<Query> {
@@ -780,6 +859,64 @@ fn as_text(v: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// Parse an ISO-8601 timestamp string into
+/// (year, month, day, hour, minute, second).
+///
+/// Accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, and `YYYY-MM-DDTHH:MM:SS`,
+/// with optional fractional seconds and an optional `Z` / `±HH:MM` suffix.
+/// The wall-clock fields are returned as written: like Postgres's
+/// `timestamp without time zone`, extract() reports the stored fields, not
+/// a UTC conversion. Returns None for anything that is not a timestamp — the
+/// caller treats that as SQL NULL.
+fn parse_timestamp_parts(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (mut hour, mut minute, mut second) = (0i64, 0i64, 0i64);
+    let rest = s[10..].trim_start();
+    if !rest.is_empty() {
+        // The separator is `T` (ISO) or a space (already consumed by the
+        // trim above); what remains must start with HH:MM:SS.
+        let t = rest.strip_prefix('T').unwrap_or(rest);
+        if t.len() < 8 || t.as_bytes()[2] != b':' || t.as_bytes()[5] != b':' {
+            return None;
+        }
+        hour = t[0..2].parse().ok()?;
+        minute = t[3..5].parse().ok()?;
+        second = t[6..8].parse().ok()?;
+        if hour > 23 || minute > 59 || second > 60 {
+            return None; // 60 admits the leap second
+        }
+        // Anything after the seconds — fractional part, `Z`, or a numeric
+        // offset — is accepted and ignored: the fields above are what
+        // extract() reports.
+    }
+    Some((year, month, day, hour, minute, second))
+}
+
+/// Postgres `extract(<part> FROM <field>)` over an ISO-8601 timestamp
+/// string. None when the value is null, absent, or not a timestamp.
+fn extract_part(v: &Value, part: ExtractPart) -> Option<i64> {
+    let (year, month, day, hour, minute, second) = parse_timestamp_parts(v.as_str()?)?;
+    Some(match part {
+        ExtractPart::Year => year,
+        ExtractPart::Quarter => (month - 1) / 3 + 1,
+        ExtractPart::Month => month,
+        ExtractPart::Day => day,
+        ExtractPart::Hour => hour,
+        ExtractPart::Minute => minute,
+        ExtractPart::Second => second,
+    })
 }
 
 /// SQL LIKE matching: `%` matches any run of characters (including empty),
@@ -1134,6 +1271,16 @@ pub fn like_match_escape_pub(value: &str, pattern: &str, ci: bool, esc: char) ->
 fn eval_pred_with(get: &dyn Fn(&str) -> Value, pred: &Pred) -> bool {
     match pred {
         Pred::Cmp { field, op, value } => cmp_op(&get(field), op, value),
+
+        Pred::Extract { field, part, op, value } => {
+            // A null, absent, or unparseable field never satisfies the
+            // predicate — SQL's three-valued logic, same rule as LIKE.
+            // Date parts are whole numbers, so the comparison is integer.
+            match extract_part(&get(field), *part) {
+                Some(n) => cmp_op(&Value::Number(serde_json::Number::from(n)), op, value),
+                None => false,
+            }
+        }
 
         Pred::In { field, values, negated } => {
             let fv = get(field);
@@ -2099,6 +2246,92 @@ mod tests {
         assert!(rows.is_empty(), "`open_` must not match the 4-char value `open`");
         let (rows2, _) = query(&db, r#"FROM jobs WHERE status LIKE "ope_""#).unwrap();
         assert_eq!(ids(&rows2), vec!["1", "4"]);
+    }
+
+    fn setup_extract() -> (tempfile::TempDir, Db) {
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        for (i, ts) in [
+            "2024-06-15 10:30:00",
+            "2024-06-20 23:59:59",
+            "2025-01-01 00:00:00",
+            "2026-03-01T12:00:00Z",
+            "not-a-timestamp",
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.put(
+                "samples",
+                &(i + 1).to_string(),
+                serde_json::json!({ "taken_at": ts }),
+                vec![],
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // a row with no taken_at at all
+        db.put(
+            "samples",
+            "6",
+            serde_json::json!({ "other": 1 }),
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn where_extract_year_and_month() {
+        let (_tmp, db) = setup_extract();
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(year from taken_at) = 2024"#).unwrap();
+        assert_eq!(ids(&rows), vec!["1", "2"]);
+        let (rows, _) = query(
+            &db,
+            r#"FROM samples WHERE extract(year from taken_at) = 2024 AND extract(month from taken_at) = 6"#,
+        )
+        .unwrap();
+        assert_eq!(ids(&rows), vec!["1", "2"]);
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(month from taken_at) = 1"#).unwrap();
+        assert_eq!(ids(&rows), vec!["3"]);
+    }
+
+    #[test]
+    fn where_extract_all_parts() {
+        let (_tmp, db) = setup_extract();
+        // 2026-03-01T12:00:00Z is row 4
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(day from taken_at) = 1"#).unwrap();
+        assert_eq!(ids(&rows), vec!["3", "4"]);
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(hour from taken_at) = 12"#).unwrap();
+        assert_eq!(ids(&rows), vec!["4"]);
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(minute from taken_at) = 30"#).unwrap();
+        assert_eq!(ids(&rows), vec!["1"]);
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(second from taken_at) = 59"#).unwrap();
+        assert_eq!(ids(&rows), vec!["2"]);
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(quarter from taken_at) = 2"#).unwrap();
+        assert_eq!(ids(&rows), vec!["1", "2"]);
+    }
+
+    #[test]
+    fn where_extract_comparison_operators_and_null_semantics() {
+        let (_tmp, db) = setup_extract();
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(year from taken_at) > 2024"#).unwrap();
+        assert_eq!(ids(&rows), vec!["3", "4"]);
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(year from taken_at) != 2024"#).unwrap();
+        assert_eq!(ids(&rows), vec!["3", "4"]);
+        // the garbage string and the missing field match nothing, in either polarity
+        let (rows, _) = query(&db, r#"FROM samples WHERE extract(year from taken_at) = 1999"#).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn where_extract_rejects_unknown_part() {
+        let (_tmp, db) = setup_extract();
+        let err = query(&db, r#"FROM samples WHERE extract(week from taken_at) = 3"#).unwrap_err();
+        assert!(err.to_string().contains("does not support"), "unexpected error: {}", err);
     }
 
     #[test]
