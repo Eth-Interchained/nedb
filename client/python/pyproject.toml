@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nedb-engine-client"
-version = "12.14.15"
+version = "12.15.16"
 description = "Async Python client for nedbd — the nedb-engine server daemon"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
