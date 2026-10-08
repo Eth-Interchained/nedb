@@ -1,6 +1,6 @@
 [package]
 name        = "nesql"
-version     = "12.13.14"
+version     = "12.14.15"
 edition     = "2021"
 license     = "BUSL-1.1"
 description = "neSQL — PostgreSQL SQL plus NEDB's own clauses, and the command-line surface for a NEDB store"
@@ -24,7 +24,7 @@ path = "src/lib.rs"
 # The engine. A VERSION REQUIREMENT is declared alongside the path so a major
 # engine bump fails this crate's build instead of being reported as a version
 # this CLI was never checked against.
-nedb-engine = { path = "../nedb-v2", version = "12.13.14" }
+nedb-engine = { path = "../nedb-v2", version = "12.14.15" }
 
 serde_json = { version = "1", features = ["preserve_order"] }
 blake2     = "0.10"
