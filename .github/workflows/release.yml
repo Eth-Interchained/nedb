@@ -19,7 +19,7 @@ jobs:
   # ---------------------------------------------------------------- PyPI -----
   pypi:
     name: Publish to PyPI (universal)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     # Needs the wheels matrix only so the platform wheels are known to build
     # before this publishes -- NOT to borrow their binaries. This wheel is pure
     # Python by design; see the note in the steps below.
@@ -159,7 +159,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,   label: linux-x86_64,        mingw: false, manylinux: auto }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,   label: linux-x86_64,        mingw: false, manylinux: auto }
           - { os: windows-latest,  target: x86_64-pc-windows-msvc,     label: windows-x86_64,      mingw: false, manylinux: auto }
           # ARM64 Linux — Graviton, Ampere, and every container on an Apple
           # Silicon host. Built on a native ARM runner (free for public repos)
@@ -168,7 +168,7 @@ jobs:
           # musl / Alpine. Without these the install SUCCEEDS and then the
           # import fails, which is the worst shape of failure: it lands after
           # the user has already decided to try us.
-          - { os: ubuntu-latest,   target: x86_64-unknown-linux-musl,  label: linux-x86_64-musl,   mingw: false, manylinux: musllinux_1_2 }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-musl,  label: linux-x86_64-musl,   mingw: false, manylinux: musllinux_1_2 }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, label: linux-aarch64-musl, mingw: false, manylinux: musllinux_1_2 }
           # macOS wheels (arm64 + x86_64) are built by Codemagic on M2 Mac Minis.
           # MinGW/MSYS2 users get the binary via the fat py3-none-any universal wheel.
@@ -346,7 +346,7 @@ jobs:
   publish-native:
     name: Publish native wheels to PyPI
     needs: [wheels]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     # Run even if some wheel jobs failed (e.g. slow Mac runner) — publish whatever built.
     # --skip-existing means partial uploads are safe and idempotent.
     if: startsWith(github.ref, 'refs/tags/') && !cancelled()
@@ -369,7 +369,7 @@ jobs:
   # ----------------------------------------------------------- crates.io -----
   publish-crate:
     name: Publish nedb-engine to crates.io
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v4
@@ -407,7 +407,7 @@ jobs:
   # Create the GitHub release on tag push so Codemagic has a release to upload Mac binaries to.
   create-release:
     name: Create GitHub release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
@@ -433,7 +433,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,   target: x86_64-unknown-linux-gnu    }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu    }
           - { os: windows-latest,  target: x86_64-pc-windows-msvc      }
           # ARM64 Linux on a native ARM runner — Graviton, Ampere, and Linux
           # containers on Apple Silicon dev machines.
@@ -441,7 +441,7 @@ jobs:
           # musl / Alpine, one per architecture. napi's generated loader already
           # detects musl at runtime (via process.report glibcVersionRuntime) and
           # picks the -musl addon — it just needs one to exist.
-          - { os: ubuntu-latest,   target: x86_64-unknown-linux-musl   }
+          - { os: ubuntu-22.04,   target: x86_64-unknown-linux-musl   }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           # macOS napi builds handled by Codemagic — uploaded directly to the GitHub release.
     steps:
@@ -616,7 +616,7 @@ jobs:
   smoke-gate:
     name: Smoke gate (npm test vs built addon)
     needs: [node-binaries]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: "!cancelled()"
     steps:
       - uses: actions/checkout@v4
@@ -644,7 +644,7 @@ jobs:
 
   publish-npm:
     needs: [node-binaries, smoke-gate]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     # HARD GATE: publish to npm only if the smoke test passed against the
     # freshly-built native addon. A red smoke = no publish.
     if: startsWith(github.ref, 'refs/tags/') && needs.smoke-gate.result == 'success'
@@ -778,7 +778,7 @@ jobs:
 
   client-pypi:
     name: Publish nedb-engine-client to PyPI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -809,7 +809,7 @@ jobs:
 
   client-npm:
     name: Publish nedb-engine-client to npm
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

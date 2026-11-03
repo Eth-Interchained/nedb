@@ -44,7 +44,7 @@ env:
 jobs:
   benchmark:
     name: protocol A/B + provenance head-to-head
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
 
     steps:

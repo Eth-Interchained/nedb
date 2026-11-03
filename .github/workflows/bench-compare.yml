@@ -52,7 +52,7 @@ env:
 jobs:
   bench:
     name: head-to-head (${{ inputs.orders }} orders)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
