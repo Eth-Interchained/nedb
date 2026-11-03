@@ -362,7 +362,9 @@ pub fn plan(
 /// qualifier. With more than one relation in the query an unqualified name may
 /// belong to the other one, and pushing another relation's predicate into this
 /// scan is a false negative.
-pub fn to_nql_predicate(e: &Expr, binding: &str, strict_qual: bool) -> Option<String> {
+/// A column in FIELD position — the left side of a comparison, or the
+/// subject of `IN` — rendered as its bare field name, or `None`.
+fn nql_field(e: &Expr, binding: &str, strict_qual: bool) -> Option<String> {
     match e {
         Expr::Column { qual, name } => match qual {
             Some(q) if q.eq_ignore_ascii_case(binding) => Some(name.clone()),
@@ -370,27 +372,74 @@ pub fn to_nql_predicate(e: &Expr, binding: &str, strict_qual: bool) -> Option<St
             None if strict_qual => None,
             None => Some(name.clone()),
         },
+        _ => None,
+    }
+}
+
+/// An operand in VALUE position — the right side of a comparison, or an
+/// `IN` item — rendered only when it is a literal.
+///
+/// A column here must be REFUSED, never rendered as its bare name. NQL's
+/// predicate grammar has no column operand: its `parse_value` reads a bare
+/// identifier as a STRING literal (that is how unquoted values such as
+/// `WHERE _coll = blocks` work), so rendering `hi >= lo` into NQL produced
+/// `hi >= lo` again — text that looks identical and means `hi` compared
+/// against the string "lo". The pre-filter then dropped rows the real
+/// `WHERE` keeps (every numeric `hi > lo`, `hi >= lo` and `hi = lo`: a
+/// number never orders above a string in NQL's ordering), and because the
+/// full `WHERE` only ever sees rows the pre-filter passed, those rows were
+/// lost for good. Operators whose literal comparison happened to pass
+/// every row (`<`, `<>` over numbers) looked correct only because the
+/// evaluator above corrected the false positives. Refusing leaves the
+/// scan unfiltered for that conjunct, and the evaluator — which does
+/// evaluate column-vs-column per row — answers it.
+fn nql_value(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Literal(v) => nql_literal(v),
+        _ => None,
+    }
+}
+
+pub fn to_nql_predicate(e: &Expr, binding: &str, strict_qual: bool) -> Option<String> {
+    match e {
+        Expr::Column { .. } => nql_field(e, binding, strict_qual),
         Expr::Literal(v) => nql_literal(v),
         Expr::Binary { op, left, right } => {
             let o = op.to_ascii_uppercase();
-            let l = to_nql_predicate(left, binding, strict_qual)?;
-            let r = to_nql_predicate(right, binding, strict_qual)?;
             match o.as_str() {
-                // Comparisons. `<>` is spelled `!=` in NQL.
-                "=" | "!=" | ">" | "<" | ">=" | "<=" | "LIKE" => Some(format!("{} {} {}", l, o, r)),
-                "<>" => Some(format!("{} != {}", l, r)),
                 // Both sides of a boolean connective must render, or the
                 // result is a different predicate rather than a looser one.
-                "AND" => Some(format!("({} AND {})", l, r)),
-                "OR" => Some(format!("({} OR {})", l, r)),
+                "AND" => {
+                    let l = to_nql_predicate(left, binding, strict_qual)?;
+                    let r = to_nql_predicate(right, binding, strict_qual)?;
+                    Some(format!("({} AND {})", l, r))
+                }
+                "OR" => {
+                    let l = to_nql_predicate(left, binding, strict_qual)?;
+                    let r = to_nql_predicate(right, binding, strict_qual)?;
+                    Some(format!("({} OR {})", l, r))
+                }
+                // Comparisons. `<>` is spelled `!=` in NQL. The left side
+                // must be a field and the right side a literal — see
+                // `nql_value` for why a column on the right is refused.
+                "=" | "!=" | ">" | "<" | ">=" | "<=" | "LIKE" => {
+                    let l = nql_field(left, binding, strict_qual)?;
+                    let r = nql_value(right)?;
+                    Some(format!("{} {} {}", l, o, r))
+                }
+                "<>" => {
+                    let l = nql_field(left, binding, strict_qual)?;
+                    let r = nql_value(right)?;
+                    Some(format!("{} != {}", l, r))
+                }
                 _ => None,
             }
         }
         Expr::InList { expr, list, negated: false } => {
-            let l = to_nql_predicate(expr, binding, strict_qual)?;
+            let l = nql_field(expr, binding, strict_qual)?;
             let mut items = Vec::with_capacity(list.len());
             for it in list {
-                items.push(to_nql_predicate(it, binding, strict_qual)?);
+                items.push(nql_value(it)?);
             }
             if items.is_empty() {
                 return None;
@@ -726,6 +775,39 @@ mod tests {
         ] {
             assert_eq!(pre(sql, "orders"), None, "{}", sql);
         }
+    }
+
+    #[test]
+    fn a_column_on_the_right_of_a_comparison_is_refused_for_every_operator() {
+        // NQL has no column operand: a bare identifier on the right of a
+        // comparison parses as a STRING literal there, so pushing
+        // `hi >= lo` compared `hi` against the text "lo" and the
+        // pre-filter dropped rows the real WHERE keeps. Every operator,
+        // numeric and string columns alike, qualified or not, is refused;
+        // the evaluator above the scan evaluates it per row instead.
+        for w in [
+            "hi > lo", "hi >= lo", "hi < lo", "hi <= lo", "hi = lo", "hi <> lo",
+            "hi != lo", "name_b > name_a", "name_b = name_a",
+            "orders.hi >= orders.lo", "hi LIKE lo", "hi IN (lo, 2)",
+        ] {
+            assert_eq!(pre(&format!("SELECT 1 FROM orders WHERE {w}"), "orders"), None, "{w}");
+        }
+        // A literal on the LEFT is likewise not a field NQL can lead with.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE 5 < hi", "orders"), None);
+    }
+
+    #[test]
+    fn a_conjunction_keeps_its_literal_half_when_the_other_half_is_column_vs_column() {
+        // A subset of a conjunction is a weaker filter: the renderable
+        // half still pushes, the column-vs-column half is left to the
+        // evaluator, and no row it would keep is dropped.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status = 'paid' AND hi >= lo", "orders")
+                       .as_deref(),
+                   Some("status = \"paid\""));
+        // But half an OR is a different predicate, so a disjunction with a
+        // column-vs-column arm is refused whole.
+        assert_eq!(pre("SELECT 1 FROM orders WHERE status = 'paid' OR hi >= lo", "orders"),
+                   None);
     }
 
     #[test]

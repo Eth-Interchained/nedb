@@ -203,6 +203,19 @@ impl Manager {
     }
 
     async fn create_db(&self, name: &str) -> anyhow::Result<Arc<Db>> {
+        // Idempotent create: a name that is already open returns the LIVE
+        // incarnation. Opening a second engine on the same directory and
+        // swapping the registry entry orphans the first engine while its
+        // sessions keep writing into the shared files — the two incarnations
+        // then disagree about what rows exist (rows vanish for new
+        // connections, tombstoned objects resurface for others). Callers
+        // (e.g. the Django backend) already treat create as idempotent:
+        // they forgive a 409 and proceed against the existing database.
+        // Under NEDB_SHARED_OPEN=1 the second open below would otherwise
+        // succeed silently and split the database in two.
+        if let Some(existing) = self.get_db(name).await {
+            return Ok(existing);
+        }
         let (data_dir, tmk, memory_mode) = {
             let inner = self.inner.read().await;
             (inner.data_dir.clone(), inner.tmk, inner.memory_mode)
@@ -218,7 +231,13 @@ impl Manager {
             Db::start_manifest_ticker(Arc::clone(&db), 1000);
             db
         };
-        self.inner.write().await.dbs.insert(name.to_string(), db.clone());
+        // Re-check under the write lock: a concurrent create of the same
+        // name may have registered first — never overwrite a live entry.
+        let mut inner = self.inner.write().await;
+        if let Some(existing) = inner.dbs.get(name) {
+            return Ok(existing.clone());
+        }
+        inner.dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
 
@@ -228,7 +247,20 @@ impl Manager {
             // Flush manifest before dropping
             db.flush_manifest_if_dirty();
             let data_dir = self.inner.read().await.data_dir.clone();
-            let _ = std::fs::remove_dir_all(data_dir.join(name));
+            let path = data_dir.join(name);
+            // A silently-partial delete is a resurrection bug: whatever
+            // object/index files survive are replayed by the next create
+            // of this name as if they were fresh data. Background flushers
+            // (the dying incarnation's own Drop/ticker) can recreate files
+            // mid-walk, so verify the directory is really gone and retry
+            // once before reporting the drop.
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                eprintln!("  [nedbd] drop {:?}: remove_dir_all failed ({}); retrying", name, e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Err(e2) = std::fs::remove_dir_all(&path) {
+                    eprintln!("  [nedbd] drop {:?}: directory NOT fully removed ({}); a recreate may resurrect stale files", name, e2);
+                }
+            }
             true
         } else {
             false
