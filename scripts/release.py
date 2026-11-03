@@ -72,7 +72,14 @@ COMMON = ["package.json", "pyproject.toml", "rust/Cargo.toml", "rust/nedb-v2/Car
           # and the `nedb-engine` line, so one entry fixes both.
           # Absent from the distribution forks, where the existing
           # os.path.exists guard skips it.
-          "rust/nesql-cli/Cargo.toml"]
+          "rust/nesql-cli/Cargo.toml",
+          # The wasm crate (rust/nedb-wasm/) is the same shape and was
+          # stranded the same way: it carries the identical
+          #   nedb-engine = { path = "../nedb-v2", version = "<engine>" }
+          # line, it arrived (the wasm spike) after this list was written,
+          # and every engine bump since has left its pin behind -- caught
+          # once by hand in CI, once at release time. One entry fixes both.
+          "rust/nedb-wasm/Cargo.toml"]
 KEYS = ("version", "nedb-engine", "nedb_engine", "nedb-core", "nedb_core")
 
 TOK = os.environ.get("GITHUB_TOKEN")
@@ -166,6 +173,14 @@ def core_versions(root, distro=None):
         # Named as missing rather than skipped: if the dependency line stops
         # carrying a version the gate must say so, not fall silent.
         out["cli nedb-engine dep"] = m.group(1) if m else "MISSING"
+    # The wasm crate, same treatment as the CLI: its own stamp and its
+    # engine pin are both gated, so a stranded pin fails here, in the
+    # survey, instead of surfacing as an unresolvable cargo build later.
+    out["wasm nedb-wasm"] = first_ver("rust/nedb-wasm/Cargo.toml")
+    wasm = os.path.join(root, "rust", "nedb-wasm", "Cargo.toml")
+    if os.path.exists(wasm):
+        m = re.search(r'nedb-engine\s*=\s*\{[^}]*version\s*=\s*"([^"]+)"', open(wasm).read())
+        out["wasm nedb-engine dep"] = m.group(1) if m else "MISSING"
     if distro:
         wf = os.path.join(root, "rust", "crates", distro, "Cargo.toml")
         if os.path.exists(wf):
