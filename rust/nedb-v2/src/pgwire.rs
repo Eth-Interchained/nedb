@@ -309,6 +309,50 @@ pub struct InsertRow {
     pub valid_to: Option<String>,
 }
 
+/// Collapse whitespace runs to a single space — but ONLY outside string
+/// literals. Inside a `'…'` literal (or a `"…"` quoted run) every byte is
+/// data and is copied verbatim: a newline, tab, CR or run of spaces in a
+/// stored TEXT value must round-trip byte-identically. The previous
+/// implementation ended `normalise` with `split_whitespace().join(" ")`
+/// over the whole statement, which flattened whitespace INSIDE literals
+/// too — `'a\nb'` was stored as `'a b'` (D2, OpenSalon messaging census).
+fn collapse_ws_outside_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut in_s = false;
+    let mut in_d = false;
+    while let Some(c) = chars.next() {
+        if in_s {
+            out.push(c);
+            if c == '\'' {
+                // A doubled '' is one literal quote, not the end.
+                if chars.peek() == Some(&'\'') { out.push(chars.next().unwrap()); }
+                else { in_s = false; }
+            }
+            continue;
+        }
+        if in_d {
+            out.push(c);
+            if c == '"' {
+                if chars.peek() == Some(&'"') { out.push(chars.next().unwrap()); }
+                else { in_d = false; }
+            }
+            continue;
+        }
+        match c {
+            '\'' => { in_s = true; out.push(c); }
+            '"' => { in_d = true; out.push(c); }
+            c if c.is_whitespace() => {
+                // One space per run, and none at the edges (trim).
+                if !out.is_empty() && !out.ends_with(' ') { out.push(' '); }
+            }
+            _ => out.push(c),
+        }
+    }
+    if out.ends_with(' ') { out.pop(); }
+    out
+}
+
 /// Strip SQL comments and collapse whitespace, so the matchers below can be
 /// simple without being fragile about formatting.
 fn normalise(sql: &str) -> String {
@@ -340,7 +384,7 @@ fn normalise(sql: &str) -> String {
             _ => out.push(c),
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    collapse_ws_outside_literals(&out)
 }
 
 /// Rewrite SQL literal/operator spellings into NQL's.
@@ -1548,10 +1592,8 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
                 _ => keys.push(item.to_string()),
             }
         }
-        tail = format!("{} ORDER BY {} {}", &tail[..ob_at], keys.join(", "), &tail[end..])
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        tail = collapse_ws_outside_literals(
+            &format!("{} ORDER BY {} {}", &tail[..ob_at], keys.join(", "), &tail[end..]));
     }
 
     // ── GROUP BY: refuse a bare column that SQL would refuse ─────────────────
@@ -1605,10 +1647,8 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
         // `count` rides along free with a named aggregate — an NQL grouped row
         // carries the key, `count` AND the aggregate — so only the named one
         // is emitted when both were asked for.
-        tail = format!("{} GROUP BY {}{} {}", head, group_key, agg_clause, after_key)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        tail = collapse_ws_outside_literals(
+            &format!("{} GROUP BY {}{} {}", head, group_key, agg_clause, after_key));
         agg_clause.clear();
     }
 
@@ -4717,6 +4757,26 @@ mod tests {
         match translate(sql).unwrap() {
             Stmt::Query { project, .. } => project,
             other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn newlines_inside_string_literals_survive_normalise() {
+        // D2: `normalise` used to end in split_whitespace().join(" "), which
+        // flattened whitespace INSIDE literals — 'a\nb' was stored as 'a b'
+        // on both the simple-literal and bound-parameter INSERT paths.
+        assert_eq!(
+            normalise("INSERT INTO msgs (_id, body) VALUES ('s1', 'News body, with comma\nand a second line')"),
+            "INSERT INTO msgs (_id, body) VALUES ('s1', 'News body, with comma\nand a second line')");
+        assert_eq!(
+            normalise("INSERT  INTO\nmsgs (body) VALUES ('a\r\nb\tc  d  ')"),
+            "INSERT INTO msgs (body) VALUES ('a\r\nb\tc  d  ')",
+            "outside literals whitespace still collapses; inside it is verbatim");
+        // An INSERT through translate() carries the byte-identical value.
+        match translate("INSERT INTO msgs (_id, body) VALUES ('s1', 'x\ny')") {
+            Ok(Stmt::Insert { rows, .. }) => assert_eq!(
+                rows[0].doc.get("body").and_then(|v| v.as_str()), Some("x\ny")),
+            other => panic!("expected an insert, got {:?}", other),
         }
     }
 
