@@ -77,6 +77,28 @@ fn open(path: &str) -> Db {
     }
 }
 
+
+/// Open the store and wait for the cold scan to finish indexing before
+/// serving an index-backed read. `Db::open` starts the scan in the
+/// background; a `get` issued against a half-scanned store reports a
+/// durable document as "not found" -- a wrong answer the caller cannot
+/// tell apart from a real miss (a genuine miss is also exit 1). `repair`
+/// already waits for `scan_complete` before trusting the index; the read
+/// commands must too.
+fn open_ready(path: &str) -> Db {
+    let db = open(path);
+    let mut waited = 0u64;
+    while !db.scan_status().scan_complete {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waited += 50;
+        if waited > 120_000 {
+            eprintln!("nedb-cli: store scan did not complete within 120s -- refusing to answer from a partial index");
+            exit(1);
+        }
+    }
+    db
+}
+
 fn need_path(rest: &[String]) -> &str {
     match rest.first() {
         Some(p) => p.as_str(),
@@ -126,7 +148,7 @@ fn cmd_get(rest: &[String]) -> i32 {
         (Some(c), Some(i)) => (c.as_str(), i.as_str()),
         _ => { eprintln!("nedb-cli: get needs <coll> <id>\n"); usage(); return 2; }
     };
-    let db = open(path);
+    let db = open_ready(path);
     let node = match rest.get(3).and_then(|s| s.parse::<u64>().ok()) {
         Some(seq) => db.get_as_of(coll, id, seq),
         None => db.get(coll, id),
@@ -141,7 +163,7 @@ fn cmd_scan(rest: &[String]) -> i32 {
     let path = need_path(rest);
     let after = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     let limit = rest.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0); // 0 → engine default cap
-    let db = open(path);
+    let db = open_ready(path);
     let batch = db.since(after, limit);
     for n in &batch.nodes {
         println!("{}", serde_json::to_string(n).unwrap());
@@ -195,7 +217,7 @@ fn cmd_repair(rest: &[String]) -> i32 {
 }
 
 fn cmd_export(rest: &[String]) -> i32 {
-    let db = open(need_path(rest));
+    let db = open_ready(need_path(rest));
     let colls: Vec<String> = match rest.get(1) {
         Some(c) => vec![c.clone()],
         None => db.collections(),
