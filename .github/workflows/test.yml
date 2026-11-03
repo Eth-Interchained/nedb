@@ -49,8 +49,8 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.9", "3.11", "3.12"]
-        os: [ubuntu-latest]
-        # ubuntu-latest rolled forward to Ubuntu 26.04, whose setup-python
+        os: [ubuntu-22.04]
+        # ubuntu-22.04 rolled forward to Ubuntu 26.04, whose setup-python
         # manifest carries no CPython 3.9 build (3.9 is EOL) — the 3.9 leg
         # died at setup before running a single test. Pin that one leg to
         # the last image that still ships 3.9; the rest stay on latest.
@@ -110,7 +110,7 @@ jobs:
   # ------------------------------------------------------------------ rust ---
   rust:
     name: rust (engine + bindings)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -155,7 +155,7 @@ jobs:
   # silently once (fixed in 2.8.5) and is invisible to behavioural tests.
   node:
     name: node (addon + smoke + durability)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -191,7 +191,7 @@ jobs:
   # rather than mid-release.
   python-native:
     name: python (native extension)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -258,7 +258,7 @@ jobs:
   # and stays fast.
   clients:
     name: clients (published packages)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -300,7 +300,7 @@ jobs:
   # only real duty is to build the binary and put it there.
   python-daemon:
     name: python (nedbd HTTP)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
