@@ -46,7 +46,15 @@ pub mod sqlplan;
 pub mod sqlpush;
 #[cfg(feature = "cast")]
 pub mod cast;
+// The HTTP server (axum/tokio) does not target wasm32-unknown-unknown.
+// The wasm build ships the engine library only — no nedbd, no pgwire
+// networking. Native builds are untouched.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod server;
+// wasm32 has no threads: rayon is unavailable there, so the parallel
+// iterators degrade to sequential ones via this shim (native keeps rayon).
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod rayon_compat;
 
 pub use store::{Dek, Node, ObjectStore};
 pub use index::{IdIndex, OrderedValue, SortedIndexes};

@@ -48,25 +48,33 @@ hex          = "0.4"
 chrono       = { version = "0.4", default-features = false, features = ["std"] }
 
 # Concurrency
-rayon        = "1"
 dashmap      = "5"
 parking_lot  = "0.12"
-
-# HTTP server
-axum         = { version = "0.7", features = ["json", "query"] }
-tokio        = { version = "1",   features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tower-http   = { version = "0.5", features = ["cors"] }
-
-# SSE log streaming
-futures-core = "0.3"
 
 # Error handling
 thiserror    = "1"
 anyhow       = "1"
 
+# ── Native-only dependencies ──────────────────────────────────────────────
+# The wasm32 build compiles the engine library without the server, the
+# advisory dir lock, or threads. Everything under this target section is
+# excluded on wasm32-unknown-unknown; native builds resolve exactly as before.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# rayon: on wasm32 there are no threads, so the parallel iterators degrade to
+# sequential ones via the crate-internal `rayon_compat` shim
+# (src/rayon_compat.rs), selected with cfg(target_arch) at the use sites.
+rayon        = "1"
+# HTTP server (nedbd + pgwire networking): tokio/axum do not target
+# wasm32-unknown-unknown.
+axum         = { version = "0.7", features = ["json", "query"] }
+tokio        = { version = "1",   features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http   = { version = "0.5", features = ["cors"] }
+# SSE log streaming — server-only.
+futures-core = "0.3"
 # Data-dir advisory lock (split-brain guard in Db::open) — flock(2) on unix,
-# LockFileEx on Windows, one cross-platform call.
+# LockFileEx on Windows, one cross-platform call. wasm has no other process
+# to guard against (and the wasm API is in-memory-only anyway).
 fs2          = "0.4"
 
 # Fast-fsync on macOS: std's File::sync_all/sync_data map to F_FULLFSYNC there

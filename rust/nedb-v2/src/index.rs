@@ -202,7 +202,10 @@ impl IdIndex {
     /// `verify()` reported 30 healthy objects, `list()` returned 0.
     pub fn try_flush_write_buf(&self) -> std::io::Result<()> {
         if self.mem.is_some() || self.write_buf.is_empty() { return Ok(()); }
+#[cfg(not(target_arch = "wasm32"))]
         use rayon::prelude::*;
+        #[cfg(target_arch = "wasm32")]
+        use crate::rayon_compat::prelude::*;
         // Drain all pending entries and write them in parallel
         let entries: Vec<((String, String), Option<String>)> = self.write_buf
             .iter()

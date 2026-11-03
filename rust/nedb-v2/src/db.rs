@@ -221,6 +221,11 @@ impl Db {
     /// Refuses (with the holder's pid when known) rather than allowing a
     /// second live engine on the same files. NEDB_SHARED_OPEN=1 skips the
     /// guard entirely — for tooling that knowingly accepts split-brain risk.
+    ///
+    /// On wasm32 there is no other process to guard against (and the wasm
+    /// API is in-memory-only, which takes no lock) — fs2 has no wasm target,
+    /// so this is a no-op there. Native behavior is unchanged.
+    #[cfg(not(target_arch = "wasm32"))]
     fn acquire_dir_lock(db_root: &Path) -> Result<Option<std::fs::File>> {
         if std::env::var("NEDB_SHARED_OPEN").map(|v| v.trim() == "1").unwrap_or(false) {
             return Ok(None);
@@ -247,6 +252,12 @@ impl Db {
         let _ = writeln!(&lock_file, "{}", std::process::id());
         let _ = lock_file.sync_all();
         Ok(Some(lock_file))
+    }
+
+    /// wasm32 twin of `acquire_dir_lock` (see above): no-op, no lock.
+    #[cfg(target_arch = "wasm32")]
+    fn acquire_dir_lock(_db_root: &Path) -> Result<Option<std::fs::File>> {
+        Ok(None)
     }
 
     /// Open (or create) a database. Runs v1→v2 migration automatically if log.aof is present.
@@ -952,7 +963,10 @@ impl Db {
         ops: Vec<(String, String, Value, Vec<String>, Option<String>, Option<String>)>,
         // (coll, id, data, caused_by, valid_from, valid_to)
     ) -> Result<Vec<Node>> {
+#[cfg(not(target_arch = "wasm32"))]
         use rayon::prelude::*;
+        #[cfg(target_arch = "wasm32")]
+        use crate::rayon_compat::prelude::*;
 
         if ops.is_empty() { return Ok(vec![]); }
 
@@ -1885,7 +1899,10 @@ impl Drop for Db {
 
 /// Background cold-scan worker. Takes Arc<Db> — safe, Db is on the heap.
 fn cold_scan_background_arc(db: Arc<Db>) {
+    #[cfg(not(target_arch = "wasm32"))]
     use rayon::prelude::*;
+    #[cfg(target_arch = "wasm32")]
+    use crate::rayon_compat::prelude::*;
 
     let objects        = &db.objects;
     let seq_atomic     = &db.seq;
@@ -2066,11 +2083,25 @@ fn rebuild_id_index_from_nodes(db: &Db, nodes: &[Node]) -> usize {
     written
 }
 
+/// Wall-clock seconds since the Unix epoch, stamped on every node as `ts`.
+///
+/// On wasm32-unknown-unknown `std::time::SystemTime` has no clock to read, so
+/// this falls back to a process-local monotonic counter. Ordering (the only
+/// property the engine relies on for `ts`) is preserved; absolute values are
+/// not wall-clock time. Native builds use the real clock, unchanged.
+#[cfg(not(target_arch = "wasm32"))]
 fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TICK: AtomicU64 = AtomicU64::new(1_700_000_000);
+    TICK.fetch_add(1, Ordering::SeqCst) as f64
 }
 
 #[cfg(test)]

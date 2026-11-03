@@ -118,6 +118,17 @@ fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// wasm32: no `FileExt::read_exact_at` / `seek_read` — clone the handle and
+/// seek+read. Correct, just not zero-copy; the wasm build is in-memory-only
+/// anyway, so segment files are never opened there (this only has to compile).
+#[cfg(target_arch = "wasm32")]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut owned = f.try_clone()?;
+    owned.seek(SeekFrom::Start(offset))?;
+    owned.read_exact(buf)
+}
+
 /// The currently-appended-to segment.
 struct Active {
     id: u32,

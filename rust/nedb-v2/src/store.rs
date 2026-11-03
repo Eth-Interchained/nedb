@@ -303,7 +303,10 @@ impl ObjectStore {
 
     /// Verify all objects. Returns (ok_count, tampered_hashes).
     pub fn verify_all(&self) -> (usize, Vec<String>) {
+#[cfg(not(target_arch = "wasm32"))]
         use rayon::prelude::*;
+        #[cfg(target_arch = "wasm32")]
+        use crate::rayon_compat::prelude::*;
         let hashes: Vec<String> = self.all_hashes().collect();
         let results: Vec<(bool, String)> = hashes.par_iter().map(|h| {
             (self.read(h).is_ok(), h.clone())

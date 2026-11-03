@@ -82,7 +82,7 @@ jobs:
         run: |
           VERSION="${{ github.ref_name }}"
           echo "Polling GitHub release for the Mac binaries (nedbd-v2 + nesql)..."
-          for i in $(seq 1 35); do
+          for i in $(seq 1 55); do
             ASSETS=$(gh release view "$VERSION" --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
             ARM=$(echo "$ASSETS" | grep -c "nedbd-v2-darwin-arm64" || true)
             X86=$(echo "$ASSETS" | grep -c "nedbd-v2-darwin-x64" || true)

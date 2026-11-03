@@ -142,7 +142,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::db::Db;
@@ -307,6 +309,50 @@ pub struct InsertRow {
     pub valid_to: Option<String>,
 }
 
+/// Collapse whitespace runs to a single space — but ONLY outside string
+/// literals. Inside a `'…'` literal (or a `"…"` quoted run) every byte is
+/// data and is copied verbatim: a newline, tab, CR or run of spaces in a
+/// stored TEXT value must round-trip byte-identically. The previous
+/// implementation ended `normalise` with `split_whitespace().join(" ")`
+/// over the whole statement, which flattened whitespace INSIDE literals
+/// too — `'a\nb'` was stored as `'a b'` (D2, OpenSalon messaging census).
+fn collapse_ws_outside_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut in_s = false;
+    let mut in_d = false;
+    while let Some(c) = chars.next() {
+        if in_s {
+            out.push(c);
+            if c == '\'' {
+                // A doubled '' is one literal quote, not the end.
+                if chars.peek() == Some(&'\'') { out.push(chars.next().unwrap()); }
+                else { in_s = false; }
+            }
+            continue;
+        }
+        if in_d {
+            out.push(c);
+            if c == '"' {
+                if chars.peek() == Some(&'"') { out.push(chars.next().unwrap()); }
+                else { in_d = false; }
+            }
+            continue;
+        }
+        match c {
+            '\'' => { in_s = true; out.push(c); }
+            '"' => { in_d = true; out.push(c); }
+            c if c.is_whitespace() => {
+                // One space per run, and none at the edges (trim).
+                if !out.is_empty() && !out.ends_with(' ') { out.push(' '); }
+            }
+            _ => out.push(c),
+        }
+    }
+    if out.ends_with(' ') { out.pop(); }
+    out
+}
+
 /// Strip SQL comments and collapse whitespace, so the matchers below can be
 /// simple without being fragile about formatting.
 fn normalise(sql: &str) -> String {
@@ -338,7 +384,7 @@ fn normalise(sql: &str) -> String {
             _ => out.push(c),
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    collapse_ws_outside_literals(&out)
 }
 
 /// Rewrite SQL literal/operator spellings into NQL's.
@@ -1546,10 +1592,8 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
                 _ => keys.push(item.to_string()),
             }
         }
-        tail = format!("{} ORDER BY {} {}", &tail[..ob_at], keys.join(", "), &tail[end..])
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        tail = collapse_ws_outside_literals(
+            &format!("{} ORDER BY {} {}", &tail[..ob_at], keys.join(", "), &tail[end..]));
     }
 
     // ── GROUP BY: refuse a bare column that SQL would refuse ─────────────────
@@ -1603,10 +1647,8 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
         // `count` rides along free with a named aggregate — an NQL grouped row
         // carries the key, `count` AND the aggregate — so only the named one
         // is emitted when both were asked for.
-        tail = format!("{} GROUP BY {}{} {}", head, group_key, agg_clause, after_key)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        tail = collapse_ws_outside_literals(
+            &format!("{} GROUP BY {}{} {}", head, group_key, agg_clause, after_key));
         agg_clause.clear();
     }
 
@@ -2927,6 +2969,7 @@ fn probe_sql(sql: &str, n_params: usize) -> String {
 }
 
 /// Run a portal's statement if it has not run yet, then report its shape.
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_executed(
     portal: &mut Portal,
     db_name: &str,
@@ -2963,12 +3006,14 @@ fn ensure_executed(
 
 // ── connection handling ─────────────────────────────────────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn read_exact(sock: &mut TcpStream, n: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     sock.read_exact(&mut buf).await?;
     Ok(buf)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn read_i32(sock: &mut TcpStream) -> std::io::Result<i32> {
     let b = read_exact(sock, 4).await?;
     Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
@@ -2986,7 +3031,31 @@ fn parse_startup_params(body: &[u8]) -> HashMap<String, String> {
     out
 }
 
+/// True when the incarnation a session bound at connect time is no longer
+/// the registry's current incarnation for that name — the database was
+/// dropped (and possibly recreated) underneath the session. A session that
+/// never resolved a database (unknown name at connect) is not stale: it
+/// keeps receiving the ordinary "not open" error per statement.
+#[cfg(not(target_arch = "wasm32"))]
+async fn incarnation_stale(
+    resolver: &Arc<dyn DbResolver>,
+    db_name: &str,
+    bound: &Option<Arc<Db>>,
+) -> bool {
+    let Some(bound_db) = bound else { return false };
+    let r = Arc::clone(resolver);
+    let name = db_name.to_string();
+    let current = tokio::task::spawn_blocking(move || r.resolve(&name))
+        .await
+        .unwrap_or(None);
+    match current {
+        Some(cur) => !Arc::ptr_eq(bound_db, &cur),
+        None => true,
+    }
+}
+
 /// Serve one client connection to completion.
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: bool) -> std::io::Result<()> {
     // ── startup, including the SSL negotiation clients try first ────────────
     let params = loop {
@@ -3023,6 +3092,14 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
     // A Postgres connection is bound to one database for its whole life, so
     // per-connection resolution is both correct and simpler than resolving per
     // statement — and it keeps the lock acquisition off the async worker.
+    //
+    // The binding is to an INCARNATION, not just a name: if the database is
+    // dropped (and possibly recreated) over HTTP while this connection lives,
+    // the bound `Db` becomes an orphan that shares the new incarnation's
+    // directory but none of its in-memory state — statements on it would
+    // silently read/write a split-brain copy. The message loop therefore
+    // re-checks the binding against the registry before each query/execute
+    // (see `incarnation_stale`) and refuses stale sessions.
     let resolved: Option<Arc<Db>> = {
         let r = Arc::clone(&resolver);
         let name = db_name.clone();
@@ -3114,6 +3191,12 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
             b'X' => return Ok(()), // Terminate
 
             b'Q' => {
+                if incarnation_stale(&resolver, &db_name, &resolved).await {
+                    sock.write_all(&err_msg("08006", &format!(
+                        "database {:?} was dropped or recreated on this server — reconnect to use its current incarnation", db_name))).await?;
+                    sock.write_all(&ready()).await?;
+                    return Ok(());
+                }
                 let sql = String::from_utf8_lossy(&body).trim_end_matches('\0').to_string();
                 let out = run_simple_query(&sql, &db_name, resolved.as_ref(), read_only);
                 sock.write_all(&out).await?;
@@ -3305,6 +3388,12 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
 
             // ── Execute: portal, maximum rows (0 = all) ────────────────────
             b'E' => {
+                if incarnation_stale(&resolver, &db_name, &resolved).await {
+                    sock.write_all(&err_msg("08006", &format!(
+                        "database {:?} was dropped or recreated on this server — reconnect to use its current incarnation", db_name))).await?;
+                    failed = true;
+                    continue;
+                }
                 let mut at = 0usize;
                 let name = take_cstr(&body, &mut at);
                 let max_rows = take_i32(&body, &mut at).unwrap_or(0);
@@ -4589,6 +4678,7 @@ fn split_statements(sql: &str) -> Vec<String> {
 }
 
 /// Bind and serve the Postgres read endpoint until the process exits.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run(host: &str, port: u16, resolver: Arc<dyn DbResolver>) -> anyhow::Result<()> {
     // Writes are ON by default — that is the parity position. An operator who
     // wants the "system of proof beside your database" deployment, where this
@@ -4710,6 +4800,26 @@ mod tests {
         match translate(sql).unwrap() {
             Stmt::Query { project, .. } => project,
             other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn newlines_inside_string_literals_survive_normalise() {
+        // D2: `normalise` used to end in split_whitespace().join(" "), which
+        // flattened whitespace INSIDE literals — 'a\nb' was stored as 'a b'
+        // on both the simple-literal and bound-parameter INSERT paths.
+        assert_eq!(
+            normalise("INSERT INTO msgs (_id, body) VALUES ('s1', 'News body, with comma\nand a second line')"),
+            "INSERT INTO msgs (_id, body) VALUES ('s1', 'News body, with comma\nand a second line')");
+        assert_eq!(
+            normalise("INSERT  INTO\nmsgs (body) VALUES ('a\r\nb\tc  d  ')"),
+            "INSERT INTO msgs (body) VALUES ('a\r\nb\tc  d  ')",
+            "outside literals whitespace still collapses; inside it is verbatim");
+        // An INSERT through translate() carries the byte-identical value.
+        match translate("INSERT INTO msgs (_id, body) VALUES ('s1', 'x\ny')") {
+            Ok(Stmt::Insert { rows, .. }) => assert_eq!(
+                rows[0].doc.get("body").and_then(|v| v.as_str()), Some("x\ny")),
+            other => panic!("expected an insert, got {:?}", other),
         }
     }
 
