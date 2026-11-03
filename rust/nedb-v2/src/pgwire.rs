@@ -3031,6 +3031,29 @@ fn parse_startup_params(body: &[u8]) -> HashMap<String, String> {
     out
 }
 
+/// True when the incarnation a session bound at connect time is no longer
+/// the registry's current incarnation for that name — the database was
+/// dropped (and possibly recreated) underneath the session. A session that
+/// never resolved a database (unknown name at connect) is not stale: it
+/// keeps receiving the ordinary "not open" error per statement.
+#[cfg(not(target_arch = "wasm32"))]
+async fn incarnation_stale(
+    resolver: &Arc<dyn DbResolver>,
+    db_name: &str,
+    bound: &Option<Arc<Db>>,
+) -> bool {
+    let Some(bound_db) = bound else { return false };
+    let r = Arc::clone(resolver);
+    let name = db_name.to_string();
+    let current = tokio::task::spawn_blocking(move || r.resolve(&name))
+        .await
+        .unwrap_or(None);
+    match current {
+        Some(cur) => !Arc::ptr_eq(bound_db, &cur),
+        None => true,
+    }
+}
+
 /// Serve one client connection to completion.
 #[cfg(not(target_arch = "wasm32"))]
 async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: bool) -> std::io::Result<()> {
@@ -3069,6 +3092,14 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
     // A Postgres connection is bound to one database for its whole life, so
     // per-connection resolution is both correct and simpler than resolving per
     // statement — and it keeps the lock acquisition off the async worker.
+    //
+    // The binding is to an INCARNATION, not just a name: if the database is
+    // dropped (and possibly recreated) over HTTP while this connection lives,
+    // the bound `Db` becomes an orphan that shares the new incarnation's
+    // directory but none of its in-memory state — statements on it would
+    // silently read/write a split-brain copy. The message loop therefore
+    // re-checks the binding against the registry before each query/execute
+    // (see `incarnation_stale`) and refuses stale sessions.
     let resolved: Option<Arc<Db>> = {
         let r = Arc::clone(&resolver);
         let name = db_name.clone();
@@ -3160,6 +3191,12 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
             b'X' => return Ok(()), // Terminate
 
             b'Q' => {
+                if incarnation_stale(&resolver, &db_name, &resolved).await {
+                    sock.write_all(&err_msg("08006", &format!(
+                        "database {:?} was dropped or recreated on this server — reconnect to use its current incarnation", db_name))).await?;
+                    sock.write_all(&ready()).await?;
+                    return Ok(());
+                }
                 let sql = String::from_utf8_lossy(&body).trim_end_matches('\0').to_string();
                 let out = run_simple_query(&sql, &db_name, resolved.as_ref(), read_only);
                 sock.write_all(&out).await?;
@@ -3351,6 +3388,12 @@ async fn handle(mut sock: TcpStream, resolver: Arc<dyn DbResolver>, read_only: b
 
             // ── Execute: portal, maximum rows (0 = all) ────────────────────
             b'E' => {
+                if incarnation_stale(&resolver, &db_name, &resolved).await {
+                    sock.write_all(&err_msg("08006", &format!(
+                        "database {:?} was dropped or recreated on this server — reconnect to use its current incarnation", db_name))).await?;
+                    failed = true;
+                    continue;
+                }
                 let mut at = 0usize;
                 let name = take_cstr(&body, &mut at);
                 let max_rows = take_i32(&body, &mut at).unwrap_or(0);
