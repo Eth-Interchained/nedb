@@ -44,11 +44,19 @@ jobs:
   # canary: if the pure-Python engine breaks, everything downstream is noise.
   python:
     name: python (${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         python: ["3.9", "3.11", "3.12"]
+        os: [ubuntu-latest]
+        # ubuntu-latest rolled forward to Ubuntu 26.04, whose setup-python
+        # manifest carries no CPython 3.9 build (3.9 is EOL) — the 3.9 leg
+        # died at setup before running a single test. Pin that one leg to
+        # the last image that still ships 3.9; the rest stay on latest.
+        include:
+          - python: "3.9"
+            os: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
