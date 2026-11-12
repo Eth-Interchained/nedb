@@ -41,6 +41,7 @@ workflows:
         - pattern: "v*"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         RUST_TARGET: aarch64-apple-darwin
         WHEEL_LABEL: macos-arm64
@@ -273,6 +274,7 @@ workflows:
         - pattern: "v*"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         RUST_TARGET: x86_64-apple-darwin
         WHEEL_LABEL: macos-x86_64
@@ -507,6 +509,7 @@ workflows:
         - pattern: "v*"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         RUST_TARGET: aarch64-apple-darwin
         WHEEL_LABEL: macos-arm64
@@ -743,6 +746,7 @@ workflows:
         - pattern: "v*"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         RUST_TARGET: x86_64-apple-darwin
         WHEEL_LABEL: macos-x86_64
@@ -979,6 +983,7 @@ workflows:
         - pattern: "v*"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         RUST_TARGET: aarch64-apple-darwin
         WHEEL_LABEL: macos-arm64
@@ -1215,6 +1220,7 @@ workflows:
         - pattern: "v*"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         RUST_TARGET: x86_64-apple-darwin
         WHEEL_LABEL: macos-x86_64
@@ -1473,6 +1479,7 @@ workflows:
         - pattern: "master"
           include: true
     environment:
+      xcode: 26.5   # pinned OFF the default 26.6 pool — Codemagic routes by Xcode image; default machines flood at release time (support-confirmed 2026-11-12)
       vars:
         CARGO_TERM_COLOR: always
         RUST_BACKTRACE: "1"
