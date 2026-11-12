@@ -51,4 +51,4 @@ NEDB **never writes to the host database's namespace**. Shadow data lives only i
 | Node.js | `npm install nedb-engine` → `require('nedb-engine/wrap')` |
 | **Rust** | **`cargo add nedb-wrap`** ← you are here |
 
-MIT © 2026 INTERCHAINED LLC
+BUSL-1.1 © 2026 INTERCHAINED LLC — free in production under $1M revenue

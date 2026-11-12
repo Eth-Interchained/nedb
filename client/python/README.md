@@ -4,7 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine-client?color=6366f1)](https://pypi.org/project/nedb-engine-client/)
 [![Python](https://img.shields.io/pypi/pyversions/nedb-engine-client?color=34d399)](https://pypi.org/project/nedb-engine-client/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-f59e0b)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
 
 Connect to any running `nedbd` instance — local or remote — with a clean async API. No engine code embedded, no Rust toolchain required. Just HTTP.
 
@@ -276,4 +276,4 @@ Queries on missing collections return `[]` rather than raising — resilient by 
 
 ---
 
-© [INTERCHAINED, LLC](https://interchained.org) · MIT License · Built with [Hyperagent](https://hyperagent.com/refer/J2G6TCD7)
+© [INTERCHAINED, LLC](https://interchained.org) · BUSL-1.1 (free in production under $1M revenue) · Built with [Hyperagent](https://hyperagent.com/refer/J2G6TCD7)
