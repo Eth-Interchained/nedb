@@ -471,14 +471,19 @@ class PortalSet:
         self._portals: List[Portal] = [
             registry.open_portal(e.id) for e in registry.entries]
 
-    def get(self, key: str) -> Optional[bytes]:
+    def probe(self, key: str) -> Tuple[str, Optional[bytes]]:
+        """Newest-first three-state probe across all shards: the first
+        authoritative answer wins (present | tombstone); absent only when
+        every shard agrees the key was never sealed."""
         for portal in reversed(self._portals):  # newest first
             state, value = portal.probe(key)
-            if state == "present":
-                return value
-            if state == "tombstone":
-                return None
-        return None
+            if state != "absent":
+                return (state, value)
+        return ("absent", None)
+
+    def get(self, key: str) -> Optional[bytes]:
+        state, value = self.probe(key)
+        return value if state == "present" else None
 
     def read_raw(self, digest: bytes) -> Optional[bytes]:
         """Content-addressed read across shards. Any hit is authoritative

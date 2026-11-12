@@ -92,6 +92,7 @@ jobs:
           fail=0
           for t in test_nedb test_bitemporal test_causal test_concurrent \
                    test_crypto test_deploy test_proof test_v050 test_portals \
+                   test_portal_engine \
                    test_wrap_redis test_adapters test_wrap_sqlite_shadow \
                    test_wrap_autoshadow \
                    test_nql_predicates test_nql_shaping \

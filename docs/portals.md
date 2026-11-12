@@ -200,6 +200,175 @@ Vision's Rust backend then:
 3. Routes by the registry's recorded ranges; shard boundaries are changed
    by editing portal entries, never by moving chain data.
 
+## Portal-aware engine open — Python engine (step 6b, design locked 2026-11-12)
+
+The Rust engine open is portal-aware (`SegmentStore::open_portal_mode`).
+This section specifies the Python engine's equivalent: `NEDB(path)` gains
+a portal-aware load that serves checkpointed state through portals
+instead of rehydrating it into RAM dicts. Design authority: Muse's six
+calls (2026-11-12), Oracle ruling 6/6 with the checkpoint-atomicity
+amendment, confirmed by Mark. The six calls:
+
+1. **Checkpoint is the sealing event.** A portal-mode checkpoint writes
+   the materialized HEAD state as key-hash shards + registry instead of
+   a monolithic `snapshot.json`. Open then = registry + the AOF tail
+   after the checkpoint watermark. Sealed history on disk, live tail in
+   RAM — the Rust shape, in Python's own checkpoint rhythm.
+2. **One switch, both engines.** `NEDB_PORTAL_READS=1`, or the
+   constructor flag `NEDB(path, portal_reads=True)`; the flag wins.
+3. **Gets are portal-native; scans stream bounded.** Nothing silently
+   falls back to full materialization. An operation portal mode cannot
+   serve bounded returns an explicit capability error.
+4. **Python checkpoints are allowed in portal mode** — a documented
+   divergence from Rust's compact refusal, because checkpoint is how
+   the Python engine makes shards.
+5. **Missing registry is legacy only when a complete legacy recovery
+   path exists; corrupt registry fails loud** (refined below).
+6. **The proof bar** is the acceptance gate at the end of this section.
+
+### What a portal checkpoint writes
+
+Through the ordinary log first: a `checkpoint` op is appended via
+`_log_append` exactly as `save_snapshot` does — the chain runs through
+it, and its seq is the **watermark**. Then, per key at HEAD:
+
+- live doc → a key-hash shard record whose value bytes are the
+  canonical JSON (`canon()`) of the materialized doc, `_seq`/`_hash`/
+  `_coll` injections included — byte-for-byte the doc a legacy snapshot
+  load would restore;
+- deleted doc → a tombstone `.idx` entry (invariant 1), with its seq
+  recorded in the state sidecar (below) so `last_seq` stays exact.
+
+Shards are written in bounded batches (default 65,536 entries) to a
+temp directory inside the data dir. Non-store snapshot state —
+relations, index config, nonces, idem, blobs, tombstone seqs — goes to
+a sidecar, `portal-state.json`. The live key list goes to
+`portal-keys.jsonl` (one key per line, sorted), so `keys()` can stream
+it from disk instead of holding it in RAM.
+
+### The commit protocol (Oracle amendment — atomic publication)
+
+1. Capture consistent state + the AOF watermark (the checkpoint op).
+2. Write shards to **temporary paths**; flush and fsync.
+3. Verify every shard (`.idx` streaming verify at registration).
+4. Publish `portal-keys.jsonl` and `portal-state.json` (temp file,
+   fsync, atomic rename, dir fsync).
+5. Publish the registry (`PortalRegistry.save` — already atomic:
+   temp, fsync, rename, dir fsync). **This is the commit point.**
+6. Only then retire superseded recovery data: the previous
+   `snapshot.json` and any shard files the new registry no longer
+   references. The AOF is never retired, truncated, or rewritten —
+   AOF supremacy is absolute.
+
+Until step 5 succeeds, the previously committed store is authoritative
+and untouched.
+
+### The shards-authoritative marker, and the open decision table
+
+`portal-state.json` is the marker that shards *became* authoritative:
+it exists only if a portal checkpoint reached step 4, and it carries
+the watermark. Open decides:
+
+| registry | state sidecar | decision |
+|---|---|---|
+| valid, shard checksums match the state's commit tie | present | **portal open** (any `snapshot.json` is superseded and ignored) |
+| present | absent | legacy open — no portal checkpoint ever committed; the registry alone is inert |
+| absent | absent | legacy open, unchanged |
+| absent | present | shards were authoritative and the registry is lost → recover by **full AOF replay** (below), loud warning; never open the stale snapshot |
+| corrupt / inconsistent with state | any | **fail loud** (`PortalError`); no silent fallback |
+
+The full-replay recovery in row 4 implements the Oracle's intent —
+*never silently open stale state* — through this engine's stronger
+primitive: the Python engine never truncates its AOF, so replay from
+genesis is exact and cannot resurrect anything the log does not say.
+(Stores whose recovery path *does* truncate the log — Vision's bounded
+store — do not have this primitive; there, registry loss after
+authority is fail-closed, full stop.)
+
+### Read contract in portal mode
+
+The RAM store holds only post-watermark versions (the tail) plus new
+writes. Reads resolve tail-first, then portals, newest-wins:
+
+- `get(key)` at HEAD: tail version if any, else the portal probe
+  (present → doc; tombstone → deleted; absent → absent).
+- `get(key, as_of)`: `as_of >= watermark` resolves across tail versions
+  and the sealed value (whose `_seq` is the watermark-era version).
+  `as_of < watermark` → capability error: pre-checkpoint history lives
+  only in the AOF. (A legacy snapshot load has the same effective
+  limit; portal mode states it instead of approximating it.)
+- `last_seq(key)`: tail seq, else the sealed doc's `_seq`, else the
+  sidecar's tombstone seq, else `None`. CAS (`if_seq`) stays exact.
+- `keys(prefix)`: tail keys merged with the streamed
+  `portal-keys.jsonl`, liveness-resolved per key. Bounded RAM.
+- Scans (`execute`, fluent queries): candidates stream from `keys()`;
+  values resolve per key by point read. Bounded by construction.
+- `store.snapshot()` is the one deliberate exception to memory
+  honesty: it materializes because the caller explicitly asked it to.
+  Nothing internal calls it in portal mode.
+- Indexes: eq/search indexes are **not** restored in portal mode —
+  restoring the config without the entries would make the eq fast-path
+  silently incomplete, which is worse than no index. Queries fall back
+  to streaming scans (correct, bounded). `create_index` in portal mode
+  → capability error. Persistent on-disk indexes are a future slice.
+
+Relations, nonces, idem and blobs restore from the sidecar exactly as
+from a snapshot. Encryption (DEK active) refuses portal mode loudly:
+shards are plaintext, and an encrypted store must never seal plaintext.
+
+### Invariants (Oracle, 2026-11-12 — added to the adopted set)
+
+- **AOF supremacy.** No write is committed-visible unless its durable
+  log semantics are satisfied. Checkpointing never invents or loses a
+  mutation; portals are a read layer over the log's effects, never a
+  write path around it.
+- **Memory honesty.** Portal-mode operations cannot secretly
+  materialize the database. Unsupported unbounded operations return an
+  explicit capability error.
+- **Parity includes deletions.** Newest-wins ordering and tombstones
+  produce identical results across Python and Rust, including after
+  crash recovery.
+
+### The windowed log
+
+Portal open windows the LOG as well as the store — the first RSS
+measurement (0.84 of legacy at 200k records) proved that an open which
+seals the store but still loads every op has not solved the problem
+this work exists to solve. Only AOF ops after the watermark are held
+in RAM (`OpLog._seq_base` counts the elided ops, so `len(log)`,
+append seqs, and `NEDB.seq` stay absolute and exact). The elided
+history is seeded, not forgotten:
+
+- the chain head comes from the tail's last op, or from the state
+  sidecar when the tail is empty — appends chain onto it exactly;
+- nonce and idempotency tables are restored from the sidecar and
+  merged with the tail's (tail wins); an idempotent retry of a
+  pre-window op re-reads that op from the AOF by seq (rare, explicit
+  cost) and dedups without appending;
+- `verify()` re-walks the whole chain by **streaming the AOF from
+  disk** — O(1) memory, the same guarantee, none of the residency;
+- the open-time self-heal is skipped in portal mode: a window's first
+  op chaining from the watermark head is correct, not a structural
+  break, and healing it would rewrite the AOF wrongly.
+
+Operations that intrinsically need the resident full log raise
+`PortalCapabilityError` in portal mode rather than answer partially:
+pre-watermark `AS OF` (store level), `AS OF SYSTEM TIME` resolution,
+`TRACE` traversal (it indexes ops positionally), `since()` below the
+window, `tip(coll)` when the collection's last write is elided, and
+`rebuild()` / `verify_determinism()` (full replay by definition).
+Daemon/wrapper surfaces that index `log.ops` positionally
+(`server.py`, `wrap_redis.py`) are not portal-mode compatible in this
+slice; portal mode is an embedded-open feature.
+
+### Acceptance gate
+
+Fixture: **1.85M records** (Vision's production shape). Portal-open
+peak RSS **≤ 20% of the legacy open's peak** on identical data; answer
+parity **exact on canonical bytes**; crash recovery verified at
+**every commit boundary** of the protocol above. The 5× figure is a
+target the fixture must prove, not a claim.
+
 ## Not in this slice
 
 - **Writes / an active portal.** Portals are read-only references to
@@ -217,12 +386,10 @@ Vision's Rust backend then:
   sealed segments through portals instead of indexing them in RAM —
   compaction is refused in portal mode in this slice, and a segment
   whose `.idx` fails registration falls back to the legacy in-memory
-  index for that segment only. What is NOT done: rewiring the Python
-  engine's own `NEDB(path)` open to a portal-aware load that bypasses
-  full materialization of the AOF and snapshot. Until that lands, the
-  Python engine still loads in full when opened the legacy way —
-  portals give it on-call reads, they do not yet change its default
-  open. The Rust conformance tests
+  index for that segment only. The Python engine's own `NEDB(path)`
+  open is now portal-aware too — see "Portal-aware engine open —
+  Python engine (step 6b)" above: checkpoint seals shards, open serves
+  them on call with a windowed log. The Rust conformance tests
   `cross_core_fixture_written_by_python` / `cross_core_fixture_written_by_rust`
   (ignored by default; run with `NEDB_PORTAL_FIXTURE_DIR` /
   `NEDB_PORTAL_FIXTURE_OUT`) prove both cores read each other's shards.

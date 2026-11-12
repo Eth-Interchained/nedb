@@ -113,7 +113,20 @@ class OpLog:
         self.ops: List[Op] = []
         self._last_nonce: Dict[str, int] = {}
         self._idem: Dict[str, int] = {}  # idem key -> seq of original op
+        self._idem_pos: Dict[str, int] = {}  # idem key -> index into self.ops
+        # Portal mode (docs/portals.md step 6b): the loaded window may
+        # start above genesis. _seq_base counts the elided ops below the
+        # window, so absolute seqs (len, append) stay correct while the
+        # pre-window ops live only in the AOF. _external_op_lookup, when
+        # set, re-reads an elided op by seq (idempotent-retry path).
+        self._seq_base: int = 0
+        self._external_op_lookup = None  # Optional[Callable[[int], Optional[Op]]]
         self._head = GENESIS
+
+    @property
+    def windowed(self) -> bool:
+        """True when the in-memory ops are a tail window (portal mode)."""
+        return self._seq_base > 0
 
     def append(
         self,
@@ -133,7 +146,20 @@ class OpLog:
         deduplicated by its idempotency key (a no-op replay-safe return)."""
         # Idempotency: a known key returns the original op without re-appending.
         if idem is not None and idem in self._idem:
-            return self.ops[self._idem[idem]], False
+            pos = self._idem_pos.get(idem)
+            if pos is not None:
+                return self.ops[pos], False
+            # The original op is below the loaded window (portal mode):
+            # re-read it from the AOF by seq. Dedup itself never depends
+            # on this — nothing is appended either way.
+            if self._external_op_lookup is not None:
+                found = self._external_op_lookup(self._idem[idem])
+                if found is not None:
+                    return found, False
+            raise ReplayError(
+                f"idempotent replay of elided op (idem {idem!r}, seq "
+                f"{self._idem[idem]}): the original op is below the loaded "
+                f"window and no AOF lookup is wired")
 
         # Replay protection: nonce must strictly exceed the client's last nonce.
         last = self._last_nonce.get(client, 0)
@@ -142,7 +168,7 @@ class OpLog:
                 f"replay/stale nonce for client '{client}': {nonce} <= {last}"
             )
 
-        seq = len(self.ops)
+        seq = self._seq_base + len(self.ops)
         ts = time.time() if ts is None else ts
         body: dict = {
             "seq": seq, "client": client, "nonce": nonce,
@@ -164,6 +190,7 @@ class OpLog:
         self._last_nonce[client] = nonce
         if idem is not None:
             self._idem[idem] = seq
+            self._idem_pos[idem] = len(self.ops) - 1
         self._head = h
         return rec, True
 
@@ -175,11 +202,15 @@ class OpLog:
         self.ops = list(ops)
         self._last_nonce = {}
         self._idem = {}
-        for o in self.ops:
+        self._idem_pos = {}
+        self._seq_base = 0
+        self._external_op_lookup = None
+        for i, o in enumerate(self.ops):
             if o.nonce > self._last_nonce.get(o.client, 0):
                 self._last_nonce[o.client] = o.nonce
             if o.idem is not None and o.idem not in self._idem:
                 self._idem[o.idem] = o.seq
+                self._idem_pos[o.idem] = i
         self._head = self.ops[-1].hash if self.ops else GENESIS
 
     @staticmethod
@@ -217,4 +248,4 @@ class OpLog:
         return [o for o in self.ops if o.seq <= as_of]
 
     def __len__(self) -> int:
-        return len(self.ops)
+        return self._seq_base + len(self.ops)

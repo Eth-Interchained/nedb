@@ -149,6 +149,13 @@ pub struct Db {
     /// Decouples flush_manifest from the hot write path so concurrent writes
     /// don't serialise on 2× file I/O per PUT.
     manifest_dirty:     Arc<AtomicBool>,
+    /// Serializes MANIFEST flushes. The tmp path is a single fixed file
+    /// (MANIFEST.tmp), so two concurrent flushers — the background ticker
+    /// and any flush_all caller — could rename the tmp out from under
+    /// each other: the loser's rename failed ENOENT and its flush was
+    /// dropped (seen live at Vision's boot, 2026-11-12, indexers all
+    /// writing at once). One flusher at a time; the write is tiny.
+    manifest_flush_lock: std::sync::Mutex<()>,
     pub seq:            AtomicU64,
     /// Cached Merkle head — updated incrementally on every write (O(1)).
     head:               RwLock<String>,
@@ -211,6 +218,7 @@ impl Db {
             coll_tip_hash:  Arc::new(DashMap::new()),
             startup_ready:  Arc::new(AtomicBool::new(true)),  // always ready
             manifest_dirty: Arc::new(AtomicBool::new(false)),
+            manifest_flush_lock: std::sync::Mutex::new(()),
             seq_index:      Arc::new(DashMap::new()),
             ts_index:       Arc::new(std::sync::RwLock::new(Vec::new())),
             known_collections: Arc::new(DashMap::new()),
@@ -289,6 +297,7 @@ impl Db {
             coll_tip_hash: Arc::new(DashMap::new()),
             startup_ready:  Arc::new(AtomicBool::new(false)),
             manifest_dirty: Arc::new(AtomicBool::new(false)),
+            manifest_flush_lock: std::sync::Mutex::new(()),
             seq_index:      Arc::new(DashMap::new()),
             ts_index:       Arc::new(std::sync::RwLock::new(Vec::new())),
             known_collections: Arc::new(DashMap::new()),
@@ -1241,6 +1250,12 @@ impl Db {
     /// to know.
     pub fn try_flush_manifest(&self) -> std::io::Result<()> {
         if self.root == std::path::PathBuf::from(":memory:") { return Ok(()); }
+        // One flusher at a time — the tmp path below is a single fixed
+        // file, and concurrent flushers rename it out from under each
+        // other (ENOENT). Poison-tolerant: a panicked flusher must not
+        // wedge every later flush.
+        let _flush_guard = self.manifest_flush_lock.lock()
+            .unwrap_or_else(|p| p.into_inner());
         let seq  = self.seq.load(Ordering::SeqCst);
         let head = self.head.read().clone();
         let tip_hash = self.tip_hash.read().1.clone();
@@ -2872,6 +2887,43 @@ mod tests_v2 {
         // Per-collection tip: same contract.
         let ct = db2.tip_collection("c").expect("coll tip survives");
         assert_eq!(ct.seq, total);
+    }
+
+    /// Regression: concurrent MANIFEST flushers must never fail.
+    ///
+    /// The flush writes a single fixed tmp file (MANIFEST.tmp) and
+    /// renames it into place. Before the flush lock, two overlapping
+    /// flushers — the background ticker plus any flush_all caller, the
+    /// exact overlap at a busy app's boot — renamed the tmp out from
+    /// under each other: the loser's rename returned ENOENT, its flush
+    /// was dropped, and the boot log filled with "MANIFEST flush
+    /// failed: No such file or directory" (Vision, 2026-11-12).
+    /// Serialized, every try_ call must succeed and the final MANIFEST
+    /// must hold the final seq.
+    #[test]
+    fn concurrent_manifest_flushers_never_fail() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path(), None).unwrap());
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    db.put("c", &format!("doc-{}-{}", t, i),
+                           serde_json::json!({"v": i}),
+                           vec![], None, None).unwrap();
+                    db.try_flush_manifest()
+                        .expect("concurrent MANIFEST flush must not fail");
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        db.try_flush_manifest().unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("MANIFEST")).unwrap();
+        let m: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(m["seq"].as_u64().unwrap(),
+                   db.seq.load(Ordering::SeqCst));
     }
 
     /// Pre-2.5.43 MANIFESTs (no tip_hash) must warm-boot, NOT force a cold
