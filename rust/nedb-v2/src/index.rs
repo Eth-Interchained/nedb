@@ -166,13 +166,22 @@ pub struct IdIndex {
     mem:       Option<Arc<dashmap::DashMap<(String, String), String>>>,
     /// WAL write buffer — disk-backed mode buffers here, flushed to disk periodically.
     write_buf: Arc<dashmap::DashMap<(String, String), Option<String>>>,  // None = tombstone
+    /// Serializes flushes. A leaf's tmp path is derived from the leaf
+    /// path, so two overlapping flushes draining the same buffer write
+    /// the SAME tmp file for a hot key: one renames it away, the other
+    /// gets ENOENT (and its error-path cleanup can delete the winner's
+    /// tmp mid-write). Seen live under Vision's indexer load
+    /// (2026-11-11/12). Flushes are periodic and batched — serializing
+    /// them costs nothing measurable.
+    flush_lock: std::sync::Mutex<()>,
 }
 
 impl IdIndex {
     pub fn new(db_root: &Path) -> Result<Self> {
         let root = db_root.join("indexes");
         fs::create_dir_all(&root)?;
-        Ok(Self { root, mem: None, write_buf: Arc::new(dashmap::DashMap::new()) })
+        Ok(Self { root, mem: None, write_buf: Arc::new(dashmap::DashMap::new()),
+                  flush_lock: std::sync::Mutex::new(()) })
     }
 
     /// Create a pure in-memory id index — no disk I/O.
@@ -181,6 +190,7 @@ impl IdIndex {
             root:      PathBuf::from(":memory:"),
             mem:       Some(Arc::new(dashmap::DashMap::new())),
             write_buf: Arc::new(dashmap::DashMap::new()),
+            flush_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -201,7 +211,14 @@ impl IdIndex {
     /// anywhere. Reproduced on a full 22 MiB filesystem: 30 rows acknowledged,
     /// `verify()` reported 30 healthy objects, `list()` returned 0.
     pub fn try_flush_write_buf(&self) -> std::io::Result<()> {
-        if self.mem.is_some() || self.write_buf.is_empty() { return Ok(()); }
+        if self.mem.is_some() { return Ok(()); }
+        // One flusher at a time (see flush_lock). The second check
+        // inside the lock lets a caller that waited on a just-finished
+        // flush return immediately instead of re-draining an empty
+        // buffer. Poison-tolerant, like the MANIFEST flush lock.
+        let _flush_guard = self.flush_lock.lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.write_buf.is_empty() { return Ok(()); }
 #[cfg(not(target_arch = "wasm32"))]
         use rayon::prelude::*;
         #[cfg(target_arch = "wasm32")]
@@ -801,6 +818,43 @@ mod tests {
     /// buffered for the next flush, so every key must read v2 at the end.
     /// (Probabilistic by nature, but the race window — thousands of parallel
     /// file writes — is wide; with 2000 keys the old code fails reliably.)
+    /// Regression: concurrent flushers of the SAME buffer must never
+    /// fail. A leaf's tmp path derives from the leaf path, so before
+    /// the flush lock, overlapping flushes (ticker + an explicit
+    /// flush_all) wrote the same tmp for a hot key — one renamed it
+    /// away, the other got ENOENT (Vision's kv rate-limit keys,
+    /// 2026-11-11). Serialized flushes make every try_ call succeed,
+    /// and the newest value must be what survives.
+    #[test]
+    fn concurrent_flushers_never_error_on_hot_keys() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let idx = Arc::new(IdIndex::new(dir.path()).unwrap());
+        for round in 0..50 {
+            for k in 0..16 {
+                idx.set("kv", &format!("hot{}", k),
+                        &format!("h{}", round)).unwrap();
+            }
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let idx = Arc::clone(&idx);
+                handles.push(std::thread::spawn(move || {
+                    idx.try_flush_write_buf()
+                }));
+            }
+            for h in handles {
+                let r = h.join().unwrap();
+                assert!(r.is_ok(),
+                        "concurrent flush failed: {:?}", r.err());
+            }
+        }
+        idx.try_flush_write_buf().unwrap();
+        for k in 0..16 {
+            assert_eq!(idx.get("kv", &format!("hot{}", k)).as_deref(),
+                       Some("h49"));
+        }
+    }
+
     #[test]
     fn flush_never_drops_a_concurrent_newer_write() {
         use std::sync::Arc;

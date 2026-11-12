@@ -17,6 +17,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from .cascade import BlobStore
+from . import portal_store as _pstore
 from . import snapshot as _snap
 from . import namespace as _ns
 from . import crypto as _crypto
@@ -91,7 +92,8 @@ def apply_op(store: MVCCStore, relations: Relations, indexes: Indexes, op: Op,
 
 class NEDB:
     def __init__(self, path: Optional[str] = None,
-                 tmk: Optional[bytes] = None) -> None:
+                 tmk: Optional[bytes] = None,
+                 portal_reads: Optional[bool] = None) -> None:
         """Create a database.
 
         With no `path`, NEDB is in-memory (the original behavior). With a `path`
@@ -114,6 +116,19 @@ class NEDB:
 
         self.path = path
         self._aof = None
+        # Portals (step 6b, docs/portals.md): portal_reads requests the
+        # portal-aware load (flag wins over NEDB_PORTAL_READS env). The
+        # watermark is set when a portal open or checkpoint actually
+        # seals/loads shards; _portal_force_replay is set when shards
+        # were authoritative but unservable, so _load must replay the
+        # full AOF and never trust a stale snapshot.
+        self._portal_reads = _pstore.portal_reads_requested(portal_reads)
+        self._portal_watermark: Optional[int] = None
+        self._portal_force_replay = False
+        self._portal_index_config: Optional[list] = None
+        self._portal_state: Optional[dict] = None
+        self._portal_seed_nonces: Dict[str, int] = {}
+        self._portal_seed_idem: Dict[str, int] = {}
         # When True, _log_append buffers writes and skips the per-op fsync; the
         # caller (the concurrent Sequencer) issues ONE fsync per batch via flush()
         # — group commit. Default False keeps embedded/direct use durable per-op.
@@ -149,7 +164,11 @@ class NEDB:
             # Self-heal a structurally-broken chain (e.g. a historical encrypt-
             # backfill gap) before we start appending. No-op on a healthy log;
             # leaves genuine tampering untouched (verify stays False + warns).
-            self._self_heal_if_needed()
+            # Skipped after a portal open: the log is a tail WINDOW there, and
+            # its first op chaining from the watermark head is correct, not a
+            # structural break — healing it would rewrite the AOF wrongly.
+            if self._portal_watermark is None:
+                self._self_heal_if_needed()
         # Append mode: never truncates the existing log.
         self._aof = open(self._aof_path, "a", encoding="utf-8")
 
@@ -274,8 +293,26 @@ class NEDB:
               f"head={self.head[:12]}…")
 
     def _load(self) -> None:
+        # ── Portal-aware load (step 6b): sealed state is served through
+        #    portals, and the LOG ITSELF is windowed — only AOF ops after
+        #    the checkpoint watermark are held in RAM (seeded with the
+        #    elided seq base, head, and nonce/idem tables, so absolute
+        #    seqs and the chain stay exact). verify() streams the AOF
+        #    from disk in this mode; pre-watermark AS OF / TRACE /
+        #    wall-clock reads return capability errors, never partial
+        #    answers. ───────────────────────────────────────────────────
+        if self._portal_reads:
+            wm = _pstore.try_portal_open(self)
+            if wm is not None:
+                tail = _pstore.read_tail_ops(self, wm)
+                _pstore.seed_log(self, tail, wm)
+                for op in tail:
+                    apply_op(self.store, self.relations, self.indexes, op, self.cause_map)
+                return
         # ── Try snapshot-assisted load first (O(delta) instead of O(total)) ─
-        snap_seq = _snap.load_snapshot(self)
+        #    (skipped when portal state forced a full replay: the snapshot
+        #    is stale relative to an authoritative portal checkpoint)
+        snap_seq = -1 if self._portal_force_replay else _snap.load_snapshot(self)
         if snap_seq >= 0:
             # Snapshot loaded: only replay AOF ops AFTER the checkpoint op.
             ops: List[Op] = []
@@ -368,6 +405,8 @@ class NEDB:
 
     def close(self) -> None:
         """Flush and close the append-only log."""
+        if isinstance(self.store, _pstore.PortalStoreView):
+            self.store.close_portals()
         if self._aof is not None:
             self._aof.flush()
             os.fsync(self._aof.fileno())
@@ -420,7 +459,13 @@ class NEDB:
             assert db2.verify()
 
         Call periodically for long-running databases or before a planned restart.
+
+        With portal reads on (`portal_reads=True` or NEDB_PORTAL_READS=1)
+        the checkpoint instead SEALS the state into portal shards
+        (docs/portals.md, step 6b) and future opens serve it on call.
         """
+        if self._portal_reads:
+            return _pstore.portal_checkpoint(self)
         return _snap.save_snapshot(self)
 
     # --- nonce helper -------------------------------------------------------
@@ -760,6 +805,11 @@ class NEDB:
 
     # --- indexes ------------------------------------------------------------
     def create_index(self, coll: str, field: str, kind: str = "eq") -> None:
+        if isinstance(self.store, _pstore.PortalStoreView):
+            raise _pstore.PortalCapabilityError(
+                "portal mode: create_index would need a full scan of the "
+                "sealed state to backfill; indexes over sealed data are a "
+                "future slice (queries use bounded streaming scans meanwhile)")
         self.indexes.ensure(coll, field, kind)
         # backfill existing rows at HEAD
         for key in self.store.keys(coll + ":"):
@@ -824,6 +874,11 @@ class NEDB:
 
     def _resolve_wall_clock(self, raw: str) -> int:
         """The last seq whose write-time is at or before the parsed moment."""
+        if self.log.windowed:
+            raise _pstore.PortalCapabilityError(
+                "portal mode: AS OF SYSTEM TIME resolves against the full "
+                "log, whose pre-watermark ops are elided in this session; "
+                "open with portal reads off for wall-clock time travel")
         moment = self._parse_wall_clock(raw)
         best: Optional[int] = None
         for rec in self.log.ops:
@@ -908,6 +963,11 @@ class NEDB:
             rows = trav
 
         # TRACE caused_by — causal provenance traversal
+        if plan.get("trace") and self.log.windowed:
+            raise _pstore.PortalCapabilityError(
+                "portal mode: TRACE walks the op log by absolute seq, and "
+                "pre-watermark ops are elided in this session; open with "
+                "portal reads off for causal traversal")
         if plan.get("trace"):
             if not plan.get("trace_reverse"):
                 # Backward: start from current result set, follow caused_by seqs
@@ -1154,11 +1214,23 @@ class NEDB:
 
     # --- integrity / determinism -------------------------------------------
     def verify(self) -> bool:
-        """Verify the hash-chained op log has not been tampered with."""
+        """Verify the hash-chained op log has not been tampered with.
+
+        In portal mode the in-memory log is a tail window, so the chain
+        is re-walked by STREAMING the AOF from disk (O(1) memory) — the
+        same guarantee, checked against the whole history, not the part
+        that happens to be resident."""
+        if self.log.windowed:
+            return _pstore.stream_verify_aof(self)
         return self.log.verify()
 
     def rebuild(self):
         """Replay the log into fresh state — proves state is a pure function of the log."""
+        if self.log.windowed:
+            raise _pstore.PortalCapabilityError(
+                "portal mode: rebuild() replays the FULL log, which is "
+                "elided below the checkpoint watermark in this session; "
+                "open with portal reads off to rebuild")
         store, relations, indexes = MVCCStore(), Relations(), Indexes()
         for (c, f, k) in self.indexes.config:
             indexes.ensure(c, f, k)
@@ -1193,6 +1265,11 @@ class NEDB:
         for rec in reversed(ops):
             if rec.payload.get("coll") == coll:
                 return rec.to_dict()
+        if self.log.windowed:
+            raise _pstore.PortalCapabilityError(
+                "portal mode: no write to this collection in the loaded "
+                "tail window; its last write may predate the checkpoint "
+                "watermark (open with portal reads off to check)")
         return None
 
     def since(self, after_seq: int) -> List[dict]:
@@ -1201,4 +1278,9 @@ class NEDB:
         stream only new writes — the append-only log IS the changefeed.
 
         Reference-engine parity of the Rust v2 core's Db::since()."""
+        if self.log.windowed and after_seq < self.log._seq_base - 1:
+            raise _pstore.PortalCapabilityError(
+                "portal mode: since() below the checkpoint watermark "
+                "would silently omit elided ops; open with portal reads "
+                "off for the full changefeed")
         return [op.to_dict() for op in self.log.ops if op.seq > after_seq]
