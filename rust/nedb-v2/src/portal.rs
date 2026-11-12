@@ -54,6 +54,15 @@ pub const MANIFEST_FILE: &str = "portals.json";
 /// 2026-11-11: these are two different semantics and the format must say
 /// which one a portal uses, versioned, never implied).
 pub const ADDRESSING_CONTENT_DIGEST: &str = "content-digest";
+
+/// Tombstone marker (Oracle invariant 1, 2026-11-11), shared with the
+/// Python core: in a KEY-HASH shard, an `.idx` entry whose len is
+/// TOMBSTONE_LEN records a DELETION (offset 0, no segment record).
+/// Multi-shard reads go newest-first and a tombstone stops the search —
+/// older values must never resurface. Content-digest shards never carry
+/// tombstones: a digest names immutable content, so there is no newer
+/// version of it to win.
+pub const TOMBSTONE_LEN: u32 = u32::MAX;
 /// `.idx` digest = BLAKE2b-256(key); records carry the value's digest.
 /// Python KV shards.
 pub const ADDRESSING_KEY_HASH: &str = "key-hash";
@@ -142,8 +151,21 @@ impl PortalRegistry {
         let raw = serde_json::to_string_pretty(&m).context("serialize portal manifest")?;
         let path = self.dir.join(MANIFEST_FILE);
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, raw)?;
-        fs::rename(&tmp, &path)?;
+        // Invariant 2 (crash-safe registration): Write -> Seal -> Verify
+        // -> fsync -> Atomic registry commit. fsync the temp manifest,
+        // rename it atomically over the old one, then fsync the
+        // directory — a crash at any point leaves the old manifest or
+        // the new one, never a torn reference to an unverified shard.
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp).context("create temp manifest")?;
+            f.write_all(raw.as_bytes())?;
+            f.sync_all().context("fsync temp manifest")?;
+        }
+        fs::rename(&tmp, &path).context("commit portal manifest")?;
+        if let Ok(d) = fs::File::open(&self.dir) {
+            let _ = d.sync_all(); // directory fsync: best effort by platform
+        }
         Ok(())
     }
 
@@ -341,11 +363,37 @@ impl Portal {
     /// On-call read: disk binary search, one positional segment read, and a
     /// BLAKE2b re-verification (reusing segment.rs's digest helper). Returns
     /// None for an absent digest; errors if the stored bytes were tampered.
+    /// All digests in this shard, streamed from the `.idx` in bounded
+    /// chunks (enumeration is the one operation that touches every
+    /// entry; it still never holds the whole index at once).
+    pub fn digests(&self) -> Result<Vec<[u8; 32]>> {
+        let mut out = Vec::with_capacity(self.count as usize);
+        const CHUNK: u64 = 1024;
+        let mut start: u64 = 0;
+        while start < self.count {
+            let n = CHUNK.min(self.count - start);
+            let mut buf = vec![0u8; (n as usize) * IDX_ENTRY_BYTES];
+            read_at(&self.idx, &mut buf,
+                    IDX_HEADER_BYTES as u64 + start * IDX_ENTRY_BYTES as u64)?;
+            for i in 0..n as usize {
+                let mut d = [0u8; 32];
+                d.copy_from_slice(&buf[i * IDX_ENTRY_BYTES..i * IDX_ENTRY_BYTES + 32]);
+                out.push(d);
+            }
+            start += n;
+        }
+        Ok(out)
+    }
+
     pub fn read(&self, digest: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let (off, len) = match self.lookup(digest)? {
             Some(loc) => loc,
             None => return Ok(None),
         };
+        if len == TOMBSTONE_LEN {
+            bail!("portal {}: tombstone entry in a content-digest shard \
+                   (tombstones are a key-hash concept)", self.entry.id);
+        }
         let mut content = vec![0u8; len as usize];
         read_at(&self.segment, &mut content, off).context("portal segment record read")?;
         if blake2b_raw(&content) != *digest {
@@ -419,6 +467,30 @@ mod tests {
                    Some("https://example.invalid/shards/"));
         let err = reg2.open_portal("remote-1").err().unwrap().to_string();
         assert!(err.contains("not implemented"), "got: {}", err);
+    }
+
+    /// A tombstone entry (key-hash concept) inside a content-digest
+    /// shard is a format violation: the read must refuse, not guess.
+    #[test]
+    fn tombstone_in_content_shard_is_refused() {
+        let dir = tempdir().unwrap();
+        let content = b"tombstone-target".to_vec();
+        let digest = blake2b_raw(&content);
+        let hex = hex::encode(digest);
+        // Segment with one real record; idx entry lies with len=TOMBSTONE.
+        let seg = SegmentStore::seg_path(dir.path(), 5);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&content);
+        fs::write(&seg, &bytes).unwrap();
+        SegmentStore::write_idx(dir.path(), 5, &[(hex.clone(), 4, TOMBSTONE_LEN)])
+            .unwrap();
+        let mut reg = PortalRegistry::new(dir.path());
+        reg.register_segment("seg-000005", 5, None, ADDRESSING_CONTENT_DIGEST)
+            .unwrap();
+        let portal = reg.open_portal("seg-000005").unwrap();
+        let err = portal.read(&digest).err().unwrap().to_string();
+        assert!(err.contains("tombstone"), "got: {}", err);
     }
 
     /// Build a real sealed segment through SegmentStore (tiny rollover), then

@@ -126,6 +126,58 @@ Registration is the only O(N) step, and it happens once at seal time.
 After that a cold start's cost is independent of shard size, and a store
 of any size opens for the cost of reading a few-KB manifest.
 
+## Invariants (Oracle review, adopted 2026-11-11)
+
+Three engineering invariants govern portals; the bounded-memory promise
+stands on them.
+
+**1. The newest truth always wins.** A portal can return perfectly
+valid, hash-verified data that is nevertheless *outdated*. Resolution
+rule: multi-shard reads consult shards NEWEST FIRST — the active
+append-only tail before sealed history, then sealed shards
+newest-to-oldest — and the first authoritative answer wins. A key-hash
+shard records a deletion as a **tombstone**: an `.idx` entry with
+len = `0xFFFFFFFF` (TOMBSTONE_LEN) and no segment record. A tombstone
+is authoritative: the search stops, older values never resurface.
+Content-digest shards are exempt by construction — a digest names
+immutable content, so no shard can hold a newer version of it — and a
+tombstone entry found in a content-digest shard is a format violation
+that readers refuse. Implemented: `PortalSet` (Python),
+`SegmentStore` portal mode (Rust: in-memory active index first, then
+portals), with tests in both cores.
+
+**2. Portal registration is crash-safe.** The sequence is
+Write → Seal → Verify → fsync → Atomic registry commit. Registration
+stream-verifies the `.idx` (checksum + sortedness) BEFORE the manifest
+names the shard; `save()` writes the manifest to a temp file, fsyncs
+it, atomically renames it over the old manifest, and fsyncs the
+directory, in both cores. A crash at any point leaves the old manifest
+or the new one — never a torn reference to an unverified shard. An
+incomplete shard stays unreferenced and recoverable.
+
+**3. Watch the shard count, not just shard size.** A multi-shard miss
+(or a hit in the oldest shard) costs O(S log N) — S shards × a binary
+search each. Measured (Python `PortalSet`, 2,000 entries/shard, 300
+reps, worst-case oldest-hit and absent keys): median latency grows
+linearly at ≈15.5 µs per shard probed — S=1: 17.6 µs, S=10: ~151 µs,
+S=50: ~775 µs, S=100: ~1.55 ms, S=200: ~3.13 ms. No redesign is
+warranted yet; this is the baseline that says when a digest→shard
+routing directory or compaction becomes worthwhile (order ~10³ shards
+in Python; the Rust per-probe cost is far lower).
+
+**Bounded memory is an architectural guarantee, not a target.** Open
+cost and engine-held memory track the ACTIVE TAIL and the manifest —
+never the sealed history. A store with 4M operations opens with
+approximately the same application-managed memory as one with 40M,
+given a similar configuration and a bounded active tail; historical
+data is never fully materialized. Measured in the Rust engine
+(`SegmentStore` legacy open vs portal-mode open, 100,000 records,
+8 MB segments, 1 sealed shard, 334 verified probe reads in both):
+legacy peak RSS 41.1 MB with all 100,000 entries indexed; portal mode
+19.6 MB with only the active tail's 25,102 entries indexed. The legacy
+number grows with every record ever sealed; the portal number does
+not. (Probe: `rss_probe_open_modes`, ignored by default.)
+
 ## Lookup integrity
 
 Per-lookup, the `.idx` trailer checksum is *not* re-verified (that would be
@@ -159,12 +211,18 @@ Vision's Rust backend then:
   choosing a portal is the caller's job in this slice.
 - **Python engine parity.** Done as a sibling slice: `python/nedb/portal.py`
   implements the byte-identical formats for both addressing semantics
-  (KV shards as `key-hash`, content shards as `content-digest`). What is
-  NOT done: rewiring the Python engine's own `NEDB(path)` open to a
-  portal-aware load that bypasses full materialization of the AOF and
-  snapshot. Until that lands, the Python engine still loads in full when
-  opened the legacy way — portals give it on-call reads, they do not yet
-  change its default open. The Rust conformance tests
+  (KV shards as `key-hash`, content shards as `content-digest`). On the
+  Rust side, the engine open itself is now portal-aware:
+  `SegmentStore::open_portal_mode` (or `NEDB_PORTAL_READS=1`) serves
+  sealed segments through portals instead of indexing them in RAM —
+  compaction is refused in portal mode in this slice, and a segment
+  whose `.idx` fails registration falls back to the legacy in-memory
+  index for that segment only. What is NOT done: rewiring the Python
+  engine's own `NEDB(path)` open to a portal-aware load that bypasses
+  full materialization of the AOF and snapshot. Until that lands, the
+  Python engine still loads in full when opened the legacy way —
+  portals give it on-call reads, they do not yet change its default
+  open. The Rust conformance tests
   `cross_core_fixture_written_by_python` / `cross_core_fixture_written_by_rust`
   (ignored by default; run with `NEDB_PORTAL_FIXTURE_DIR` /
   `NEDB_PORTAL_FIXTURE_OUT`) prove both cores read each other's shards.

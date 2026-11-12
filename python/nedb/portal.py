@@ -53,6 +53,13 @@ MANIFEST_FILE = "portals.json"
 ADDRESSING_CONTENT_DIGEST = "content-digest"
 ADDRESSING_KEY_HASH = "key-hash"
 ADDRESSING_SEMANTICS = (ADDRESSING_CONTENT_DIGEST, ADDRESSING_KEY_HASH)
+# Tombstone marker (Oracle invariant 1, 2026-11-11): in a KEY-HASH shard,
+# an `.idx` entry whose len is TOMBSTONE_LEN records a DELETION of that
+# key. It has no segment record (offset 0). A multi-shard read that meets
+# a tombstone stops: older shards must not resurrect the key. Both cores
+# share this constant; content-digest shards never carry tombstones
+# (their content is immutable per digest).
+TOMBSTONE_LEN = 0xFFFFFFFF
 IDX_MAGIC = b"NIX1"
 IDX_HEADER_BYTES = 4 + 8
 IDX_ENTRY_BYTES = 32 + 8 + 4
@@ -66,6 +73,15 @@ def _b2(data: bytes) -> bytes:
     produces different bytes — the cross-core fixture caught precisely
     that divergence on 2026-11-11. Portal digests MUST use this form."""
     return hashlib.blake2b(data, digest_size=64).digest()[:32]
+
+
+def _fsync_dir(dirpath: str) -> None:
+    """fsync a directory so a rename inside it is durable (invariant 2)."""
+    fd = os.open(dirpath, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def seg_path(dirpath: str, seg_id: int) -> str:
@@ -100,16 +116,23 @@ def write_idx(dirpath: str, seg_id: int, entries: List[Tuple[bytes, int, int]]) 
     with open(tmp, "wb") as fh:
         fh.write(body)
         fh.write(checksum)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    _fsync_dir(dirpath)
     return checksum.hex()
 
 
 def write_shard(dirpath: str, seg_id: int,
-                items: Dict[str, bytes]) -> List[Tuple[bytes, int, int]]:
+                items: Dict[str, bytes],
+                tombstones: Tuple[str, ...] = ()) -> List[Tuple[bytes, int, int]]:
     """Seal a KV shard: write the segment + `.idx` for `items`.
 
     Keys map to records whose content is [value_digest 32][value bytes];
-    the `.idx` digest is BLAKE2b-256(key). Returns the idx entries.
+    the `.idx` digest is BLAKE2b-256(key). Keys named in `tombstones` get
+    a tombstone `.idx` entry (len = TOMBSTONE_LEN, no segment record):
+    the deletion marker that stops newest-first multi-shard reads from
+    resurrecting older values (invariant 1). Returns the idx entries.
     """
     os.makedirs(dirpath, exist_ok=True)
     entries: List[Tuple[bytes, int, int]] = []
@@ -122,6 +145,8 @@ def write_shard(dirpath: str, seg_id: int,
             f.write(content)
             entries.append((_b2(key.encode("utf-8")), off + 4, len(content)))
             off += 4 + len(content)
+        for key in tombstones:
+            entries.append((_b2(key.encode("utf-8")), 0, TOMBSTONE_LEN))
     write_idx(dirpath, seg_id, entries)
     return entries
 
@@ -248,9 +273,18 @@ class PortalRegistry:
                          indent=2)
         path = os.path.join(self.dir, MANIFEST_FILE)
         tmp = path + ".tmp"
+        # Invariant 2 (crash-safe registration): Write -> Seal -> Verify ->
+        # fsync -> Atomic registry commit. The manifest is written to a
+        # temp file, fsynced, atomically renamed over the old manifest,
+        # and the directory is fsynced — a crash at any point leaves either
+        # the old manifest or the new one, never a torn reference to an
+        # unverified shard.
         with open(tmp, "w") as f:
             f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        _fsync_dir(self.dir)
 
     def get(self, portal_id: str) -> Optional[PortalEntry]:
         for e in self.entries:
@@ -370,6 +404,29 @@ class Portal:
                              % self.entry.id)
         return content
 
+    def probe(self, key: str) -> Tuple[str, Optional[bytes]]:
+        """Three-state key probe for multi-shard resolution (invariant 1):
+        ("present", value) | ("tombstone", None) | ("absent", None).
+        A tombstone is authoritative WITHIN this shard: the key was
+        deleted at this shard's seal, so older shards must not be
+        consulted for it."""
+        if self.entry.addressing != ADDRESSING_KEY_HASH:
+            raise ValueError(
+                "portal %s: probe() requires key-hash addressing, this "
+                "portal is %r" % (self.entry.id, self.entry.addressing))
+        loc = self.lookup(key)
+        if loc is None:
+            return ("absent", None)
+        off, length = loc
+        if length == TOMBSTONE_LEN:
+            return ("tombstone", None)
+        content = os.pread(self._seg_fd, length, off)
+        value_digest, value = content[:32], content[32:]
+        if _b2(value) != value_digest:
+            raise ValueError("portal %s: record tampered (hash mismatch)"
+                             % self.entry.id)
+        return ("present", value)
+
     def get(self, key: str) -> Optional[bytes]:
         if self.entry.addressing != ADDRESSING_KEY_HASH:
             raise ValueError(
@@ -377,14 +434,63 @@ class Portal:
                 "is %r — use read_raw()" % (self.entry.id, self.entry.addressing))
         """On-call read: disk binary search, one positional segment read,
         and verification of the value against its stored BLAKE2b digest.
-        Returns None for an absent key; raises on tampered bytes."""
-        loc = self.lookup(key)
-        if loc is None:
-            return None
-        off, length = loc
-        content = os.pread(self._seg_fd, length, off)
-        value_digest, value = content[:32], content[32:]
-        if _b2(value) != value_digest:
-            raise ValueError("portal %s: record tampered (hash mismatch)"
-                             % self.entry.id)
-        return value
+        Returns None for an absent OR tombstoned key; raises on tampered
+        bytes."""
+        state, value = self.probe(key)
+        return value if state == "present" else None
+
+
+# --------------------------------------------------------------------------
+# PortalSet (multi-shard reads — invariant 1: the newest truth wins)
+# --------------------------------------------------------------------------
+
+class PortalSet:
+    """Reads across many sealed shards with newest-wins resolution.
+
+    Shards are ordered oldest -> newest by registration order (append
+    order). A key lookup consults them NEWEST FIRST — mirroring an
+    engine that checks its active append-only tail before sealed
+    history — and the first authoritative answer wins:
+
+      present   -> that value (older copies are stale, never returned)
+      tombstone -> deleted; older shards are NOT consulted
+      absent    -> fall through to the next older shard
+
+    Without this rule a portal can return perfectly valid, hash-verified
+    data that is nevertheless outdated. Content-digest shards are exempt
+    by construction: a digest names immutable content, so no shard can
+    hold a "newer version" of it.
+
+    Lookup cost is O(S log N) worst case (S shards, N entries per shard):
+    a miss, or a hit in the oldest shard, touches every shard. See the
+    shard-count benchmark in docs/portals.md for when routing/compaction
+    becomes worthwhile.
+    """
+
+    def __init__(self, registry: PortalRegistry):
+        self._portals: List[Portal] = [
+            registry.open_portal(e.id) for e in registry.entries]
+
+    def get(self, key: str) -> Optional[bytes]:
+        for portal in reversed(self._portals):  # newest first
+            state, value = portal.probe(key)
+            if state == "present":
+                return value
+            if state == "tombstone":
+                return None
+        return None
+
+    def read_raw(self, digest: bytes) -> Optional[bytes]:
+        """Content-addressed read across shards. Any hit is authoritative
+        (immutable content); order only affects speed."""
+        for portal in reversed(self._portals):
+            if portal.entry.addressing != ADDRESSING_CONTENT_DIGEST:
+                continue
+            out = portal.read_raw(digest)
+            if out is not None:
+                return out
+        return None
+
+    def close(self) -> None:
+        for portal in self._portals:
+            portal.close()

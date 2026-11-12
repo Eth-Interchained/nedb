@@ -12,8 +12,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from nedb.portal import (IDX_ENTRY_BYTES, IDX_HEADER_BYTES, PortalEntry,
-                         PortalRegistry, idx_path, seg_path, write_shard, _b2)
+from nedb.portal import (ADDRESSING_KEY_HASH, IDX_ENTRY_BYTES,
+                         IDX_HEADER_BYTES, PortalEntry, PortalRegistry,
+                         idx_path, seg_path, write_shard, _b2)
 
 
 def test_registry_open_reads_manifest_only(tmp_path):
@@ -47,6 +48,27 @@ def test_remote_uri_is_reserved_and_refused(tmp_path):
         assert False, "remote portal must refuse in the local-only slice"
     except ValueError as e:
         assert "not implemented" in str(e)
+
+
+def test_newest_wins_and_tombstones_stop_resurrection(tmp_path):
+    """Invariant 1: across shards, the newest truth wins — an update in a
+    newer shard shadows the older value, and a tombstone in a newer shard
+    deletes the key outright (older values must not resurface)."""
+    from nedb.portal import PortalSet
+    d = str(tmp_path)
+    write_shard(d, 0, {"k": b"old", "gone": b"was-here", "solo": b"v0"})
+    write_shard(d, 1, {"k": b"new"}, tombstones=("gone",))
+    reg = PortalRegistry(d)
+    reg.register_segment("s0", 0, addressing=ADDRESSING_KEY_HASH)
+    reg.register_segment("s1", 1, addressing=ADDRESSING_KEY_HASH)
+    reg.save()
+    reg2 = PortalRegistry.open(d)
+    ps = PortalSet(reg2)
+    assert ps.get("k") == b"new"          # newest value wins
+    assert ps.get("gone") is None         # tombstone stops resurrection
+    assert ps.get("solo") == b"v0"        # untouched older key still reads
+    assert ps.get("never") is None
+    ps.close()
 
 
 def test_roundtrip_and_absent(tmp_path):
