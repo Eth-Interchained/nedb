@@ -173,6 +173,14 @@ impl PortalRegistry {
         &self.entries
     }
 
+    /// Drop entries whose segment file no longer exists under `dir`
+    /// (deleted or compacted away after the entry was registered), so a
+    /// persisted registry cannot accumulate references to gone segments.
+    pub fn prune_missing(&mut self) {
+        let dir = self.dir.clone();
+        self.entries.retain(|e| dir.join(&e.segment).exists());
+    }
+
     pub fn get(&self, id: &str) -> Option<&PortalEntry> {
         self.entries.iter().find(|e| e.id == id)
     }
