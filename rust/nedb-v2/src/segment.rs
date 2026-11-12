@@ -158,6 +158,36 @@ pub struct SegmentStore {
     /// behind the `active` mutex. Cleared on `compact()` — old segment ids are
     /// never referenced again after the index swap.
     read_handles: DashMap<u32, Arc<File>>,
+    /// Portal mode (NEDB_PORTAL_READS / open_portal_mode): sealed segments
+    /// are NOT indexed in memory. They are served through portals —
+    /// on-disk binary search of each sealed segment's `.idx` — so the
+    /// in-memory index holds only the active segment's entries, however
+    /// large the sealed history grows. None = legacy mode (default).
+    portals: Option<Vec<crate::portal::Portal>>,
+}
+
+/// Portal-reads opt-in, mirroring the NEDB_DAG_V3 pattern. Default off:
+/// the legacy open is byte-for-byte the old behavior.
+fn portal_reads_enabled() -> bool {
+    std::env::var("NEDB_PORTAL_READS")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+                     || v.eq_ignore_ascii_case("on")
+                     || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+fn fast_fsync_enabled() -> bool {
+    std::env::var("NEDB_FAST_FSYNC")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+                     || v.eq_ignore_ascii_case("on")
+                     || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
 }
 
 /// Durability point for a segment file.
@@ -196,7 +226,12 @@ impl SegmentStore {
     }
 
     /// Open (or create) the segment store under `{objects_root}/segments`.
+    /// With NEDB_PORTAL_READS set, sealed segments are served through
+    /// portals instead of the in-memory index (see open_portal_mode).
     pub fn open(objects_root: &Path) -> Result<Self> {
+        if portal_reads_enabled() {
+            return Self::open_portal_mode(objects_root);
+        }
         Self::open_with_max(objects_root, DEFAULT_MAX_SEGMENT_BYTES)
     }
 
@@ -287,7 +322,130 @@ impl SegmentStore {
             max_segment_bytes,
             fast_fsync,
             read_handles: DashMap::new(),
+            portals: None,
         })
+    }
+
+    /// Open in PORTAL MODE: sealed segments are registered as portals and
+    /// served by on-disk `.idx` binary search instead of being loaded into
+    /// the in-memory index. Only the active segment is scanned/indexed in
+    /// memory, so open cost and RAM are independent of sealed history.
+    /// A sealed segment whose `.idx` fails portal registration (e.g. an
+    /// unsorted pre-portal sidecar) falls back to the legacy in-memory
+    /// index for that segment only — mixed mode, still correct.
+    pub fn open_portal_mode(objects_root: &Path) -> Result<Self> {
+        Self::open_portal_mode_with_max(objects_root, DEFAULT_MAX_SEGMENT_BYTES)
+    }
+
+    pub fn open_portal_mode_with_max(objects_root: &Path, max_segment_bytes: u64) -> Result<Self> {
+        let dir = objects_root.join("segments");
+        fs::create_dir_all(&dir).context("create objects/segments dir")?;
+
+        let mut ids: Vec<u32> = Vec::new();
+        for entry in fs::read_dir(&dir).context("read segments dir")? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_prefix("seg-") {
+                if let Some(num) = rest.strip_suffix(".dat") {
+                    if let Ok(id) = num.parse::<u32>() {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids.sort_unstable();
+
+        let index: DashMap<String, SegmentLocation> = DashMap::new();
+        let mut portals: Vec<crate::portal::Portal> = Vec::new();
+        let mut registry = crate::portal::PortalRegistry::new(&dir);
+        let mut active_id: u32 = 0;
+        let mut active_end: u64 = 0;
+
+        for (pos, &id) in ids.iter().enumerate() {
+            let is_last = pos + 1 == ids.len();
+            if is_last {
+                // Active segment: scan + truncate torn tail, index in RAM.
+                let (valid_end, entries) = Self::scan_segment(&dir, id)?;
+                for (h, o, l) in entries {
+                    index.insert(h, SegmentLocation { segment_id: id, offset: o, len: l });
+                }
+                let path = Self::seg_path(&dir, id);
+                let file_len = fs::metadata(&path)?.len();
+                if valid_end < file_len {
+                    let f = OpenOptions::new().write(true).open(&path)?;
+                    f.set_len(valid_end)?;
+                }
+                active_id = id;
+                active_end = valid_end;
+            } else {
+                // Sealed segment: heal a missing/corrupt .idx from a scan
+                // (as legacy does), then try to register it as a portal.
+                if Self::load_idx(&dir, id)?.is_none() {
+                    let (_ve, entries) = Self::scan_segment(&dir, id)?;
+                    let _ = Self::write_idx(&dir, id, &entries);
+                }
+                let pid = format!("seg-{:06}", id);
+                match registry.register_segment(
+                    &pid, id, None, crate::portal::ADDRESSING_CONTENT_DIGEST,
+                ) {
+                    Ok(_) => {
+                        let entry = registry.get(&pid).unwrap().clone();
+                        match crate::portal::Portal::open(&dir, entry) {
+                            Ok(p) => portals.push(p),
+                            Err(_) => {
+                                // Portal open failed: legacy fallback.
+                                if let Ok(Some(entries)) = Self::load_idx(&dir, id) {
+                                    for (h, o, l) in entries {
+                                        index.insert(h, SegmentLocation { segment_id: id, offset: o, len: l });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Unsorted/invalid sidecar: legacy fallback for
+                        // this segment only.
+                        if let Ok(Some(entries)) = Self::load_idx(&dir, id) {
+                            for (h, o, l) in entries {
+                                index.insert(h, SegmentLocation { segment_id: id, offset: o, len: l });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = registry.save(); // best-effort: persist the manifest
+
+        let active_path = Self::seg_path(&dir, active_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&active_path)
+            .with_context(|| format!("open active segment {:?}", active_path))?;
+        file.seek(SeekFrom::Start(active_end))?;
+
+        Ok(Self {
+            dir,
+            index,
+            active: Mutex::new(Active { id: active_id, file, offset: active_end }),
+            max_segment_bytes,
+            fast_fsync: fast_fsync_enabled(),
+            read_handles: DashMap::new(),
+            portals: Some(portals),
+        })
+    }
+
+    /// Number of entries held in the in-memory index. In portal mode this
+    /// counts only the active segment (plus any legacy-fallback segments);
+    /// sealed portal segments contribute ZERO. Diagnostics + tests.
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Number of sealed segments being served through portals.
+    pub fn portal_count(&self) -> usize {
+        self.portals.as_ref().map(|p| p.len()).unwrap_or(0)
     }
 
     /// Scan one segment, returning (valid_end_offset, records). Records past a
@@ -439,22 +597,39 @@ impl SegmentStore {
 
     // ── core API ──────────────────────────────────────────────────────────────
 
-    /// True if this hash is already stored in a segment.
+    /// True if this hash is already stored in a segment. In portal mode
+    /// sealed segments answer via on-disk lookup (no index entry needed).
     pub fn contains(&self, hash: &str) -> bool {
-        self.index.contains_key(hash)
+        if self.index.contains_key(hash) {
+            return true;
+        }
+        if let Some(ref portals) = self.portals {
+            if let Ok(raw) = hex::decode(hash) {
+                if raw.len() == 32 {
+                    let mut digest = [0u8; 32];
+                    digest.copy_from_slice(&raw);
+                    for p in portals {
+                        if let Ok(Some(_)) = p.lookup(&digest) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Append `content` under `hash` (idempotent). `hash` must equal
     /// `BLAKE2b(content)`; the caller computes it (parallel, outside the lock).
     pub fn put(&self, hash: &str, content: &[u8]) -> Result<()> {
-        if self.index.contains_key(hash) {
+        if self.contains(hash) {
             return Ok(());
         }
         let len = content.len() as u32;
         let record_size = 4u64 + content.len() as u64;
 
         let mut active = self.active.lock().unwrap();
-        if self.index.contains_key(hash) {
+        if self.contains(hash) {
             return Ok(());
         }
 
@@ -495,16 +670,43 @@ impl SegmentStore {
     /// Read the raw content bytes for `hash`, or `None` if not stored in any
     /// segment (caller then falls back to the loose-object path). Re-verifies.
     pub fn get(&self, hash: &str) -> Result<Option<Vec<u8>>> {
-        let loc = match self.index.get(hash) {
-            Some(entry) => *entry.value(),
-            None => return Ok(None),
-        };
-        Ok(Some(self.read_content(&loc, hash)?))
+        if let Some(entry) = self.index.get(hash) {
+            let loc = *entry.value();
+            return Ok(Some(self.read_content(&loc, hash)?));
+        }
+        // Portal mode: sealed segments answer from disk. The portal read
+        // re-verifies the content digest itself.
+        if let Some(ref portals) = self.portals {
+            let raw = hex::decode(hash)
+                .map_err(|_| anyhow::anyhow!("bad hash hex in get: {}", hash))?;
+            if raw.len() == 32 {
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(&raw);
+                for p in portals {
+                    if let Some(content) = p.read(&digest)? {
+                        return Ok(Some(content));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
-    /// All hashes currently stored in segments.
+    /// All hashes currently stored in segments. Enumeration is the one
+    /// operation that must touch every entry: in portal mode each sealed
+    /// `.idx` is streamed sequentially (bounded memory) rather than held.
     pub fn all_hashes(&self) -> Vec<String> {
-        self.index.iter().map(|e| e.key().clone()).collect()
+        let mut out: Vec<String> = self.index.iter().map(|e| e.key().clone()).collect();
+        if let Some(ref portals) = self.portals {
+            for p in portals {
+                if let Ok(digests) = p.digests() {
+                    for d in digests {
+                        out.push(hex::encode(d));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Flush + fsync the active segment. One durability point per batch.
@@ -534,6 +736,9 @@ impl SegmentStore {
     /// are blocked for the duration via the active lock, and the in-memory index
     /// is swapped in place.
     pub fn compact(&self, live: &HashSet<String>) -> Result<CompactStats> {
+        if self.portals.is_some() {
+            bail!("compact is not supported in portal mode in this slice; reopen without NEDB_PORTAL_READS to compact");
+        }
         let mut active = self.active.lock().unwrap();
 
         let total_before = self.index.len();
@@ -886,5 +1091,107 @@ mod tests {
                        format!("concurrent-record-{:04}", i).as_bytes(),
                        "record {} must read correctly through fresh post-compact handles", i);
         }
+    }
+
+    /// Portal mode: sealed segments are served from disk, NOT indexed.
+    /// Open a multi-segment store through portals and prove (structurally)
+    /// that the in-memory index holds only the active segment while every
+    /// record still reads back byte-identical.
+    #[test]
+    fn portal_mode_open_indexes_only_the_active_segment() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let max = 2_000u64; // tiny segments → several sealed + one active
+        let mut hashes: Vec<String> = Vec::new();
+        {
+            let store = SegmentStore::open_with_max(&root, max).unwrap();
+            for i in 0..120u32 {
+                let content = format!("portal-mode-record-{:04}-{}", i, "x".repeat(80))
+                    .into_bytes();
+                let h = blake2b(&content);
+                store.put(&h, &content).unwrap();
+                hashes.push(h);
+            }
+            store.sync().unwrap();
+        }
+        let legacy = SegmentStore::open_with_max(&root, max).unwrap();
+        let legacy_index = legacy.index_len();
+        assert_eq!(legacy_index, 120);
+        drop(legacy);
+
+        let store = SegmentStore::open_portal_mode_with_max(&root, max).unwrap();
+        assert!(store.portal_count() >= 2,
+                "expected several sealed portals, got {}", store.portal_count());
+        assert!(store.index_len() < 120,
+                "portal open must not index sealed segments (index={})",
+                store.index_len());
+        assert!(store.index_len() > 0, "active segment is indexed");
+        // Every record reads back byte-identical through portals.
+        for (i, h) in hashes.iter().enumerate() {
+            let expect = format!("portal-mode-record-{:04}-{}", i, "x".repeat(80))
+                .into_bytes();
+            assert_eq!(store.get(h).unwrap().as_deref(), Some(expect.as_slice()),
+                       "record {} must read through portals", i);
+            assert!(store.contains(h));
+        }
+        // Absent hash: clean miss in both layers.
+        let absent = blake2b(b"never written");
+        assert_eq!(store.get(&absent).unwrap(), None);
+        assert!(!store.contains(&absent));
+        // Enumeration still sees everything.
+        assert_eq!(store.all_hashes().len(), 120);
+        // Idempotent put of a sealed hash must not duplicate it into the
+        // active segment.
+        let idx_before = store.index_len();
+        store.put(&hashes[0], &format!("portal-mode-record-{:04}-{}", 0, "x".repeat(80)).into_bytes()).unwrap();
+        assert_eq!(store.index_len(), idx_before, "sealed put must be a no-op");
+        // New writes still land in the active segment and read back.
+        let newc = b"written-in-portal-mode".to_vec();
+        let newh = blake2b(&newc);
+        store.put(&newh, &newc).unwrap();
+        assert_eq!(store.get(&newh).unwrap().as_deref(), Some(newc.as_slice()));
+        // Compact refuses cleanly in this slice.
+        let live: std::collections::HashSet<String> = hashes.iter().cloned().collect();
+        assert!(store.compact(&live).is_err());
+    }
+
+    /// RSS probe (manual, ignored): builds a 300k-record store once at
+    /// $NEDB_RSS_DIR, then opens it in $NEDB_RSS_MODE (legacy|portal),
+    /// serves 1,000 random reads, and prints peak RSS (VmHWM). Run each
+    /// mode as a separate process invocation and compare.
+    #[test]
+    #[ignore]
+    fn rss_probe_open_modes() {
+        let dir = std::env::var("NEDB_RSS_DIR").expect("NEDB_RSS_DIR");
+        let root = std::path::PathBuf::from(&dir);
+        let max = 8 * 1024 * 1024u64;
+        let n: u32 = std::env::var("NEDB_RSS_N")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(300_000);
+        if !root.join("segments").join("seg-000000.dat").exists() {
+            let store = SegmentStore::open_with_max(&root, max).unwrap();
+            for i in 0..n {
+                let content = format!("rss-record-{:06}-{}", i, "y".repeat(90)).into_bytes();
+                let h = blake2b(&content);
+                store.put(&h, &content).unwrap();
+            }
+            store.sync().unwrap();
+            eprintln!("built {} records", n);
+        }
+        let mode = std::env::var("NEDB_RSS_MODE").unwrap_or_else(|_| "legacy".into());
+        let store = if mode == "portal" {
+            SegmentStore::open_portal_mode_with_max(&root, max).unwrap()
+        } else {
+            SegmentStore::open_with_max(&root, max).unwrap()
+        };
+        let mut hits = 0usize;
+        for i in (0..n).step_by(300) {
+            let content = format!("rss-record-{:06}-{}", i, "y".repeat(90)).into_bytes();
+            let h = blake2b(&content);
+            if store.get(&h).unwrap().is_some() { hits += 1; }
+        }
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let hwm = status.lines().find(|l| l.starts_with("VmHWM")).unwrap().to_string();
+        eprintln!("mode={} index_len={} portals={} hits={} {}",
+                  mode, store.index_len(), store.portal_count(), hits, hwm);
     }
 }
