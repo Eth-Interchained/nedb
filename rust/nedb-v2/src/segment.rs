@@ -357,7 +357,15 @@ impl SegmentStore {
 
         let index: DashMap<String, SegmentLocation> = DashMap::new();
         let mut portals: Vec<crate::portal::Portal> = Vec::new();
-        let mut registry = crate::portal::PortalRegistry::new(&dir);
+        // Trust the persisted registry. Registration streams a segment's
+        // whole .idx to verify its checksum — a once-per-segment cost at
+        // first sight. Rebuilding the registry from empty on every boot
+        // (PortalRegistry::new) re-pays that stream for every sealed
+        // segment forever, making open cost linear in sealed history:
+        // the exact tax portals exist to remove. A registry that is
+        // missing or unreadable starts empty and is rebuilt below.
+        let mut registry = crate::portal::PortalRegistry::open(&dir)
+            .unwrap_or_else(|_| crate::portal::PortalRegistry::new(&dir));
         let mut active_id: u32 = 0;
         let mut active_end: u64 = 0;
 
@@ -378,13 +386,29 @@ impl SegmentStore {
                 active_id = id;
                 active_end = valid_end;
             } else {
+                let pid = format!("seg-{:06}", id);
+                // Fast path: an earlier boot registered this segment and
+                // the registry persisted. Portal::open validates the saved
+                // entry structurally in O(1) — idx magic, entry count,
+                // exact idx length — and portal reads re-verify every
+                // record's content digest, so trusting the entry weakens
+                // nothing: it only skips re-streaming the whole .idx to
+                // re-verify a checksum that registration already verified
+                // once. Open cost stays independent of sealed history.
+                if let Some(entry) = registry.get(&pid).cloned() {
+                    if let Ok(p) = crate::portal::Portal::open(&dir, entry) {
+                        portals.push(p);
+                        continue;
+                    }
+                    // The saved entry no longer validates (idx replaced,
+                    // compacted, or damaged): heal + re-register below.
+                }
                 // Sealed segment: heal a missing/corrupt .idx from a scan
                 // (as legacy does), then try to register it as a portal.
                 if Self::load_idx(&dir, id)?.is_none() {
                     let (_ve, entries) = Self::scan_segment(&dir, id)?;
                     let _ = Self::write_idx(&dir, id, &entries);
                 }
-                let pid = format!("seg-{:06}", id);
                 match registry.register_segment(
                     &pid, id, None, crate::portal::ADDRESSING_CONTENT_DIGEST,
                 ) {
@@ -414,6 +438,7 @@ impl SegmentStore {
                 }
             }
         }
+        registry.prune_missing();
         let _ = registry.save(); // best-effort: persist the manifest
 
         let active_path = Self::seg_path(&dir, active_id);
@@ -1153,6 +1178,119 @@ mod tests {
         // Compact refuses cleanly in this slice.
         let live: std::collections::HashSet<String> = hashes.iter().cloned().collect();
         assert!(store.compact(&live).is_err());
+    }
+
+    fn build_multi_segment(root: &Path, max: u64, start: u32, n: u32)
+        -> Vec<String>
+    {
+        let store = SegmentStore::open_with_max(root, max).unwrap();
+        let mut hashes = Vec::new();
+        for i in start..start + n {
+            let content = format!("portal-mode-record-{:04}-{}", i,
+                                  "x".repeat(80)).into_bytes();
+            let h = blake2b(&content);
+            store.put(&h, &content).unwrap();
+            hashes.push(h);
+        }
+        store.sync().unwrap();
+        hashes
+    }
+
+    fn first_sealed_idx(root: &Path) -> std::path::PathBuf {
+        let segdir = root.join("segments");
+        let mut idxs: Vec<std::path::PathBuf> = fs::read_dir(&segdir)
+            .unwrap().flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".idx"))
+            .collect();
+        idxs.sort();
+        idxs.into_iter().next().expect("a sealed .idx must exist")
+    }
+
+    /// Registry trust: a second portal-mode boot must serve a segment
+    /// whose saved registry entry validates structurally WITHOUT
+    /// re-registering it. Proof by sabotage: corrupting the .idx
+    /// checksum trailer makes re-registration (and load_idx) fail, so
+    /// under the old always-register boot the segment could only come
+    /// back via a scan-heal that REWRITES the .idx. Here every record
+    /// must read and the sabotaged .idx must remain byte-identical —
+    /// only possible if the saved entry was trusted as-is.
+    #[test]
+    fn portal_open_trusts_saved_registry() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let max = 2_000u64;
+        let hashes = build_multi_segment(&root, max, 0, 120);
+        {
+            let store = SegmentStore::open_portal_mode_with_max(&root, max)
+                .unwrap();
+            assert!(store.portal_count() >= 2);
+        }
+        let idx = first_sealed_idx(&root);
+        let mut bytes = fs::read(&idx).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF; // corrupt the checksum trailer only
+        fs::write(&idx, &bytes).unwrap();
+
+        let store = SegmentStore::open_portal_mode_with_max(&root, max)
+            .unwrap();
+        assert!(store.portal_count() >= 2);
+        for h in &hashes {
+            assert!(store.get(h).unwrap().is_some(),
+                    "record must read through the trusted portal");
+        }
+        assert_eq!(fs::read(&idx).unwrap(), bytes,
+                   "trusted entry: .idx untouched (no heal, no re-register)");
+    }
+
+    /// A saved entry that no longer validates structurally (here: the
+    /// .idx magic is destroyed) must fall back to the heal + re-register
+    /// path, never to a dead segment.
+    #[test]
+    fn portal_open_heals_structurally_damaged_idx() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let max = 2_000u64;
+        let hashes = build_multi_segment(&root, max, 0, 120);
+        {
+            let _ = SegmentStore::open_portal_mode_with_max(&root, max)
+                .unwrap();
+        }
+        let idx = first_sealed_idx(&root);
+        let mut bytes = fs::read(&idx).unwrap();
+        bytes[0..4].copy_from_slice(b"XXXX"); // destroy the magic
+        fs::write(&idx, &bytes).unwrap();
+
+        let store = SegmentStore::open_portal_mode_with_max(&root, max)
+            .unwrap();
+        for h in &hashes {
+            assert!(store.get(h).unwrap().is_some(),
+                    "healed segment must serve its records");
+        }
+    }
+
+    /// Segments sealed AFTER the registry was saved are not in it; the
+    /// next portal boot must register them on first sight.
+    #[test]
+    fn portal_open_registers_segments_sealed_after_first_open() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let max = 2_000u64;
+        let first = build_multi_segment(&root, max, 0, 120);
+        let count1 = {
+            let store = SegmentStore::open_portal_mode_with_max(&root, max)
+                .unwrap();
+            store.portal_count()
+        };
+        let second = build_multi_segment(&root, max, 120, 120);
+        let store = SegmentStore::open_portal_mode_with_max(&root, max)
+            .unwrap();
+        assert!(store.portal_count() > count1,
+                "new segments must register ({} -> {})",
+                count1, store.portal_count());
+        for h in first.iter().chain(second.iter()) {
+            assert!(store.get(h).unwrap().is_some());
+        }
     }
 
     /// RSS probe (manual, ignored): builds a 300k-record store once at
