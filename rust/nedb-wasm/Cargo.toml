@@ -9,7 +9,7 @@
 
 [package]
 name        = "nedb-wasm"
-version     = "16.16.16"
+version     = "16.17.18"
 edition     = "2021"
 license     = "BUSL-1.1"
 repository  = "https://github.com/aiassistsecure/nedb"
@@ -19,7 +19,7 @@ description = "NEDB v2 engine for the browser — wasm-bindgen bindings over the
 crate-type  = ["cdylib", "rlib"]
 
 [dependencies]
-nedb-engine  = { path = "../nedb-v2", version = "16.16.16" }
+nedb-engine  = { path = "../nedb-v2", version = "16.17.18" }
 serde_json   = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 wasm-bindgen = "0.2"
 
