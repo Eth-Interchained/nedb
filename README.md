@@ -127,6 +127,47 @@ traversable — and the same hash chain that keeps it honest also protects it.
 
 ---
 
+## Portals — data stays on disk, access is immediate · *new*
+
+A database should not need RAM proportional to its history just to *open*.
+NEDB's segment stores used to load every sealed segment's index into memory
+at startup; the Python engine materialised its whole store. At production
+scale that open cost gigabytes — and got processes OOM-killed before they
+served a single query.
+
+**Portals invert it.** The store is sharded on disk, and each shard is held
+only as a *reference*: a small manifest (`portals.json`) names the sealed
+segments, opening reads only the manifest, and a lookup binary-searches the
+shard's `.idx` **on disk** and reads exactly one record — BLAKE2b-verified,
+as every NEDB read is. The DAG and the hash chain are untouched; portals are
+a read/reference layer over sealed segments, never a write path around the
+log.
+
+Three invariants govern them:
+
+1. **The newest truth always wins** — multi-shard reads go newest-first, and
+   tombstones stop deleted keys from resurfacing out of older shards.
+2. **Registration is crash-safe** — Write → Seal → Verify → fsync → Atomic
+   registry commit. A crash leaves the old manifest or the new one, never a
+   torn reference to an unverified shard.
+3. **Bounded memory is a guarantee, not a target** — open cost tracks the
+   active tail, never the sealed history. Measured in the Rust engine
+   (100,000 records): legacy open 41.1 MB peak RSS with all 100,000 entries
+   indexed; portal open **19.6 MB** with only the active tail's 25,102
+   indexed. Worst-case lookup latency grows linearly in shard count
+   (≈15.5 µs per shard probed in Python), which is the baseline that says
+   when routing becomes worthwhile — measured, not guessed.
+
+Both cores implement the same byte-identical format — the Rust engine
+(`NEDB_PORTAL_READS=1` / `SegmentStore::open_portal_mode`) and the Python
+engine (`nedb.portal`, including `PortalSet` newest-first multi-shard
+reads) — proven by a cross-core fixture each core reads from the other,
+byte for byte. Local-first by design; the registry's optional `uri`
+locator keeps remote shards an additive step, not a redesign.
+Full spec: [`docs/portals.md`](docs/portals.md).
+
+---
+
 ## [neSQL](https://github.com/Eth-Interchained/neSQL) — the language this engine speaks
 
 Nobody should have to learn a query language to use a database. That sentence cost

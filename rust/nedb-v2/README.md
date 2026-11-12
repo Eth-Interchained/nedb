@@ -3,7 +3,7 @@
 **NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server**
 
 [![crates.io](https://img.shields.io/crates/v/nedb-engine?color=f97316)](https://crates.io/crates/nedb-engine)
-[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-f59e0b)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
 [![GitHub](https://img.shields.io/badge/github-aiassistsecure%2Fnedb-8da0cb)](https://github.com/aiassistsecure/nedb)
 
 This crate ships the **`nedbd`** binary — the NEDB v2 DAG HTTP server. Install it, point it at a data directory, and any language can speak to it over HTTP/JSON.
@@ -116,6 +116,7 @@ NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG
 - **Causal provenance**: documents link to their causal parents via `caused_by` hashes. `TRACE caused_by` walks the full causal graph backward.
 - **TRAVERSE**: named graph relations via `__links__`. `FROM person WHERE _id = "robert" TRAVERSE parent_of` returns linked nodes.
 - **O(1) warm start**: a `MANIFEST` file stores `seq` + Merkle head so restarts never re-scan the entire object store.
+- **Portals — bounded-memory open**: sealed segments are referenced, not loaded. With `NEDB_PORTAL_READS=1` the engine indexes only the active segment in RAM and serves sealed history by binary-searching each segment's `.idx` **on disk** (every read still BLAKE2b-verified). Open cost tracks the active tail, never the sealed history — a store with 40M operations opens with approximately the memory of one with 4M. See [docs/portals.md](https://github.com/Eth-Interchained/nedb/blob/master/docs/portals.md).
 - **Instant cold start**: the daemon accepts connections immediately; background scan loads objects incrementally.
 - **AES-256-GCM at rest**: optional symmetric encryption with a double-envelope key structure (TMK wraps DEK).
 
@@ -162,6 +163,8 @@ nedbd [OPTIONS] [data_dir]
 | `NEDBD_DAG` | — | `1` = same as `--dag` flag |
 | `NEDBD_CAST` | — | `1` = same as `--cast` flag |
 | `NEDBD_CAST_MODEL` | — | Explicit path to a `model.cast` container |
+| `NEDB_DAG_V3` | — | `1` = packed segment substrate for the DAG object store |
+| `NEDB_PORTAL_READS` | — | `1` = serve sealed segments through Portals: open indexes only the active segment in RAM, sealed reads binary-search the `.idx` on disk |
 
 ---
 
@@ -423,7 +426,7 @@ nedbd --doctor
 
 ## License
 
-[MIT](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE) — free for any use, including commercial and production. © 2026 INTERCHAINED LLC.
+[BUSL-1.1](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE) — free in production for organisations under USD $1M annual revenue; converts to Apache 2.0 on 2030-09-11. © 2026 INTERCHAINED LLC.
 
 ---
 
