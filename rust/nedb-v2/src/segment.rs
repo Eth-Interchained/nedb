@@ -42,12 +42,12 @@ use dashmap::DashMap;
 const DEFAULT_MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Magic prefix for `.idx` sidecar files (NEDB v3 index, format 1).
-const IDX_MAGIC: &[u8; 4] = b"NIX1";
+pub(crate) const IDX_MAGIC: &[u8; 4] = b"NIX1";
 /// `.idx` on-disk entry: 32-byte raw digest + u64 offset + u32 len.
-const IDX_ENTRY_BYTES: usize = 32 + 8 + 4;
+pub(crate) const IDX_ENTRY_BYTES: usize = 32 + 8 + 4;
 /// `.idx` header: magic(4) + count(8). Trailer: blake2b-256 checksum (32).
-const IDX_HEADER_BYTES: usize = 4 + 8;
-const IDX_CHECKSUM_BYTES: usize = 32;
+pub(crate) const IDX_HEADER_BYTES: usize = 4 + 8;
+pub(crate) const IDX_CHECKSUM_BYTES: usize = 32;
 
 /// Location of one content record inside the segment set.
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +72,7 @@ pub struct CompactStats {
 }
 
 /// BLAKE2b-256 (first 32 bytes of Blake2b-512) raw digest.
-fn blake2b_raw(data: &[u8]) -> [u8; 32] {
+pub(crate) fn blake2b_raw(data: &[u8]) -> [u8; 32] {
     let mut h = Blake2b512::new();
     h.update(data);
     let out = h.finalize();
@@ -90,7 +90,7 @@ fn blake2b(data: &[u8]) -> String {
 /// Positional read at an explicit offset — no shared-cursor state, so one
 /// handle serves any number of concurrent readers without locking.
 #[cfg(unix)]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.read_exact_at(buf, offset)
 }
@@ -102,7 +102,7 @@ fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
 /// its own absolute offset) and the appender writes through a different
 /// handle with its own cursor.
 #[cfg(windows)]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut done = 0usize;
     while done < buf.len() {
@@ -122,7 +122,7 @@ fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
 /// seek+read. Correct, just not zero-copy; the wasm build is in-memory-only
 /// anyway, so segment files are never opened there (this only has to compile).
 #[cfg(target_arch = "wasm32")]
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     let mut owned = f.try_clone()?;
     owned.seek(SeekFrom::Start(offset))?;
@@ -188,10 +188,10 @@ fn durable_sync(file: &File, fast: bool) -> std::io::Result<()> {
 }
 
 impl SegmentStore {
-    fn seg_path(dir: &Path, id: u32) -> PathBuf {
+    pub(crate) fn seg_path(dir: &Path, id: u32) -> PathBuf {
         dir.join(format!("seg-{:06}.dat", id))
     }
-    fn idx_path(dir: &Path, id: u32) -> PathBuf {
+    pub(crate) fn idx_path(dir: &Path, id: u32) -> PathBuf {
         dir.join(format!("seg-{:06}.idx", id))
     }
 
@@ -359,7 +359,14 @@ impl SegmentStore {
 
     /// Write a checksummed `.idx` for a SEALED segment (atomic via tmp→rename).
     /// Best-effort: a failure just means the next open scans the segment.
-    fn write_idx(dir: &Path, id: u32, entries: &[(String, u64, u32)]) -> Result<()> {
+    pub(crate) fn write_idx(dir: &Path, id: u32, entries: &[(String, u64, u32)]) -> Result<()> {
+        // Portal invariant: .idx entries are stored SORTED by raw digest
+        // (hex-string order == raw-byte order for lowercase hex), so a portal
+        // can binary-search the .idx on disk without loading it. load_idx is
+        // order-insensitive, so sorting changes nothing for existing readers.
+        let mut sorted: Vec<(String, u64, u32)> = entries.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let entries: &[(String, u64, u32)] = &sorted;
         let mut body: Vec<u8> = Vec::with_capacity(IDX_HEADER_BYTES + entries.len() * IDX_ENTRY_BYTES);
         body.extend_from_slice(IDX_MAGIC);
         body.extend_from_slice(&(entries.len() as u64).to_le_bytes());

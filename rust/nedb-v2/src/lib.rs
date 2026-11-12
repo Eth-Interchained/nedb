@@ -20,6 +20,7 @@
 
 pub mod store;
 pub mod segment;
+pub mod portal;
 pub mod index;
 pub mod graph;
 pub mod namespace;
