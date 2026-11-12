@@ -172,3 +172,27 @@ def test_idx_format_matches_rust_layout(tmp_path):
     assert count == 1
     assert len(data) == IDX_HEADER_BYTES + IDX_ENTRY_BYTES + 32
     assert _b2(data[:-32]) == data[-32:]
+
+
+if __name__ == "__main__":
+    # CI runs the Python suites as plain scripts (no pytest). Execute each
+    # test_* function with a fresh temp dir standing in for pytest's
+    # tmp_path fixture, so this suite really runs there — a defined-but-
+    # never-called test file would be a false green.
+    import pathlib
+    import tempfile
+    import traceback
+
+    _fns = [(n, f) for n, f in sorted(globals().items())
+            if n.startswith("test_") and callable(f)]
+    _failed = 0
+    for _name, _fn in _fns:
+        with tempfile.TemporaryDirectory() as _td:
+            try:
+                _fn(pathlib.Path(_td))
+                print("PASS", _name)
+            except Exception:
+                _failed += 1
+                print("FAIL", _name)
+                traceback.print_exc()
+    raise SystemExit(1 if _failed else 0)
